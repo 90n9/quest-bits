@@ -44,10 +44,11 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "create_task",
-             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. Returns the task with its new code.",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). Returns the task with its new code.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
+                "parent_id": int, "parent_code": str
              ], required: ["title"])],
 
             ["name": "update_task",

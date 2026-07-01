@@ -183,6 +183,10 @@ public final class Store: @unchecked Sendable {
 
         // --- Additive migration: recurring tasks ---
         if !columnExists("tasks", "recurrence") { exec("ALTER TABLE tasks ADD COLUMN recurrence TEXT;") }
+
+        // --- Additive migration: subtasks (one level of nesting) ---
+        if !columnExists("tasks", "parent_id") { exec("ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE;") }
+        exec("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);")
     }
 
     /// Assign codes to any pre-existing rows that lack them.
@@ -320,16 +324,17 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id"
 
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                            status: TaskStatus = .todo, priority: Priority = .none,
-                           dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil) throws -> TodoTask {
+                           dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
+                           parentId: Int64? = nil) throws -> TodoTask {
         lock.lock(); defer { lock.unlock() }
         return try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
                                       status: status, priority: priority, dueDate: dueDate, tags: tags,
-                                      recurrence: recurrence)
+                                      recurrence: recurrence, parentId: parentId)
     }
 
     /// Insert a task without taking the lock — for use inside already-locked methods
@@ -337,7 +342,8 @@ public final class Store: @unchecked Sendable {
     @discardableResult
     private func createTaskUnlocked(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                                     status: TaskStatus = .todo, priority: Priority = .none,
-                                    dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil) throws -> TodoTask {
+                                    dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
+                                    parentId: Int64? = nil) throws -> TodoTask {
         let now = Date()
         // Next per-project sequence number → task code.
         try runWrite("UPDATE projects SET task_seq = task_seq + 1 WHERE id=?;", [.int(projectId)])
@@ -347,12 +353,12 @@ public final class Store: @unchecked Sendable {
         let due: SQLValue = dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, recurrence, created_at, updated_at, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
+            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, recurrence, parent_id, created_at, updated_at, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
              .text(status.rawValue), .text(priority.rawValue), due, .text(encodeTags(tags)),
-             recurrence.map(SQLValue.text) ?? .null,
+             recurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
              .int(Int64(now.timeIntervalSince1970)), .int(Int64(now.timeIntervalSince1970)), .int(projectId)]
         )
         let id = lastInsertId()
@@ -360,7 +366,7 @@ public final class Store: @unchecked Sendable {
         if status != .todo { logEvent(id, "status", "todo", status.rawValue) }
         return TodoTask(id: id, code: code, projectId: projectId, title: title, detail: detail, link: link,
                         status: status, priority: priority, dueDate: dueDate, tags: tags,
-                        recurrence: recurrence, createdAt: now, updatedAt: now, sortOrder: 0)
+                        recurrence: recurrence, parentId: parentId, createdAt: now, updatedAt: now, sortOrder: 0)
     }
 
     public func listTasks(projectId: Int64? = nil) throws -> [TodoTask] {
@@ -379,6 +385,28 @@ public final class Store: @unchecked Sendable {
         var out: [TodoTask] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(taskFromRow(stmt)) }
         return out
+    }
+
+    /// Subtasks of a parent task, ordered like the main list.
+    public func subtasks(parentId: Int64) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare("SELECT \(Self.taskCols) FROM tasks WHERE parent_id=? ORDER BY sort_order, id;", [.int(parentId)])
+        defer { sqlite3_finalize(stmt) }
+        var out: [TodoTask] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { out.append(taskFromRow(stmt)) }
+        return out
+    }
+
+    /// Completion progress of a parent's subtasks: (done, total).
+    public func subtaskProgress(parentId: Int64) throws -> (done: Int, total: Int) {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),0) FROM tasks WHERE parent_id=?;",
+            [.int(parentId)]
+        )
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return (0, 0) }
+        return (Int(sqlite3_column_int64(stmt, 1)), Int(sqlite3_column_int64(stmt, 0)))
     }
 
     public func getTask(id: Int64) throws -> TodoTask {
@@ -571,9 +599,12 @@ public final class Store: @unchecked Sendable {
 
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
-        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence
+        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
+        }
+        func int64Opt(_ i: Int32) -> Int64? {
+            sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, i)
         }
         return TodoTask(
             id: sqlite3_column_int64(stmt, 0),
@@ -590,6 +621,7 @@ public final class Store: @unchecked Sendable {
             startedAt: date(10),
             completedAt: date(11),
             effortSeconds: Int(sqlite3_column_int64(stmt, 12)),
+            parentId: int64Opt(17),
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13)),
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14)),
             sortOrder: Int(sqlite3_column_int64(stmt, 15))

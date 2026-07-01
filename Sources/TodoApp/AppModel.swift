@@ -159,6 +159,17 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
+    /// Add a subtask (one level of nesting) under a parent task.
+    func addSubtask(title: String, parent: TodoTask) {
+        _ = try? store.createTask(projectId: parent.projectId, title: title, parentId: parent.id)
+        reloadTasks()
+    }
+
+    /// Toggle a subtask between done and todo (checkbox behavior).
+    func toggleSubtaskDone(_ sub: TodoTask) {
+        updateTask(sub, status: sub.status == .done ? .todo : .done)
+    }
+
     func updateTask(_ task: TodoTask, title: String? = nil, detail: String? = nil, link: String?? = nil,
                     status: TaskStatus? = nil, priority: Priority? = nil, dueDate: Date?? = nil, tags: [String]? = nil,
                     recurrence: String?? = nil) {
@@ -200,12 +211,14 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
-    /// Reorder tasks within the current project after a drag.
-    func moveTasks(from offsets: IndexSet, to destination: Int) {
-        var ordered = tasks
+    /// Reorder the displayed rows after a drag. `displayed` is the array the List is
+    /// showing (top-level tasks in a project view; the flat list in a smart view), so
+    /// offsets line up regardless of nesting.
+    func moveTasks(_ displayed: [TodoTask], from offsets: IndexSet, to destination: Int) {
+        var ordered = displayed
         ordered.move(fromOffsets: offsets, toOffset: destination)
-        tasks = ordered // optimistic UI
         try? store.reorderTasks(orderedIds: ordered.map { $0.id })
+        reloadTasks()
     }
 
     // MARK: - Command actions (keyboard shortcuts)

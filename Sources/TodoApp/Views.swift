@@ -176,8 +176,10 @@ struct TaskListView: View {
                         Divider()
                     }
                     List(selection: $model.selectedTaskIds) {
-                        ForEach(model.tasks) { task in
-                            TaskRow(task: task)
+                        ForEach(displayedTasks) { task in
+                            TaskRow(task: task,
+                                    subtasks: subtasks(of: task),
+                                    showSubtaskUI: model.smartView == nil)
                                 .tag(task.id)
                                 .contextMenu {
                                     Button("Copy Code (\(task.code))") { model.copyCode(task.code) }
@@ -200,7 +202,7 @@ struct TaskListView: View {
                                     Button("Delete", role: .destructive) { model.deleteTask(task.id) }
                                 }
                         }
-                        .onMove { offsets, dest in model.moveTasks(from: offsets, to: dest) }
+                        .onMove { offsets, dest in model.moveTasks(displayedTasks, from: offsets, to: dest) }
                     }
                 }
             }
@@ -239,6 +241,17 @@ struct TaskListView: View {
     /// Projects other than the one currently selected (move/copy targets).
     private var otherProjects: [Project] {
         model.projects.filter { $0.id != model.selectedProjectId }
+    }
+
+    /// Rows shown as top-level List items. In a project view, only top-level tasks
+    /// (subtasks render nested under their parent); in a smart view, the flat list.
+    private var displayedTasks: [TodoTask] {
+        model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
+    }
+
+    /// Subtasks of a task, taken from the already-loaded flat list (project view only).
+    private func subtasks(of task: TodoTask) -> [TodoTask] {
+        model.smartView == nil ? model.tasks.filter { $0.parentId == task.id } : []
     }
 }
 
@@ -296,50 +309,104 @@ struct BulkActionBar: View {
 struct TaskRow: View {
     @EnvironmentObject var model: AppModel
     let task: TodoTask
+    var subtasks: [TodoTask] = []
+    var showSubtaskUI: Bool = false
+
+    @State private var addingSubtask = false
+    @State private var newSubtaskTitle = ""
+
+    private var doneCount: Int { subtasks.filter { $0.status == .done }.count }
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: { model.cycleStatus(task) }) {
-                Image(systemName: statusIcon)
-                    .foregroundStyle(statusColor)
-                    .font(.system(size: 16))
-            }
-            .buttonStyle(.plain)
-            .help("Click to cycle status")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Button(action: { model.cycleStatus(task) }) {
+                    Image(systemName: statusIcon)
+                        .foregroundStyle(statusColor)
+                        .font(.system(size: 16))
+                }
+                .buttonStyle(.plain)
+                .help("Click to cycle status")
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    if task.priority != .none {
-                        Image(systemName: "flag.fill").font(.caption2).foregroundStyle(priorityColor)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        if task.priority != .none {
+                            Image(systemName: "flag.fill").font(.caption2).foregroundStyle(priorityColor)
+                        }
+                        CodeBadge(code: task.code)
+                        Text(task.title)
+                            .strikethrough(task.status == .done)
+                            .foregroundStyle(task.status == .done ? .secondary : .primary)
+                        if !subtasks.isEmpty {
+                            Text("\(doneCount)/\(subtasks.count)")
+                                .font(.caption2.monospacedDigit().weight(.medium))
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(Color.secondary.opacity(0.15), in: Capsule())
+                                .foregroundStyle(doneCount == subtasks.count ? Color.green : .secondary)
+                                .help("\(doneCount) of \(subtasks.count) subtasks done")
+                        }
                     }
-                    CodeBadge(code: task.code)
-                    Text(task.title)
-                        .strikethrough(task.status == .done)
-                        .foregroundStyle(task.status == .done ? .secondary : .primary)
+                    HStack(spacing: 8) {
+                        if task.link != nil && !(task.link?.isEmpty ?? true) {
+                            Image(systemName: "link").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        if task.effortSeconds > 0 {
+                            Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        if let due = task.dueDate {
+                            Label(dueText(due), systemImage: "calendar")
+                                .font(.caption2)
+                                .foregroundStyle(isOverdue(due, task) ? Color.red : .secondary)
+                        }
+                        if let rec = task.recurrence, !rec.isEmpty {
+                            Text("↻ \(rec)").font(.caption2).foregroundStyle(.secondary)
+                        }
+                        ForEach(task.tags.prefix(3), id: \.self) { TagChip(text: $0) }
+                    }
                 }
-                HStack(spacing: 8) {
-                    if task.link != nil && !(task.link?.isEmpty ?? true) {
-                        Image(systemName: "link").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Text(task.status.display).font(.caption2).foregroundStyle(.secondary)
+            }
+
+            // Subtasks (one level of nesting), shown only for top-level tasks in a project view.
+            if showSubtaskUI && task.parentId == nil {
+                ForEach(subtasks) { sub in
+                    SubtaskRow(sub: sub)
+                }
+                if addingSubtask {
+                    HStack(spacing: 8) {
+                        Image(systemName: "square").foregroundStyle(.secondary)
+                        TextField("Subtask title", text: $newSubtaskTitle)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.callout)
+                            .onSubmit { commitSubtask() }
+                        Button("Add") { commitSubtask() }
+                            .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+                        Button("Cancel") { addingSubtask = false; newSubtaskTitle = "" }
                     }
-                    if task.effortSeconds > 0 {
-                        Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
-                            .font(.caption2).foregroundStyle(.secondary)
+                    .padding(.leading, 26)
+                } else {
+                    Button {
+                        addingSubtask = true
+                    } label: {
+                        Label("subtask", systemImage: "plus")
+                            .font(.caption)
                     }
-                    if let due = task.dueDate {
-                        Label(dueText(due), systemImage: "calendar")
-                            .font(.caption2)
-                            .foregroundStyle(isOverdue(due, task) ? Color.red : .secondary)
-                    }
-                    if let rec = task.recurrence, !rec.isEmpty {
-                        Text("↻ \(rec)").font(.caption2).foregroundStyle(.secondary)
-                    }
-                    ForEach(task.tags.prefix(3), id: \.self) { TagChip(text: $0) }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.leading, 26)
                 }
             }
-            Spacer()
-            Text(task.status.display).font(.caption2).foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+    }
+
+    private func commitSubtask() {
+        let t = newSubtaskTitle.trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty { model.addSubtask(title: t, parent: task) }
+        newSubtaskTitle = ""
+        addingSubtask = false
     }
 
     private var priorityColor: Color {
@@ -376,6 +443,31 @@ struct TaskRow: View {
         case .inProgress: return .orange
         case .done: return .green
         }
+    }
+}
+
+/// A single subtask line: checkbox + title, indented under its parent.
+struct SubtaskRow: View {
+    @EnvironmentObject var model: AppModel
+    let sub: TodoTask
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: { model.toggleSubtaskDone(sub) }) {
+                Image(systemName: sub.status == .done ? "checkmark.square.fill" : "square")
+                    .foregroundStyle(sub.status == .done ? Color.green : .secondary)
+                    .font(.system(size: 14))
+            }
+            .buttonStyle(.plain)
+            .help("Toggle done")
+
+            Text(sub.title)
+                .font(.callout)
+                .strikethrough(sub.status == .done)
+                .foregroundStyle(sub.status == .done ? .secondary : .primary)
+            Spacer()
+        }
+        .padding(.leading, 26)
     }
 }
 

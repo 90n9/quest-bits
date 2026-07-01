@@ -114,8 +114,21 @@ final class MCPServer {
             return try jsonString(taskDict(store.getTask(id: try resolveTaskId(args))))
 
         case "create_task":
+            // Optional parent (subtask). If given and no project is specified,
+            // the subtask inherits the parent's project.
+            let parentId: Int64? = (args["parent_id"] != nil || args["parent_code"] != nil)
+                ? try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code")
+                : nil
+            let projectId: Int64
+            if args["project_id"] != nil || args["project_code"] != nil {
+                projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            } else if let parentId {
+                projectId = try store.getTask(id: parentId).projectId
+            } else {
+                projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            }
             let task = try store.createTask(
-                projectId: try resolveProjectId(args, idKey: "project_id", codeKey: "project_code"),
+                projectId: projectId,
                 title: try requireString(args, "title"),
                 detail: args["detail"] as? String ?? "",
                 link: args["link"] as? String,
@@ -123,7 +136,8 @@ final class MCPServer {
                 priority: parsePriority(args["priority"]) ?? .none,
                 dueDate: parseDate(args["due_date"]),
                 tags: parseTags(args["tags"]) ?? [],
-                recurrence: args["recurrence"] as? String
+                recurrence: args["recurrence"] as? String,
+                parentId: parentId
             )
             return try jsonString(taskDict(task))
 
@@ -248,6 +262,7 @@ final class MCPServer {
             "due_date": t.dueDate.map(iso) ?? NSNull(),
             "tags": t.tags,
             "recurrence": t.recurrence ?? NSNull(),
+            "parent_id": t.parentId ?? NSNull(),
             "started_at": t.startedAt.map(iso) ?? NSNull(),
             "completed_at": t.completedAt.map(iso) ?? NSNull(),
             "effort_minutes": t.effortSeconds / 60,
@@ -298,10 +313,15 @@ final class MCPServer {
 
     /// Resolve a task id from either `id` (int) or `code` (string handle like "GEN-3").
     private func resolveTaskId(_ args: [String: Any]) throws -> Int64 {
-        if let n = args["id"] as? NSNumber { return n.int64Value }
-        if let s = args["id"] as? String, let n = Int64(s) { return n }
-        if let code = args["code"] as? String, let id = store.taskId(forCode: code) { return id }
-        throw MCPError.missingArg("id or code")
+        try resolveTaskId(args, idKey: "id", codeKey: "code")
+    }
+
+    /// Resolve a task id from arbitrary `<idKey>` (int) or `<codeKey>` (string code).
+    private func resolveTaskId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
+        if let n = args[idKey] as? NSNumber { return n.int64Value }
+        if let s = args[idKey] as? String, let n = Int64(s) { return n }
+        if let code = args[codeKey] as? String, let id = store.taskId(forCode: code) { return id }
+        throw MCPError.missingArg("\(idKey) or \(codeKey)")
     }
 
     /// Resolve a project id from `<idKey>` (int) or `<codeKey>` (string code).
