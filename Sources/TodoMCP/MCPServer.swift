@@ -119,6 +119,12 @@ final class MCPServer {
             let parentId: Int64? = (args["parent_id"] != nil || args["parent_code"] != nil)
                 ? try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code")
                 : nil
+            // Enforce the one-level nesting invariant: a subtask cannot itself be a
+            // parent. The SwiftUI path enforces this (SubtaskRow has no "+ subtask");
+            // guard the MCP path too so agents can't create unreachable grandchildren.
+            if let parentId, try store.getTask(id: parentId).parentId != nil {
+                throw MCPError.invalidArg("parent must be a top-level task; subtasks support only one level of nesting")
+            }
             let projectId: Int64
             if args["project_id"] != nil || args["project_code"] != nil {
                 projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
@@ -378,10 +384,12 @@ final class MCPServer {
 
 enum MCPError: Error, CustomStringConvertible {
     case missingArg(String)
+    case invalidArg(String)
     case unknownTool(String)
     var description: String {
         switch self {
         case .missingArg(let k): return "missing or invalid argument: \(k)"
+        case .invalidArg(let m): return "invalid argument: \(m)"
         case .unknownTool(let t): return "unknown tool: \(t)"
         }
     }
