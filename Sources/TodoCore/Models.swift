@@ -160,6 +160,40 @@ public struct DailyStats: Codable, Hashable, Sendable {
     }
 }
 
+/// Per-day aggregated activity for the stats dashboard (one row per calendar day).
+public struct DayStat: Identifiable, Codable, Hashable, Sendable {
+    public var date: String          // yyyy-MM-dd, local
+    public var focusSeconds: Int     // focused time logged that day
+    public var pomodoros: Int        // completed focus sessions that day
+    public var tasksCompleted: Int   // tasks whose completed_at falls on that day
+
+    public var id: String { date }
+
+    public init(date: String, focusSeconds: Int, pomodoros: Int, tasksCompleted: Int) {
+        self.date = date
+        self.focusSeconds = focusSeconds
+        self.pomodoros = pomodoros
+        self.tasksCompleted = tasksCompleted
+    }
+}
+
+/// Effort accrued against a single project, for the dashboard's per-project chart.
+public struct ProjectEffort: Identifiable, Codable, Hashable, Sendable {
+    public var projectId: Int64
+    public var code: String
+    public var name: String
+    public var effortSeconds: Int
+
+    public var id: Int64 { projectId }
+
+    public init(projectId: Int64, code: String, name: String, effortSeconds: Int) {
+        self.projectId = projectId
+        self.code = code
+        self.name = name
+        self.effortSeconds = effortSeconds
+    }
+}
+
 /// User-configurable pomodoro durations (seconds) + behavior flags.
 public struct PomodoroSettings: Codable, Hashable, Sendable {
     public var focusSeconds: Int

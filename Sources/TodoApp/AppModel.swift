@@ -22,6 +22,11 @@ final class AppModel: ObservableObject {
     @Published var smartView: SmartView?      // when set, tasks span all projects
     @Published var searchQuery: String = ""   // live filter over the displayed task list
 
+    // Stats dashboard: when shown, the content column swaps to the dashboard.
+    @Published var showDashboard = false
+    @Published var daySeries: [DayStat] = []
+    @Published var projectEfforts: [ProjectEffort] = []
+
     /// The single selected task id, or nil when zero or multiple are selected.
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
     @Published var stats: DailyStats = DailyStats(date: "", completedPomodoros: 0, totalFocusSeconds: 0)
@@ -88,6 +93,12 @@ final class AppModel: ObservableObject {
         }
         reloadTasks()
         reloadStats()
+        if showDashboard { reloadDashboard() }
+    }
+
+    func reloadDashboard() {
+        daySeries = (try? store.dailyStatsSeries(days: 7)) ?? []
+        projectEfforts = (try? store.effortByProject()) ?? []
     }
 
     func reloadTasks() {
@@ -106,6 +117,7 @@ final class AppModel: ObservableObject {
     }
 
     func selectProject(_ id: Int64?) {
+        showDashboard = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -114,11 +126,21 @@ final class AppModel: ObservableObject {
     }
 
     func selectSmartView(_ v: SmartView) {
+        showDashboard = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
         searchQuery = ""
         reloadTasks()
+    }
+
+    func selectDashboard() {
+        showDashboard = true
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        reloadDashboard()
     }
 
     /// Case-insensitive match of a task against the current search query

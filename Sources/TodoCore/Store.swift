@@ -682,6 +682,89 @@ public final class Store: @unchecked Sendable {
         return DailyStats(date: fmt.string(from: start), completedPomodoros: count, totalFocusSeconds: total)
     }
 
+    /// Per-day activity for the last `days` calendar days (oldest first, includes today):
+    /// focus seconds, completed pomodoros (focus sessions), and tasks completed that day.
+    /// Rows are bucketed by local start-of-day, matching `dailyStats`.
+    public func dailyStatsSeries(days: Int = 7) throws -> [DayStat] {
+        lock.lock(); defer { lock.unlock() }
+        let n = max(1, days)
+        let cal = Calendar.current
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.dateFormat = "yyyy-MM-dd"
+
+        // Build day buckets oldest → newest.
+        let todayStart = cal.startOfDay(for: Date())
+        var labels: [String] = []
+        var focus: [String: (secs: Int, count: Int)] = [:]
+        var done: [String: Int] = [:]
+        for offset in stride(from: n - 1, through: 0, by: -1) {
+            guard let start = cal.date(byAdding: .day, value: -offset, to: todayStart) else { continue }
+            labels.append(fmt.string(from: start))
+        }
+        guard let rangeStart = cal.date(byAdding: .day, value: -(n - 1), to: todayStart),
+              let rangeEnd = cal.date(byAdding: .day, value: 1, to: todayStart) else {
+            return labels.map { DayStat(date: $0, focusSeconds: 0, pomodoros: 0, tasksCompleted: 0) }
+        }
+        let lo = SQLValue.int(Int64(rangeStart.timeIntervalSince1970))
+        let hi = SQLValue.int(Int64(rangeEnd.timeIntervalSince1970))
+
+        // Focus sessions in range → bucket by started_at's local day.
+        if let stmt = try? prepare(
+            "SELECT started_at, focus_seconds FROM focus_sessions WHERE started_at >= ? AND started_at < ?;", [lo, hi]) {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let day = cal.startOfDay(for: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)))
+                let key = fmt.string(from: day)
+                var e = focus[key] ?? (0, 0)
+                e.secs += Int(sqlite3_column_int64(stmt, 1))
+                e.count += 1
+                focus[key] = e
+            }
+            sqlite3_finalize(stmt)
+        }
+
+        // Tasks completed in range → bucket by completed_at's local day.
+        if let stmt = try? prepare(
+            "SELECT completed_at FROM tasks WHERE completed_at IS NOT NULL AND completed_at >= ? AND completed_at < ?;", [lo, hi]) {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let day = cal.startOfDay(for: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)))
+                let key = fmt.string(from: day)
+                done[key, default: 0] += 1
+            }
+            sqlite3_finalize(stmt)
+        }
+
+        return labels.map { key in
+            let f = focus[key] ?? (0, 0)
+            return DayStat(date: key, focusSeconds: f.secs, pomodoros: f.count, tasksCompleted: done[key] ?? 0)
+        }
+    }
+
+    /// Total accrued effort per project (all projects, highest first; zero-effort projects included).
+    public func effortByProject() throws -> [ProjectEffort] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            """
+            SELECT p.id, p.code, p.name, COALESCE(SUM(t.effort_seconds), 0) AS eff
+            FROM projects p
+            LEFT JOIN tasks t ON t.project_id = p.id
+            GROUP BY p.id, p.code, p.name
+            ORDER BY eff DESC, p.name;
+            """, [])
+        defer { sqlite3_finalize(stmt) }
+        var out: [ProjectEffort] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append(ProjectEffort(
+                projectId: sqlite3_column_int64(stmt, 0),
+                code: colText(stmt, 1),
+                name: colText(stmt, 2),
+                effortSeconds: Int(sqlite3_column_int64(stmt, 3))
+            ))
+        }
+        return out
+    }
+
     // MARK: - Settings (pomodoro durations)
 
     public func loadSettings() throws -> PomodoroSettings {

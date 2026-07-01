@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Charts
 
 // MARK: - Root
 
@@ -12,10 +13,19 @@ struct ContentView: View {
                 ProjectSidebar()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
             } content: {
-                TaskListView()
-                    .navigationSplitViewColumnWidth(min: 280, ideal: 360)
+                if model.showDashboard {
+                    DashboardView()
+                        .navigationSplitViewColumnWidth(min: 420, ideal: 560)
+                } else {
+                    TaskListView()
+                        .navigationSplitViewColumnWidth(min: 280, ideal: 360)
+                }
             } detail: {
-                TaskDetailView()
+                if model.showDashboard {
+                    ContentUnavailableViewCompat(text: "Your activity at a glance")
+                } else {
+                    TaskDetailView()
+                }
             }
             .frame(maxHeight: .infinity)
             Divider()
@@ -66,6 +76,11 @@ struct ProjectSidebar: View {
                         .onTapGesture { model.selectSmartView(v) }
                         .listRowBackground(model.smartView == v ? Color.accentColor.opacity(0.15) : Color.clear)
                 }
+                Label("Dashboard", systemImage: "chart.bar.xaxis")
+                    .foregroundStyle(model.showDashboard ? Color.accentColor : .primary)
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.selectDashboard() }
+                    .listRowBackground(model.showDashboard ? Color.accentColor.opacity(0.15) : Color.clear)
             }
             Section("Projects") {
                 ForEach(model.projects) { p in
@@ -1036,6 +1051,199 @@ struct CopyCodeButton: View {
                 .contentTransition(.symbolEffect(.replace))
         }
         .disabled(copied)
+    }
+}
+
+// MARK: - Stats dashboard
+
+/// A single bar-chart datum (label on the x-axis, numeric height).
+struct BarDatum: Identifiable, Hashable {
+    let label: String
+    let value: Double
+    var id: String { label }
+}
+
+/// Format a minutes value as "45m" / "1h 5m".
+func fmtMinutes(_ minutes: Double) -> String {
+    let m = max(0, Int(minutes.rounded()))
+    if m < 60 { return "\(m)m" }
+    return "\(m / 60)h \(m % 60)m"
+}
+
+/// The stats dashboard: focus, pomodoros, and completed tasks per day (last 7 days),
+/// plus accrued effort per project. Uses Swift Charts, with a custom fallback below macOS 13.
+struct DashboardView: View {
+    @EnvironmentObject var model: AppModel
+
+    private var totalFocusSeconds: Int { model.daySeries.reduce(0) { $0 + $1.focusSeconds } }
+    private var totalPomodoros: Int { model.daySeries.reduce(0) { $0 + $1.pomodoros } }
+    private var totalCompleted: Int { model.daySeries.reduce(0) { $0 + $1.tasksCompleted } }
+    private var totalTrackedSeconds: Int { model.projectEfforts.reduce(0) { $0 + $1.effortSeconds } }
+
+    private var focusData: [BarDatum] {
+        model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.focusSeconds) / 60.0) }
+    }
+    private var pomodoroData: [BarDatum] {
+        model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.pomodoros)) }
+    }
+    private var completedData: [BarDatum] {
+        model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.tasksCompleted)) }
+    }
+    /// Top projects by effort (skip zero-effort ones; show at most 8).
+    private var effortData: [BarDatum] {
+        model.projectEfforts
+            .filter { $0.effortSeconds > 0 }
+            .prefix(8)
+            .map { BarDatum(label: $0.code, value: Double($0.effortSeconds) / 60.0) }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                Text("Stats").font(.largeTitle.bold())
+
+                // Summary tiles (last 7 days + all-time tracked effort).
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
+                    StatTile(icon: "clock", tint: .orange, value: fmtEffort(totalFocusSeconds), label: "Focus (7d)")
+                    StatTile(icon: "checkmark.seal", tint: .red, value: "\(totalPomodoros)", label: "Pomodoros (7d)")
+                    StatTile(icon: "checkmark.circle", tint: .green, value: "\(totalCompleted)", label: "Completed (7d)")
+                    StatTile(icon: "hourglass", tint: .blue, value: fmtEffort(totalTrackedSeconds), label: "Tracked effort")
+                }
+
+                ChartCard(title: "Focus per day", subtitle: "minutes, last 7 days") {
+                    BarChartView(data: focusData, unit: "min", tint: .orange) { fmtMinutes($0) }
+                }
+                ChartCard(title: "Pomodoros per day", subtitle: "completed focus sessions") {
+                    BarChartView(data: pomodoroData, unit: "count", tint: .red) { "\(Int($0))" }
+                }
+                ChartCard(title: "Tasks completed per day", subtitle: "last 7 days") {
+                    BarChartView(data: completedData, unit: "count", tint: .green) { "\(Int($0))" }
+                }
+                ChartCard(title: "Effort per project", subtitle: "minutes tracked, top projects") {
+                    if effortData.isEmpty {
+                        Text("No tracked effort yet — run a focus timer on an in-progress task.")
+                            .font(.callout).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 120)
+                    } else {
+                        BarChartView(data: effortData, unit: "min", tint: .blue) { fmtMinutes($0) }
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .navigationTitle("Dashboard")
+        .onAppear { model.reloadDashboard() }
+    }
+
+    /// Short weekday ("Mon") for a yyyy-MM-dd date string; falls back to the raw string.
+    private func weekday(_ ymd: String) -> String {
+        let inFmt = DateFormatter()
+        inFmt.locale = Locale(identifier: "en_US_POSIX")
+        inFmt.calendar = Calendar(identifier: .gregorian)
+        inFmt.dateFormat = "yyyy-MM-dd"
+        guard let d = inFmt.date(from: ymd) else { return ymd }
+        let out = DateFormatter()
+        out.calendar = Calendar(identifier: .gregorian)
+        out.dateFormat = "EEE"
+        return out.string(from: d)
+    }
+}
+
+/// Compact summary tile: icon, big value, caption.
+struct StatTile: View {
+    let icon: String
+    let tint: Color
+    let value: String
+    let label: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: icon).font(.title3).foregroundStyle(tint)
+            Text(value).font(.title2.bold().monospacedDigit())
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// A titled card wrapping a chart.
+struct ChartCard<Content: View>: View {
+    let title: String
+    let subtitle: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// Bar chart over `data`. Uses Swift Charts on macOS 13+, else a lightweight
+/// GeometryReader/rectangle fallback so the build never depends on Charts at runtime.
+struct BarChartView: View {
+    let data: [BarDatum]
+    let unit: String
+    let tint: Color
+    let format: (Double) -> String
+
+    var body: some View {
+        if #available(macOS 13.0, *) {
+            Chart(data) { d in
+                BarMark(
+                    x: .value("Category", d.label),
+                    y: .value(unit, d.value)
+                )
+                .foregroundStyle(tint.gradient)
+                .annotation(position: .top) {
+                    if d.value > 0 {
+                        Text(format(d.value)).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .chartXScale(domain: data.map(\.label))
+            .frame(height: 170)
+        } else {
+            FallbackBarChart(data: data, tint: tint, format: format)
+                .frame(height: 170)
+        }
+    }
+}
+
+/// Custom bar chart for SDKs without Swift Charts.
+struct FallbackBarChart: View {
+    let data: [BarDatum]
+    let tint: Color
+    let format: (Double) -> String
+
+    var body: some View {
+        let maxV = max(data.map(\.value).max() ?? 1, 1)
+        GeometryReader { geo in
+            let barArea = max(geo.size.height - 34, 1)
+            HStack(alignment: .bottom, spacing: 8) {
+                ForEach(data) { d in
+                    VStack(spacing: 4) {
+                        Text(d.value > 0 ? format(d.value) : "")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .frame(height: 14)
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(tint)
+                            .frame(height: CGFloat(d.value / maxV) * barArea)
+                        Text(d.label).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+        }
     }
 }
 
