@@ -240,7 +240,14 @@ struct TaskListView: View {
                                 Button("Delete", role: .destructive) { model.deleteTask(task.id) }
                             }
                     }
-                    .onMove { offsets, dest in model.moveTasks(displayedTasks, from: offsets, to: dest) }
+                    .onMove { offsets, dest in
+                        // Reordering rewrites a dense sort_order for exactly the ids passed in.
+                        // That is only correct when displayedTasks is the full unfiltered list;
+                        // while searching it is a filtered subset, so a drag would clobber the
+                        // ordering of hidden tasks. Disable reordering during search.
+                        guard !isSearching else { return }
+                        model.moveTasks(displayedTasks, from: offsets, to: dest)
+                    }
                 }
             }
         }
