@@ -1,0 +1,100 @@
+import Foundation
+
+extension MCPServer {
+    /// MCP tool schemas advertised via tools/list.
+    static var toolDefinitions: [[String: Any]] {
+        func obj(_ props: [String: Any], required: [String] = []) -> [String: Any] {
+            ["type": "object", "properties": props, "required": required]
+        }
+        let str: [String: Any] = ["type": "string"]
+        let int: [String: Any] = ["type": "integer"]
+        let statusEnum: [String: Any] = ["type": "string", "enum": ["todo", "in_progress", "done"]]
+        let priorityEnum: [String: Any] = ["type": "string", "enum": ["none", "low", "medium", "high"]]
+        let dateStr: [String: Any] = ["type": "string", "description": "ISO-8601 or yyyy-MM-dd; null to clear"]
+        let tagsArr: [String: Any] = ["type": "array", "items": str]
+
+        return [
+            ["name": "list_projects",
+             "description": "List all projects. Each has a short `code` (e.g. GEN) usable as a handle.",
+             "inputSchema": obj([:])],
+
+            ["name": "create_project",
+             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned.",
+             "inputSchema": obj(["name": str, "description": str], required: ["name"])],
+
+            ["name": "rename_project",
+             "description": "Rename a project, identified by `id` or `code`.",
+             "inputSchema": obj(["id": int, "code": str, "name": str], required: ["name"])],
+
+            ["name": "update_project",
+             "description": "Update a project's `name` and/or `description` (identify by `id` or `code`).",
+             "inputSchema": obj(["id": int, "code": str, "name": str, "description": str])],
+
+            ["name": "delete_project",
+             "description": "Delete a project and all its tasks. Identify by `id` or `code`.",
+             "inputSchema": obj(["id": int, "code": str])],
+
+            ["name": "list_tasks",
+             "description": "List tasks, optionally filtered by `project_id` or `project_code`.",
+             "inputSchema": obj(["project_id": int, "project_code": str])],
+
+            ["name": "get_task",
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3).",
+             "inputSchema": obj(["id": int, "code": str])],
+
+            ["name": "create_task",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags optional; status defaults to todo. Returns the task with its new code.",
+             "inputSchema": obj([
+                "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr
+             ], required: ["title"])],
+
+            ["name": "update_task",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null or due_date:null to clear them. Use this to update progress status, priority, due date, or tags.",
+             "inputSchema": obj([
+                "id": int, "code": str, "title": str, "detail": str, "link": str,
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr
+             ])],
+
+            ["name": "delete_task",
+             "description": "Delete a task by `id` or `code`.",
+             "inputSchema": obj(["id": int, "code": str])],
+
+            ["name": "duplicate_task",
+             "description": "Clone a task (by `id` or `code`). Without a target it duplicates in the same project; with `to_project_id`/`to_project_code` it copies there (original kept). The copy gets a fresh code.",
+             "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
+
+            ["name": "move_task",
+             "description": "Move (transfer) a task (by `id` or `code`) to another project (`to_project_id` or `to_project_code`).",
+             "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
+
+            ["name": "bulk_update_tasks",
+             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, priority, due_date, add_tags to all. add_tags merges (keeps existing).",
+             "inputSchema": obj([
+                "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "add_tags": tagsArr
+             ])],
+
+            ["name": "bulk_move_tasks",
+             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`.",
+             "inputSchema": obj([
+                "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
+                "to_project_id": int, "to_project_code": str, "copy": ["type": "boolean"]
+             ])],
+
+            ["name": "bulk_delete_tasks",
+             "description": "Delete many tasks at once. Give `ids` and/or `codes` arrays.",
+             "inputSchema": obj([
+                "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str]
+             ])],
+
+            ["name": "get_task_history",
+             "description": "Get the change history (status changes, etc.) for a task by `id` or `code`, newest first.",
+             "inputSchema": obj(["id": int, "code": str])],
+
+            ["name": "daily_stats",
+             "description": "Today's pomodoro stats: completed count and total focus minutes.",
+             "inputSchema": obj([:])]
+        ]
+    }
+}
