@@ -120,6 +120,17 @@ final class AppModel: ObservableObject {
         }
         inProgressTasks = all.filter { $0.status == .inProgress }
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
+        syncDueReminders(all)
+    }
+
+    /// Keep local due-date notifications in sync with the current task set.
+    /// Reconciles on every reload, so app edits and external (MCP) writes alike
+    /// schedule/replace/cancel reminders without per-mutation bookkeeping.
+    private func syncDueReminders(_ allTasks: [TodoTask]) {
+        NotificationScheduler.shared.reconcile(
+            tasks: allTasks,
+            enabled: settings.notificationsEnabled,
+            soundEnabled: settings.soundEnabled)
     }
 
     func reloadStats() {
@@ -387,6 +398,8 @@ final class AppModel: ObservableObject {
         settings = s
         pomodoro.settings = s
         try? store.saveSettings(s)
+        // Toggling notifications/sound takes effect immediately for due reminders.
+        syncDueReminders((try? store.listTasks(projectId: nil)) ?? [])
     }
 
     // MARK: - DB file watching (live reload on MCP writes)
