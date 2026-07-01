@@ -236,6 +236,18 @@ final class MCPServer {
             }
             return try jsonString(events)
 
+        case "add_dependency":
+            let tid = try resolveTaskId(args)
+            let dep = try resolveTaskId(args, idKey: "depends_on_id", codeKey: "depends_on_code")
+            try store.addDependency(taskId: tid, dependsOnId: dep)
+            return try jsonString(taskDict(store.getTask(id: tid)))
+
+        case "remove_dependency":
+            let tid = try resolveTaskId(args)
+            let dep = try resolveTaskId(args, idKey: "depends_on_id", codeKey: "depends_on_code")
+            try store.removeDependency(taskId: tid, dependsOnId: dep)
+            return try jsonString(taskDict(store.getTask(id: tid)))
+
         case "daily_stats":
             let stats = try store.dailyStats()
             return try jsonString([
@@ -269,6 +281,8 @@ final class MCPServer {
             "tags": t.tags,
             "recurrence": t.recurrence ?? NSNull(),
             "parent_id": t.parentId ?? NSNull(),
+            "depends_on": (try? store.dependencies(taskId: t.id)) ?? [],
+            "blocked": store.isBlocked(taskId: t.id),
             "started_at": t.startedAt.map(iso) ?? NSNull(),
             "completed_at": t.completedAt.map(iso) ?? NSNull(),
             "effort_minutes": t.effortSeconds / 60,

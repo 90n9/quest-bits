@@ -187,6 +187,17 @@ public final class Store: @unchecked Sendable {
         // --- Additive migration: subtasks (one level of nesting) ---
         if !columnExists("tasks", "parent_id") { exec("ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE;") }
         exec("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);")
+
+        // --- Additive migration: task dependencies (blocked-by edges) ---
+        exec("""
+        CREATE TABLE IF NOT EXISTS task_deps (
+            task_id       INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY(task_id, depends_on_id)
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_deps_task ON task_deps(task_id);")
+        exec("CREATE INDEX IF NOT EXISTS idx_deps_depends ON task_deps(depends_on_id);")
     }
 
     /// Assign codes to any pre-existing rows that lack them.
@@ -595,6 +606,80 @@ public final class Store: @unchecked Sendable {
             merged.append(tag)
         }
         try updateTask(id: id, tags: merged)
+    }
+
+    // MARK: - Dependencies (blocked-by)
+
+    /// The ids of tasks that `taskId` is blocked by (its depends-on list).
+    public func dependencies(taskId: Int64) throws -> [Int64] {
+        lock.lock(); defer { lock.unlock() }
+        return dependenciesUnlocked(taskId)
+    }
+
+    /// Read the depends-on ids without taking the lock (for use inside locked scopes).
+    private func dependenciesUnlocked(_ taskId: Int64) -> [Int64] {
+        guard let stmt = try? prepare("SELECT depends_on_id FROM task_deps WHERE task_id=? ORDER BY depends_on_id;", [.int(taskId)]) else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [Int64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }
+        return out
+    }
+
+    /// Record that `taskId` is blocked by `dependsOnId`. Rejects self-dependency and
+    /// any edge that would close a cycle (covers the obvious A→B / B→A case and
+    /// deeper transitive loops). Duplicate edges are ignored.
+    public func addDependency(taskId: Int64, dependsOnId: Int64) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard taskId != dependsOnId else {
+            throw StoreError.step("a task cannot depend on itself")
+        }
+        // If dependsOnId already (transitively) depends on taskId, adding
+        // taskId→dependsOnId would create a cycle.
+        if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
+            throw StoreError.step("adding this dependency would create a cycle")
+        }
+        try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
+    }
+
+    /// Remove the blocked-by edge `taskId`→`dependsOnId` (no-op if absent).
+    public func removeDependency(taskId: Int64, dependsOnId: Int64) throws {
+        lock.lock(); defer { lock.unlock() }
+        try runWrite("DELETE FROM task_deps WHERE task_id=? AND depends_on_id=?;", [.int(taskId), .int(dependsOnId)])
+    }
+
+    /// True if any of `taskId`'s dependencies is not yet done.
+    public func isBlocked(taskId: Int64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return isBlockedUnlocked(taskId)
+    }
+
+    private func isBlockedUnlocked(_ taskId: Int64) -> Bool {
+        (queryInt(
+            "SELECT COUNT(*) FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id WHERE d.task_id=? AND t.status != 'done';",
+            [.int(taskId)]) ?? 0) > 0
+    }
+
+    /// Ids of all tasks currently blocked (>=1 not-done dependency) — one query for the UI.
+    public func blockedTaskIds() throws -> [Int64] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            "SELECT DISTINCT d.task_id FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id WHERE t.status != 'done';", [])
+        defer { sqlite3_finalize(stmt) }
+        var out: [Int64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }
+        return out
+    }
+
+    /// Does `from` reach `to` by following depends-on edges transitively? (cycle guard)
+    private func dependsReachesUnlocked(from: Int64, to: Int64) -> Bool {
+        var seen: Set<Int64> = []
+        var stack: [Int64] = [from]
+        while let cur = stack.popLast() {
+            if cur == to { return true }
+            if !seen.insert(cur).inserted { continue }
+            stack.append(contentsOf: dependenciesUnlocked(cur))
+        }
+        return false
     }
 
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {

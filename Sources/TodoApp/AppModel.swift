@@ -26,6 +26,10 @@ final class AppModel: ObservableObject {
     // Refreshed alongside the displayed task list so it tracks status changes.
     @Published var inProgressTasks: [TodoTask] = []
 
+    // Ids of tasks currently blocked by an unfinished dependency (for the 🔒 badge).
+    // Recomputed alongside the displayed task list.
+    @Published var blockedTaskIds: Set<Int64> = []
+
     // Stats dashboard: when shown, the content column swaps to the dashboard.
     @Published var showDashboard = false
     @Published var daySeries: [DayStat] = []
@@ -115,6 +119,7 @@ final class AppModel: ObservableObject {
             tasks = []
         }
         inProgressTasks = all.filter { $0.status == .inProgress }
+        blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
     }
 
     func reloadStats() {
@@ -260,6 +265,38 @@ final class AppModel: ObservableObject {
         var ordered = displayed
         ordered.move(fromOffsets: offsets, toOffset: destination)
         try? store.reorderTasks(orderedIds: ordered.map { $0.id })
+        reloadTasks()
+    }
+
+    // MARK: - Dependencies (blocked-by)
+
+    /// All tasks across every project (for dependency pickers).
+    func allTasks() -> [TodoTask] {
+        (try? store.listTasks(projectId: nil)) ?? []
+    }
+
+    /// Look up a task by id, preferring the loaded list, falling back to the store.
+    func task(byId id: Int64) -> TodoTask? {
+        tasks.first(where: { $0.id == id }) ?? (try? store.getTask(id: id))
+    }
+
+    /// The ids `taskId` is blocked by.
+    func dependencies(of taskId: Int64) -> [Int64] {
+        (try? store.dependencies(taskId: taskId)) ?? []
+    }
+
+    /// Add a blocked-by edge; surfaces store rejections (self/cycle) as a toast.
+    func addDependency(_ taskId: Int64, dependsOn depId: Int64) {
+        do {
+            try store.addDependency(taskId: taskId, dependsOnId: depId)
+            reloadTasks()
+        } catch {
+            flashToast("\(error)")
+        }
+    }
+
+    func removeDependency(_ taskId: Int64, dependsOn depId: Int64) {
+        try? store.removeDependency(taskId: taskId, dependsOnId: depId)
         reloadTasks()
     }
 

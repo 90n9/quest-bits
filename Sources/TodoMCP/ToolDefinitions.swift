@@ -94,6 +94,14 @@ extension MCPServer {
              "description": "Get the change history (status changes, etc.) for a task by `id` or `code`, newest first.",
              "inputSchema": obj(["id": int, "code": str])],
 
+            ["name": "add_dependency",
+             "description": "Make a task blocked by another. The task (`id`/`code`) stays blocked until the dependency (`depends_on_id`/`depends_on_code`) is done. Rejects self-dependency and cycles.",
+             "inputSchema": obj(["id": int, "code": str, "depends_on_id": int, "depends_on_code": str])],
+
+            ["name": "remove_dependency",
+             "description": "Remove a blocked-by dependency: task (`id`/`code`) no longer depends on (`depends_on_id`/`depends_on_code`).",
+             "inputSchema": obj(["id": int, "code": str, "depends_on_id": int, "depends_on_code": str])],
+
             ["name": "daily_stats",
              "description": "Today's pomodoro stats: completed count and total focus minutes.",
              "inputSchema": obj([:])]

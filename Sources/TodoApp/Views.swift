@@ -391,13 +391,22 @@ struct TaskRow: View {
 
     @State private var addingSubtask = false
     @State private var newSubtaskTitle = ""
+    @State private var showBlockedAlert = false
 
     private var doneCount: Int { subtasks.filter { $0.status == .done }.count }
+    private var isBlocked: Bool { model.blockedTaskIds.contains(task.id) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 10) {
-                Button(action: { model.cycleStatus(task) }) {
+                Button(action: {
+                    // Cycling todo → In Progress on a blocked task asks for confirmation.
+                    if task.status == .todo && isBlocked {
+                        showBlockedAlert = true
+                    } else {
+                        model.cycleStatus(task)
+                    }
+                }) {
                     Image(systemName: statusIcon)
                         .foregroundStyle(statusColor)
                         .font(.system(size: 16))
@@ -421,6 +430,14 @@ struct TaskRow: View {
                                 .background(Color.secondary.opacity(0.15), in: Capsule())
                                 .foregroundStyle(doneCount == subtasks.count ? Color.green : .secondary)
                                 .help("\(doneCount) of \(subtasks.count) subtasks done")
+                        }
+                        if isBlocked {
+                            Text("🔒 blocked")
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(Color.red.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.red)
+                                .help("Blocked by an unfinished dependency")
                         }
                     }
                     HStack(spacing: 8) {
@@ -477,6 +494,12 @@ struct TaskRow: View {
             }
         }
         .padding(.vertical, 2)
+        .alert("Task is blocked", isPresented: $showBlockedAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Start anyway") { model.cycleStatus(task) }
+        } message: {
+            Text("This task is blocked by an unfinished dependency. Move it to In Progress anyway?")
+        }
     }
 
     private func commitSubtask() {
@@ -563,6 +586,10 @@ struct TaskDetailView: View {
     @State private var tagsText = ""
     @State private var recurrence = "none"   // "none" | "daily" | "weekly" | "monthly"
 
+    // Blocked-task guard: confirm before moving a blocked task to In Progress.
+    @State private var showBlockedAlert = false
+    @State private var statusBeforeBlock: TaskStatus = .todo
+
     var body: some View {
         Group {
             if let task = currentTask {
@@ -602,6 +629,46 @@ struct TaskDetailView: View {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 6) {
                                     ForEach(parsedTags, id: \.self) { TagChip(text: $0) }
+                                }
+                            }
+                        }
+                    }
+                    Section("Blocked By") {
+                        let deps = model.dependencies(of: task.id)
+                        if deps.isEmpty {
+                            Text("No blocking tasks").foregroundStyle(.secondary).font(.caption)
+                        } else {
+                            ForEach(deps, id: \.self) { depId in
+                                if let dep = model.task(byId: depId) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: dep.status == .done ? "checkmark.circle.fill" : "circle")
+                                            .foregroundStyle(dep.status == .done ? Color.green : Color.orange)
+                                        CodeBadge(code: dep.code)
+                                        Text(dep.title).lineLimit(1)
+                                        Spacer()
+                                        Button {
+                                            model.removeDependency(task.id, dependsOn: depId)
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .foregroundStyle(.secondary)
+                                        .help("Remove dependency")
+                                    }
+                                }
+                            }
+                        }
+                        Menu("Add blocking task…") {
+                            ForEach(model.projects) { p in
+                                let cands = candidateDeps(for: task).filter { $0.projectId == p.id }
+                                if !cands.isEmpty {
+                                    Menu(p.name) {
+                                        ForEach(cands, id: \.id) { cand in
+                                            Button("\(cand.code)  \(cand.title)") {
+                                                model.addDependency(task.id, dependsOn: cand.id)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -649,12 +716,26 @@ struct TaskDetailView: View {
                 .onChange(of: title) { _, _ in autosave() }
                 .onChange(of: detail) { _, _ in autosave() }
                 .onChange(of: link) { _, _ in autosave() }
-                .onChange(of: status) { _, _ in autosave() }
+                .onChange(of: status) { old, new in
+                    // Moving a blocked task to In Progress requires confirmation.
+                    if new == .inProgress, let t = currentTask, model.blockedTaskIds.contains(t.id) {
+                        statusBeforeBlock = old
+                        showBlockedAlert = true
+                    } else {
+                        autosave()
+                    }
+                }
                 .onChange(of: priority) { _, _ in autosave() }
                 .onChange(of: hasDue) { _, _ in autosave() }
                 .onChange(of: dueDate) { _, _ in autosave() }
                 .onChange(of: tagsText) { _, _ in autosave() }
                 .onChange(of: recurrence) { _, _ in autosave() }
+                .alert("Task is blocked", isPresented: $showBlockedAlert) {
+                    Button("Cancel", role: .cancel) { status = statusBeforeBlock }
+                    Button("Start anyway") { autosave() }
+                } message: {
+                    Text("This task is blocked by an unfinished dependency. Move it to In Progress anyway?")
+                }
             } else {
                 ContentUnavailableViewCompat(text: model.selectedTaskIds.count >= 2
                     ? "\(model.selectedTaskIds.count) tasks selected — use the bulk bar above"
@@ -665,6 +746,13 @@ struct TaskDetailView: View {
 
     private var parsedTags: [String] {
         tagsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    /// Tasks eligible to become a blocking dependency: any task other than this one
+    /// that isn't already a dependency. The store rejects cycles on add.
+    private func candidateDeps(for task: TodoTask) -> [TodoTask] {
+        let existing = Set(model.dependencies(of: task.id))
+        return model.allTasks().filter { $0.id != task.id && !existing.contains($0.id) }
     }
 
     /// True when the editor fields differ from the stored task.
