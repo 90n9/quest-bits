@@ -13,6 +13,7 @@ extension MCPServer {
         let dateStr: [String: Any] = ["type": "string", "description": "ISO-8601 or yyyy-MM-dd; null to clear"]
         let tagsArr: [String: Any] = ["type": "array", "items": str]
         let recurrenceEnum: [String: Any] = ["type": "string", "enum": ["daily", "weekly", "monthly"], "description": "repeat interval; null to clear. On completion, spawns the next occurrence with the due date advanced."]
+        let estimateInt: [String: Any] = ["type": "integer", "description": "planned effort in minutes (0 = unset). Compared against actual tracked effort_minutes."]
 
         return [
             ["name": "list_projects",
@@ -48,14 +49,15 @@ extension MCPServer {
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
-                "parent_id": int, "parent_code": str
+                "estimate_minutes": estimateInt, "parent_id": int, "parent_code": str
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, or recurrence.",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
+                "estimate_minutes": estimateInt
              ])],
 
             ["name": "delete_task",

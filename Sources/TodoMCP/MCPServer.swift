@@ -143,7 +143,8 @@ final class MCPServer {
                 dueDate: parseDate(args["due_date"]),
                 tags: parseTags(args["tags"]) ?? [],
                 recurrence: args["recurrence"] as? String,
-                parentId: parentId
+                parentId: parentId,
+                estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60
             )
             return try jsonString(taskDict(task))
 
@@ -180,7 +181,8 @@ final class MCPServer {
                 priority: parsePriority(args["priority"]),
                 dueDate: dueArg,
                 tags: parseTags(args["tags"]),
-                recurrence: recurArg
+                recurrence: recurArg,
+                estimateSeconds: parseMinutes(args["estimate_minutes"]).map { $0 * 60 }
             )
             return try jsonString(taskDict(store.getTask(id: id)))
 
@@ -287,6 +289,8 @@ final class MCPServer {
             "completed_at": t.completedAt.map(iso) ?? NSNull(),
             "effort_minutes": t.effortSeconds / 60,
             "effort_seconds": t.effortSeconds,
+            "estimate_minutes": t.estimateSeconds / 60,
+            "estimate_seconds": t.estimateSeconds,
             "created_at": iso(t.createdAt),
             "updated_at": iso(t.updatedAt)
         ]
@@ -302,6 +306,13 @@ final class MCPServer {
         f.dateFormat = "yyyy-MM-dd"
         f.timeZone = .current
         return f.date(from: s)
+    }
+
+    /// Parse an integer minutes argument (accepts JSON number or numeric string). nil if absent/invalid.
+    private func parseMinutes(_ v: Any?) -> Int? {
+        if let n = v as? NSNumber { return max(0, n.intValue) }
+        if let s = v as? String, let n = Int(s) { return max(0, n) }
+        return nil
     }
 
     private func parseTags(_ v: Any?) -> [String]? {

@@ -453,6 +453,9 @@ struct TaskRow: View {
                             Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
+                        if task.estimateSeconds > 0 {
+                            EstimateBadge(estimateSeconds: task.estimateSeconds, actualSeconds: task.effortSeconds)
+                        }
                         if let due = task.dueDate {
                             Label(dueText(due), systemImage: "calendar")
                                 .font(.caption2)
@@ -754,6 +757,9 @@ struct BoardCard: View {
                     Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
+                if task.estimateSeconds > 0 {
+                    EstimateBadge(estimateSeconds: task.estimateSeconds, actualSeconds: task.effortSeconds)
+                }
                 if let due = task.dueDate {
                     Label(dueText(due), systemImage: "calendar")
                         .font(.caption2).foregroundStyle(.secondary)
@@ -806,6 +812,7 @@ struct TaskDetailView: View {
     @State private var dueDate = Date()
     @State private var tagsText = ""
     @State private var recurrence = "none"   // "none" | "daily" | "weekly" | "monthly"
+    @State private var estimateMinutes = 0   // 0 = no estimate
 
     // Blocked-task guard: confirm before moving a blocked task to In Progress.
     @State private var showBlockedAlert = false
@@ -907,6 +914,16 @@ struct TaskDetailView: View {
                             .frame(minHeight: 120)
                             .font(.body)
                     }
+                    Section("Estimate") {
+                        Stepper(value: $estimateMinutes, in: 0...6000, step: 5) {
+                            Text(estimateMinutes == 0 ? "No estimate" : "Estimate: \(fmtMinutes(Double(estimateMinutes)))")
+                        }
+                        if estimateMinutes > 0 {
+                            EstimateVsActualView(estimateSeconds: estimateMinutes * 60,
+                                                 actualSeconds: task.effortSeconds)
+                                .padding(.vertical, 2)
+                        }
+                    }
                     Section("Timing") {
                         LabeledContent("Effort", value: fmtEffort(task.effortSeconds))
                         if let s = task.startedAt {
@@ -951,6 +968,7 @@ struct TaskDetailView: View {
                 .onChange(of: dueDate) { _, _ in autosave() }
                 .onChange(of: tagsText) { _, _ in autosave() }
                 .onChange(of: recurrence) { _, _ in autosave() }
+                .onChange(of: estimateMinutes) { _, _ in autosave() }
                 .alert("Task is blocked", isPresented: $showBlockedAlert) {
                     Button("Cancel", role: .cancel) { status = statusBeforeBlock }
                     Button("Start anyway") { autosave() }
@@ -987,6 +1005,7 @@ struct TaskDetailView: View {
             || (hasDue && !sameDay(dueDate, t.dueDate))
             || parsedTags != t.tags
             || recurrence != (t.recurrence ?? "none")
+            || estimateMinutes * 60 != t.estimateSeconds
     }
 
     private func sameDay(_ a: Date, _ b: Date?) -> Bool {
@@ -1005,6 +1024,7 @@ struct TaskDetailView: View {
         dueDate = t.dueDate ?? Date()
         tagsText = t.tags.joined(separator: ", ")
         recurrence = t.recurrence ?? "none"
+        estimateMinutes = t.estimateSeconds / 60
     }
 
     /// Persist current editor state if it differs from the stored task.
@@ -1020,7 +1040,8 @@ struct TaskDetailView: View {
             priority: priority,
             dueDate: .some(hasDue ? dueDate : nil),
             tags: parsedTags,
-            recurrence: .some(recurrence == "none" ? nil : recurrence)
+            recurrence: .some(recurrence == "none" ? nil : recurrence),
+            estimateSeconds: estimateMinutes * 60
         )
     }
 }
@@ -1051,6 +1072,7 @@ struct HistoryRow: View {
         case "due date": return "Due date"
         case "tags": return "Tags"
         case "link": return "Link"
+        case "estimate": return "Estimate"
         case "project": return "Moved project"
         default: return event.field.capitalized
         }
@@ -1063,6 +1085,75 @@ func fmtEffort(_ seconds: Int) -> String {
     let m = seconds / 60
     if m < 60 { return "\(m)m" }
     return "\(m / 60)h \(m % 60)m"
+}
+
+/// Compact estimate-vs-actual chip for task rows: a target icon with the estimate,
+/// plus a signed over/under delta once any effort has been logged.
+struct EstimateBadge: View {
+    let estimateSeconds: Int
+    let actualSeconds: Int
+
+    var body: some View {
+        let over = actualSeconds > estimateSeconds
+        let delta = abs(actualSeconds - estimateSeconds)
+        HStack(spacing: 3) {
+            Image(systemName: "target").font(.caption2)
+            Text("est \(fmtEffort(estimateSeconds))")
+                .foregroundStyle(.secondary)
+            if actualSeconds > 0 && delta > 0 {
+                Text(over ? "+\(fmtEffort(delta))" : "-\(fmtEffort(delta))")
+                    .foregroundStyle(over ? Color.red : Color.green)
+            }
+        }
+        .font(.caption2)
+        .help("Estimate \(fmtEffort(estimateSeconds)) vs actual \(fmtEffort(actualSeconds))")
+    }
+}
+
+/// Estimate vs actual effort with a proportional bar and an under/over summary.
+/// The bar fills green up to the estimate and turns red once actual exceeds it.
+struct EstimateVsActualView: View {
+    let estimateSeconds: Int
+    let actualSeconds: Int
+
+    var body: some View {
+        let est = max(estimateSeconds, 1)
+        let ratio = min(Double(actualSeconds) / Double(est), 1.0)
+        let over = actualSeconds > estimateSeconds
+        let delta = abs(actualSeconds - estimateSeconds)
+        let pct = Int((Double(delta) / Double(est) * 100).rounded())
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("Estimate", systemImage: "target")
+                Spacer()
+                Text(fmtEffort(estimateSeconds)).monospacedDigit()
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.15))
+                    Capsule()
+                        .fill(over ? Color.red : Color.green)
+                        .frame(width: CGFloat(ratio) * geo.size.width)
+                }
+            }
+            .frame(height: 8)
+            HStack {
+                Text("Actual \(fmtEffort(actualSeconds))")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if actualSeconds == 0 {
+                    Text("not started").font(.caption2).foregroundStyle(.secondary)
+                } else if delta == 0 {
+                    Text("on estimate").font(.caption2).foregroundStyle(.green)
+                } else {
+                    Text(over ? "over by \(fmtEffort(delta)) (\(pct)%)" : "under by \(fmtEffort(delta)) (\(pct)%)")
+                        .font(.caption2)
+                        .foregroundStyle(over ? Color.red : Color.green)
+                }
+            }
+        }
+    }
 }
 
 /// Format a date+time, locale-safe (Gregorian).

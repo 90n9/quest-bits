@@ -198,6 +198,9 @@ public final class Store: @unchecked Sendable {
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_deps_task ON task_deps(task_id);")
         exec("CREATE INDEX IF NOT EXISTS idx_deps_depends ON task_deps(depends_on_id);")
+
+        // --- Additive migration: time estimate (compared against effort_seconds) ---
+        if !columnExists("tasks", "estimate_seconds") { exec("ALTER TABLE tasks ADD COLUMN estimate_seconds INTEGER NOT NULL DEFAULT 0;") }
     }
 
     /// Assign codes to any pre-existing rows that lack them.
@@ -335,17 +338,17 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds"
 
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                            status: TaskStatus = .todo, priority: Priority = .none,
                            dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
-                           parentId: Int64? = nil) throws -> TodoTask {
+                           parentId: Int64? = nil, estimateSeconds: Int = 0) throws -> TodoTask {
         lock.lock(); defer { lock.unlock() }
         return try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
                                       status: status, priority: priority, dueDate: dueDate, tags: tags,
-                                      recurrence: recurrence, parentId: parentId)
+                                      recurrence: recurrence, parentId: parentId, estimateSeconds: estimateSeconds)
     }
 
     /// Insert a task without taking the lock — for use inside already-locked methods
@@ -354,7 +357,7 @@ public final class Store: @unchecked Sendable {
     private func createTaskUnlocked(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                                     status: TaskStatus = .todo, priority: Priority = .none,
                                     dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
-                                    parentId: Int64? = nil) throws -> TodoTask {
+                                    parentId: Int64? = nil, estimateSeconds: Int = 0) throws -> TodoTask {
         let now = Date()
         // Next per-project sequence number → task code.
         try runWrite("UPDATE projects SET task_seq = task_seq + 1 WHERE id=?;", [.int(projectId)])
@@ -364,12 +367,13 @@ public final class Store: @unchecked Sendable {
         let due: SQLValue = dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, recurrence, parent_id, created_at, updated_at, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
+            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, recurrence, parent_id, estimate_seconds, created_at, updated_at, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
              .text(status.rawValue), .text(priority.rawValue), due, .text(encodeTags(tags)),
              recurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
+             .int(Int64(max(0, estimateSeconds))),
              .int(Int64(now.timeIntervalSince1970)), .int(Int64(now.timeIntervalSince1970)), .int(projectId)]
         )
         let id = lastInsertId()
@@ -377,7 +381,8 @@ public final class Store: @unchecked Sendable {
         if status != .todo { logEvent(id, "status", "todo", status.rawValue) }
         return TodoTask(id: id, code: code, projectId: projectId, title: title, detail: detail, link: link,
                         status: status, priority: priority, dueDate: dueDate, tags: tags,
-                        recurrence: recurrence, parentId: parentId, createdAt: now, updatedAt: now, sortOrder: 0)
+                        recurrence: recurrence, effortSeconds: 0, estimateSeconds: max(0, estimateSeconds),
+                        parentId: parentId, createdAt: now, updatedAt: now, sortOrder: 0)
     }
 
     public func listTasks(projectId: Int64? = nil) throws -> [TodoTask] {
@@ -483,7 +488,8 @@ public final class Store: @unchecked Sendable {
 
     public func updateTask(id: Int64, title: String? = nil, detail: String? = nil, link: String?? = nil,
                            status: TaskStatus? = nil, priority: Priority? = nil,
-                           dueDate: Date?? = nil, tags: [String]? = nil, recurrence: String?? = nil) throws {
+                           dueDate: Date?? = nil, tags: [String]? = nil, recurrence: String?? = nil,
+                           estimateSeconds: Int? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         let old = getTaskUnlocked(id)
         let now = Int64(Date().timeIntervalSince1970)
@@ -502,6 +508,7 @@ public final class Store: @unchecked Sendable {
         if let dueDate { sets.append("due_date=?"); binds.append(dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null) }
         if let tags { sets.append("tags=?"); binds.append(.text(encodeTags(tags))) }
         if let recurrence { sets.append("recurrence=?"); binds.append(recurrence.map(SQLValue.text) ?? .null) }
+        if let estimateSeconds { sets.append("estimate_seconds=?"); binds.append(.int(Int64(max(0, estimateSeconds)))) }
         guard !sets.isEmpty else { return }
         sets.append("updated_at=?"); binds.append(.int(now))
         binds.append(.int(id))
@@ -518,7 +525,8 @@ public final class Store: @unchecked Sendable {
                let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
                 let spawned = try createTaskUnlocked(
                     projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
-                    status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule
+                    status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
+                    estimateSeconds: old.estimateSeconds
                 )
                 logEvent(spawned.id, "recurrence", "", rule)
             }
@@ -539,6 +547,10 @@ public final class Store: @unchecked Sendable {
             }
             if let tags, tags != old.tags {
                 logEvent(id, "tags", old.tags.joined(separator: ", "), tags.joined(separator: ", "))
+            }
+            if let estimateSeconds, max(0, estimateSeconds) != old.estimateSeconds {
+                let fmt: (Int) -> String = { $0 == 0 ? "none" : "\($0 / 60)m" }
+                logEvent(id, "estimate", fmt(old.estimateSeconds), fmt(max(0, estimateSeconds)))
             }
         }
     }
@@ -684,7 +696,7 @@ public final class Store: @unchecked Sendable {
 
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
-        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id
+        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
@@ -706,6 +718,7 @@ public final class Store: @unchecked Sendable {
             startedAt: date(10),
             completedAt: date(11),
             effortSeconds: Int(sqlite3_column_int64(stmt, 12)),
+            estimateSeconds: Int(sqlite3_column_int64(stmt, 18)),
             parentId: int64Opt(17),
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13)),
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14)),

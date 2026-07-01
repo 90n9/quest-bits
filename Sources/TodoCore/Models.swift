@@ -67,6 +67,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var startedAt: Date?      // first time it went In Progress
     public var completedAt: Date?    // when it went Done
     public var effortSeconds: Int    // focused time accrued while In Progress + timer running
+    public var estimateSeconds: Int  // planned effort; 0 = unset (compared to effortSeconds)
     public var parentId: Int64?      // nil = top-level; else the parent task (one level of nesting)
     public var createdAt: Date
     public var updatedAt: Date
@@ -87,6 +88,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         startedAt: Date? = nil,
         completedAt: Date? = nil,
         effortSeconds: Int = 0,
+        estimateSeconds: Int = 0,
         parentId: Int64? = nil,
         createdAt: Date,
         updatedAt: Date,
@@ -106,6 +108,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.startedAt = startedAt
         self.completedAt = completedAt
         self.effortSeconds = effortSeconds
+        self.estimateSeconds = estimateSeconds
         self.parentId = parentId
         self.createdAt = createdAt
         self.updatedAt = updatedAt
