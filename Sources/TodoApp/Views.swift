@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Charts
+import UniformTypeIdentifiers
 
 // MARK: - Root
 
@@ -16,6 +17,9 @@ struct ContentView: View {
                 if model.showDashboard {
                     DashboardView()
                         .navigationSplitViewColumnWidth(min: 420, ideal: 560)
+                } else if model.boardView {
+                    BoardView()
+                        .navigationSplitViewColumnWidth(min: 520, ideal: 820)
                 } else {
                     TaskListView()
                         .navigationSplitViewColumnWidth(min: 280, ideal: 360)
@@ -182,6 +186,7 @@ struct TaskListView: View {
         }
         .navigationTitle(projectName)
         .toolbar {
+            ToolbarItem(placement: .principal) { ViewModeToggle() }
             ToolbarItem(placement: .primaryAction) {
                 Button { showNew = true } label: {
                     Label("New Task", systemImage: "plus")
@@ -568,6 +573,222 @@ struct SubtaskRow: View {
             Spacer()
         }
         .padding(.leading, 26)
+    }
+}
+
+// MARK: - Kanban board
+
+/// Segmented list/board switch, shown in the task-area toolbar in both modes.
+struct ViewModeToggle: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Picker("View", selection: Binding(
+            get: { model.boardView },
+            set: { model.boardView = $0 }
+        )) {
+            Image(systemName: "list.bullet").tag(false)
+            Image(systemName: "rectangle.split.3x1").tag(true)
+        }
+        .pickerStyle(.segmented)
+        .fixedSize()
+        .help("Switch between list and board")
+    }
+}
+
+/// Kanban board: one column per status (Todo / In Progress / Done) for the
+/// current project or smart view. Cards drag between columns to change status.
+struct BoardView: View {
+    @EnvironmentObject var model: AppModel
+
+    /// Cards shown on the board: top-level tasks in a project view (subtasks stay
+    /// nested in the list); the flat filtered set in a smart view.
+    private var boardTasks: [TodoTask] {
+        model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
+    }
+
+    var body: some View {
+        Group {
+            if model.selectedProjectId == nil && model.smartView == nil {
+                ContentUnavailableViewCompat(text: "Select a view or project")
+            } else {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    HStack(alignment: .top, spacing: 14) {
+                        ForEach(TaskStatus.allCases, id: \.self) { status in
+                            BoardColumn(status: status,
+                                        tasks: boardTasks.filter { $0.status == status })
+                        }
+                    }
+                    .padding(16)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                }
+            }
+        }
+        .navigationTitle(boardTitle)
+        .toolbar {
+            ToolbarItem(placement: .principal) { ViewModeToggle() }
+        }
+    }
+
+    private var boardTitle: String {
+        if let sv = model.smartView { return sv.title }
+        return model.projects.first(where: { $0.id == model.selectedProjectId })?.name ?? "Board"
+    }
+}
+
+/// One board column: a status header + a scrollable stack of cards. Accepts a
+/// dropped card and re-files it to this column's status.
+struct BoardColumn: View {
+    @EnvironmentObject var model: AppModel
+    let status: TaskStatus
+    let tasks: [TodoTask]
+    @State private var targeted = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: icon).foregroundStyle(tint)
+                Text(status.display).font(.headline)
+                Text("\(tasks.count)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 4)
+
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(tasks) { task in
+                        BoardCard(task: task)
+                            .onDrag {
+                                NSItemProvider(object: String(task.id) as NSString)
+                            }
+                    }
+                    if tasks.isEmpty {
+                        Text("No tasks")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 20)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .frame(width: 260)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .padding(10)
+        .background(
+            (targeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06)),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(targeted ? Color.accentColor : Color.clear, lineWidth: 2)
+        )
+        .onDrop(of: [.plainText], isTargeted: $targeted) { providers in
+            handleDrop(providers)
+        }
+    }
+
+    /// Load the dragged task id and move it to this column's status.
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first else { return false }
+        provider.loadObject(ofClass: NSString.self) { obj, _ in
+            guard let str = obj as? String, let id = Int64(str) else { return }
+            Task { @MainActor in
+                if let task = model.task(byId: id), task.status != status {
+                    model.updateTask(task, status: status)
+                }
+            }
+        }
+        return true
+    }
+
+    private var icon: String {
+        switch status {
+        case .todo: return "circle"
+        case .inProgress: return "circle.lefthalf.filled"
+        case .done: return "checkmark.circle.fill"
+        }
+    }
+    private var tint: Color {
+        switch status {
+        case .todo: return .secondary
+        case .inProgress: return .orange
+        case .done: return .green
+        }
+    }
+}
+
+/// A draggable card: code, priority, title, and effort/due when present.
+/// Tapping it selects the task so the detail column reflects it.
+struct BoardCard: View {
+    @EnvironmentObject var model: AppModel
+    let task: TodoTask
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                if task.priority != .none {
+                    Image(systemName: "flag.fill").font(.caption2).foregroundStyle(priorityColor)
+                }
+                CodeBadge(code: task.code)
+                Spacer()
+            }
+            Text(task.title)
+                .font(.callout)
+                .lineLimit(3)
+                .foregroundStyle(task.status == .done ? .secondary : .primary)
+                .strikethrough(task.status == .done)
+            HStack(spacing: 8) {
+                if task.priority != .none {
+                    Text(task.priority.display)
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(priorityColor.opacity(0.15), in: Capsule())
+                        .foregroundStyle(priorityColor)
+                }
+                if task.effortSeconds > 0 {
+                    Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let due = task.dueDate {
+                    Label(dueText(due), systemImage: "calendar")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                ForEach(task.tags.prefix(2), id: \.self) { TagChip(text: $0) }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(model.selectedTaskId == task.id ? Color.accentColor : Color.secondary.opacity(0.18),
+                        lineWidth: model.selectedTaskId == task.id ? 2 : 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectedTaskIds = [task.id] }
+        .help(task.title)
+    }
+
+    private var priorityColor: Color {
+        switch task.priority {
+        case .high: return .red
+        case .medium: return .orange
+        case .low: return .blue
+        case .none: return .secondary
+        }
+    }
+
+    private func dueText(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "MMM d"
+        return f.string(from: d)
     }
 }
 

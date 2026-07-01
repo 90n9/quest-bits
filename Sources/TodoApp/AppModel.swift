@@ -22,6 +22,10 @@ final class AppModel: ObservableObject {
     @Published var smartView: SmartView?      // when set, tasks span all projects
     @Published var searchQuery: String = ""   // live filter over the displayed task list
 
+    // Task-area layout: false = list view, true = Kanban board. Persists across
+    // project/smart-view selection; ignored while the dashboard is showing.
+    @Published var boardView = false
+
     // In-progress tasks across all projects — surfaced in the menu bar dropdown.
     // Refreshed alongside the displayed task list so it tracks status changes.
     @Published var inProgressTasks: [TodoTask] = []
