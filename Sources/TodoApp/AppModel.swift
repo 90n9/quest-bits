@@ -22,6 +22,10 @@ final class AppModel: ObservableObject {
     @Published var smartView: SmartView?      // when set, tasks span all projects
     @Published var searchQuery: String = ""   // live filter over the displayed task list
 
+    // In-progress tasks across all projects — surfaced in the menu bar dropdown.
+    // Refreshed alongside the displayed task list so it tracks status changes.
+    @Published var inProgressTasks: [TodoTask] = []
+
     // Stats dashboard: when shown, the content column swaps to the dashboard.
     @Published var showDashboard = false
     @Published var daySeries: [DayStat] = []
@@ -102,14 +106,15 @@ final class AppModel: ObservableObject {
     }
 
     func reloadTasks() {
+        let all = (try? store.listTasks(projectId: nil)) ?? []
         if let sv = smartView {
-            let all = (try? store.listTasks(projectId: nil)) ?? []
             tasks = sv == .inProgress ? all.filter { $0.status == .inProgress } : all
         } else if let pid = selectedProjectId {
-            tasks = (try? store.listTasks(projectId: pid)) ?? []
+            tasks = all.filter { $0.projectId == pid }
         } else {
             tasks = []
         }
+        inProgressTasks = all.filter { $0.status == .inProgress }
     }
 
     func reloadStats() {

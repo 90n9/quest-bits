@@ -17,6 +17,18 @@ struct TodoAppMain: App {
         .windowToolbarStyle(.unified)
         .commands { TodoCommands(model: delegate.model, shortcuts: delegate.shortcuts) }
 
+        // Menu bar timer: live phase + mm:ss countdown, with the active task and
+        // Start/Pause · Skip · Stop controls in the dropdown. Observes the same
+        // PomodoroEngine the main window uses — no duplicated timer logic.
+        MenuBarExtra {
+            MenuBarContent()
+                .environmentObject(delegate.model)
+                .environmentObject(delegate.model.pomodoro)
+        } label: {
+            MenuBarLabel(engine: delegate.model.pomodoro)
+        }
+        .menuBarExtraStyle(.menu)
+
         Settings {
             SettingsView()
                 .environmentObject(delegate.model)
@@ -73,53 +85,22 @@ struct TodoCommands: Commands {
     }
 }
 
-/// Owns the model, the menu-bar status item, and notification setup.
+/// Owns the model and notification setup. The menu-bar timer is a SwiftUI
+/// `MenuBarExtra` scene (see `TodoAppMain`), not a hand-rolled status item.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     let shortcuts = ShortcutStore()
-    private var statusItem: NSStatusItem?
-    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MCPRegistration.registerIfNeeded()
         requestNotificationPermission()
-        setupMenuBar()
         wirePomodoroNotifications()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep running in the menu bar after the window closes.
         false
-    }
-
-    // MARK: - Menu bar
-
-    private func setupMenuBar() {
-        let item = NSStatusItem.create()
-        if let button = item.button {
-            button.title = "🍅 --:--"
-            button.target = self
-            button.action = #selector(toggleWindow)
-        }
-        // Live-update the title from the pomodoro clock.
-        Publishers.CombineLatest3(model.pomodoro.$remaining, model.pomodoro.$phase, model.pomodoro.$running)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _, phase, running in
-                guard let self, let button = self.statusItem?.button else { return }
-                let icon = phase == .focus ? "🍅" : (phase == .idle ? "⏸" : "☕️")
-                button.title = phase == .idle ? "\(icon) --:--" : "\(icon) \(self.model.pomodoro.clock)\(running ? "" : " ⏸")"
-            }
-            .store(in: &cancellables)
-        statusItem = item
-    }
-
-    @objc private func toggleWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        for window in NSApp.windows where window.canBecomeKey {
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
     }
 
     // MARK: - Notifications
@@ -141,8 +122,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-private extension NSStatusItem {
-    static func create() -> NSStatusItem {
-        NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+// MARK: - Menu bar timer
+
+/// The menu-bar title: phase icon + live mm:ss. Observes the shared engine so it
+/// updates on every tick, exactly like the main window's PomodoroBar.
+struct MenuBarLabel: View {
+    @ObservedObject var engine: PomodoroEngine
+
+    var body: some View {
+        Text(title)
+    }
+
+    private var title: String {
+        let icon = engine.phase == .focus ? "🍅" : (engine.phase == .idle ? "⏸" : "☕️")
+        if engine.phase == .idle { return "\(icon) --:--" }
+        return "\(icon) \(engine.clock)\(engine.running ? "" : " ⏸")"
+    }
+}
+
+/// Dropdown for the menu-bar timer: current phase/clock, the active in-progress
+/// task, and Start/Pause · Skip · Stop wired to the existing engine + model.
+struct MenuBarContent: View {
+    @EnvironmentObject var model: AppModel
+    @EnvironmentObject var engine: PomodoroEngine
+
+    var body: some View {
+        Text(phaseHeadline)
+
+        if let active = model.inProgressTasks.first {
+            let extra = model.inProgressTasks.count - 1
+            Text("Active: \(active.title)" + (extra > 0 ? " (+\(extra) more)" : ""))
+        } else {
+            Text("No task in progress")
+        }
+
+        Divider()
+
+        Button(engine.running ? "Pause" : "Start") { model.toggleTimer() }
+        Button("Skip Phase") { engine.skip() }
+            .disabled(engine.phase == .idle)
+        Button("Stop") { engine.stop() }
+            .disabled(engine.phase == .idle)
+
+        Divider()
+
+        Button("Show Main Window") { Self.showMainWindow() }
+        Button("Quit Todo") { NSApp.terminate(nil) }
+    }
+
+    private var phaseHeadline: String {
+        engine.phase == .idle ? "Ready" : "\(engine.phase.label) — \(engine.clock)"
+    }
+
+    /// Bring the main window forward (recreating window behavior of the old
+    /// status-item click), keeping the app's activation working as before.
+    static func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        for window in NSApp.windows where window.canBecomeKey {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
     }
 }
