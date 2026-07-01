@@ -157,53 +157,11 @@ struct TaskListView: View {
         Group {
             if model.selectedProjectId == nil && model.smartView == nil {
                 ContentUnavailableViewCompat(text: "Select a view or project")
-            } else if model.tasks.isEmpty {
-                VStack(spacing: 12) {
-                    Text(model.smartView != nil ? "No tasks here" : "No tasks in this project")
-                        .foregroundStyle(.secondary)
-                    if model.smartView == nil {
-                        Button { showNew = true } label: {
-                            Label("New Task", systemImage: "plus")
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
-                    if model.selectedTaskIds.count >= 2 {
-                        BulkActionBar(otherProjects: otherProjects)
-                        Divider()
-                    }
-                    List(selection: $model.selectedTaskIds) {
-                        ForEach(displayedTasks) { task in
-                            TaskRow(task: task,
-                                    subtasks: subtasks(of: task),
-                                    showSubtaskUI: model.smartView == nil)
-                                .tag(task.id)
-                                .contextMenu {
-                                    Button("Copy Code (\(task.code))") { model.copyCode(task.code) }
-                                    Button("Duplicate") { model.duplicateTask(task.id) }
-
-                                    if !otherProjects.isEmpty {
-                                        Menu("Move to") {
-                                            ForEach(otherProjects) { p in
-                                                Button(p.name) { model.moveTask(task.id, toProject: p.id) }
-                                            }
-                                        }
-                                        Menu("Copy to") {
-                                            ForEach(otherProjects) { p in
-                                                Button(p.name) { model.copyTask(task.id, toProject: p.id) }
-                                            }
-                                        }
-                                    }
-
-                                    Divider()
-                                    Button("Delete", role: .destructive) { model.deleteTask(task.id) }
-                                }
-                        }
-                        .onMove { offsets, dest in model.moveTasks(displayedTasks, from: offsets, to: dest) }
-                    }
+                    SearchBar(query: $model.searchQuery)
+                    Divider()
+                    taskContent
                 }
             }
         }
@@ -233,6 +191,61 @@ struct TaskListView: View {
         }
     }
 
+    @ViewBuilder private var taskContent: some View {
+        if model.tasks.isEmpty {
+            VStack(spacing: 12) {
+                Text(model.smartView != nil ? "No tasks here" : "No tasks in this project")
+                    .foregroundStyle(.secondary)
+                if model.smartView == nil {
+                    Button { showNew = true } label: {
+                        Label("New Task", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if displayedTasks.isEmpty {
+            ContentUnavailableViewCompat(
+                text: "No tasks match \u{201C}\(model.searchQuery.trimmingCharacters(in: .whitespaces))\u{201D}")
+        } else {
+            VStack(spacing: 0) {
+                if model.selectedTaskIds.count >= 2 {
+                    BulkActionBar(otherProjects: otherProjects)
+                    Divider()
+                }
+                List(selection: $model.selectedTaskIds) {
+                    ForEach(displayedTasks) { task in
+                        TaskRow(task: task,
+                                subtasks: subtasks(of: task),
+                                showSubtaskUI: model.smartView == nil)
+                            .tag(task.id)
+                            .contextMenu {
+                                Button("Copy Code (\(task.code))") { model.copyCode(task.code) }
+                                Button("Duplicate") { model.duplicateTask(task.id) }
+
+                                if !otherProjects.isEmpty {
+                                    Menu("Move to") {
+                                        ForEach(otherProjects) { p in
+                                            Button(p.name) { model.moveTask(task.id, toProject: p.id) }
+                                        }
+                                    }
+                                    Menu("Copy to") {
+                                        ForEach(otherProjects) { p in
+                                            Button(p.name) { model.copyTask(task.id, toProject: p.id) }
+                                        }
+                                    }
+                                }
+
+                                Divider()
+                                Button("Delete", role: .destructive) { model.deleteTask(task.id) }
+                            }
+                    }
+                    .onMove { offsets, dest in model.moveTasks(displayedTasks, from: offsets, to: dest) }
+                }
+            }
+        }
+    }
+
     private var projectName: String {
         if let sv = model.smartView { return sv.title }
         return model.projects.first(where: { $0.id == model.selectedProjectId })?.name ?? "Tasks"
@@ -243,15 +256,57 @@ struct TaskListView: View {
         model.projects.filter { $0.id != model.selectedProjectId }
     }
 
+    private var isSearching: Bool {
+        !model.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     /// Rows shown as top-level List items. In a project view, only top-level tasks
     /// (subtasks render nested under their parent); in a smart view, the flat list.
+    /// When searching, keep a top-level task if it matches or any of its subtasks match.
     private var displayedTasks: [TodoTask] {
-        model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
+        let base = model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
+        guard isSearching else { return base }
+        if model.smartView == nil {
+            return base.filter { task in
+                model.taskMatchesSearch(task)
+                    || model.tasks.contains { $0.parentId == task.id && model.taskMatchesSearch($0) }
+            }
+        }
+        return base.filter { model.taskMatchesSearch($0) }
     }
 
     /// Subtasks of a task, taken from the already-loaded flat list (project view only).
+    /// While searching, show all subtasks when the parent matches, otherwise only the
+    /// subtasks that match the query.
     private func subtasks(of task: TodoTask) -> [TodoTask] {
-        model.smartView == nil ? model.tasks.filter { $0.parentId == task.id } : []
+        guard model.smartView == nil else { return [] }
+        let subs = model.tasks.filter { $0.parentId == task.id }
+        guard isSearching, !model.taskMatchesSearch(task) else { return subs }
+        return subs.filter { model.taskMatchesSearch($0) }
+    }
+}
+
+/// Live-filter search field for the task list header, with a clear button.
+struct SearchBar: View {
+    @Binding var query: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search tasks", text: $query)
+                .textFieldStyle(.plain)
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.bar)
     }
 }
 

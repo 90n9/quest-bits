@@ -20,6 +20,7 @@ final class AppModel: ObservableObject {
     @Published var selectedProjectId: Int64?
     @Published var selectedTaskIds: Set<Int64> = []
     @Published var smartView: SmartView?      // when set, tasks span all projects
+    @Published var searchQuery: String = ""   // live filter over the displayed task list
 
     /// The single selected task id, or nil when zero or multiple are selected.
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
@@ -108,6 +109,7 @@ final class AppModel: ObservableObject {
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
+        searchQuery = ""
         reloadTasks()
     }
 
@@ -115,7 +117,20 @@ final class AppModel: ObservableObject {
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
+        searchQuery = ""
         reloadTasks()
+    }
+
+    /// Case-insensitive match of a task against the current search query
+    /// (title, detail, tags, code). Empty/whitespace query matches everything.
+    func taskMatchesSearch(_ task: TodoTask) -> Bool {
+        let q = searchQuery.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return true }
+        if task.title.lowercased().contains(q) { return true }
+        if task.detail.lowercased().contains(q) { return true }
+        if task.code.lowercased().contains(q) { return true }
+        if task.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
+        return false
     }
 
     /// Project code for a task id (used by smart views to label rows).
