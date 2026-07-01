@@ -180,6 +180,9 @@ public final class Store: @unchecked Sendable {
         );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_history_task ON task_history(task_id);")
+
+        // --- Additive migration: recurring tasks ---
+        if !columnExists("tasks", "recurrence") { exec("ALTER TABLE tasks ADD COLUMN recurrence TEXT;") }
     }
 
     /// Assign codes to any pre-existing rows that lack them.
@@ -317,13 +320,24 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence"
 
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                            status: TaskStatus = .todo, priority: Priority = .none,
-                           dueDate: Date? = nil, tags: [String] = []) throws -> TodoTask {
+                           dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil) throws -> TodoTask {
         lock.lock(); defer { lock.unlock() }
+        return try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
+                                      status: status, priority: priority, dueDate: dueDate, tags: tags,
+                                      recurrence: recurrence)
+    }
+
+    /// Insert a task without taking the lock — for use inside already-locked methods
+    /// (e.g. spawning the next occurrence of a recurring task from updateTask).
+    @discardableResult
+    private func createTaskUnlocked(projectId: Int64, title: String, detail: String = "", link: String? = nil,
+                                    status: TaskStatus = .todo, priority: Priority = .none,
+                                    dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil) throws -> TodoTask {
         let now = Date()
         // Next per-project sequence number → task code.
         try runWrite("UPDATE projects SET task_seq = task_seq + 1 WHERE id=?;", [.int(projectId)])
@@ -333,11 +347,12 @@ public final class Store: @unchecked Sendable {
         let due: SQLValue = dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, created_at, updated_at, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
+            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, recurrence, created_at, updated_at, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
              .text(status.rawValue), .text(priority.rawValue), due, .text(encodeTags(tags)),
+             recurrence.map(SQLValue.text) ?? .null,
              .int(Int64(now.timeIntervalSince1970)), .int(Int64(now.timeIntervalSince1970)), .int(projectId)]
         )
         let id = lastInsertId()
@@ -345,7 +360,7 @@ public final class Store: @unchecked Sendable {
         if status != .todo { logEvent(id, "status", "todo", status.rawValue) }
         return TodoTask(id: id, code: code, projectId: projectId, title: title, detail: detail, link: link,
                         status: status, priority: priority, dueDate: dueDate, tags: tags,
-                        createdAt: now, updatedAt: now, sortOrder: 0)
+                        recurrence: recurrence, createdAt: now, updatedAt: now, sortOrder: 0)
     }
 
     public func listTasks(projectId: Int64? = nil) throws -> [TodoTask] {
@@ -429,7 +444,7 @@ public final class Store: @unchecked Sendable {
 
     public func updateTask(id: Int64, title: String? = nil, detail: String? = nil, link: String?? = nil,
                            status: TaskStatus? = nil, priority: Priority? = nil,
-                           dueDate: Date?? = nil, tags: [String]? = nil) throws {
+                           dueDate: Date?? = nil, tags: [String]? = nil, recurrence: String?? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         let old = getTaskUnlocked(id)
         let now = Int64(Date().timeIntervalSince1970)
@@ -447,10 +462,28 @@ public final class Store: @unchecked Sendable {
         if let priority { sets.append("priority=?"); binds.append(.text(priority.rawValue)) }
         if let dueDate { sets.append("due_date=?"); binds.append(dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null) }
         if let tags { sets.append("tags=?"); binds.append(.text(encodeTags(tags))) }
+        if let recurrence { sets.append("recurrence=?"); binds.append(recurrence.map(SQLValue.text) ?? .null) }
         guard !sets.isEmpty else { return }
         sets.append("updated_at=?"); binds.append(.int(now))
         binds.append(.int(id))
         try runWrite("UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
+
+        // Recurrence: when a recurring task transitions INTO done, spawn the next
+        // occurrence (fresh todo) with its due date advanced by the interval.
+        // createTaskUnlocked is used because we already hold the lock here.
+        if let status, status == .done, let old, old.status != .done {
+            // Effective recurrence: a value set in this same update wins, else the stored one.
+            let effectiveRecurrence: String?
+            if let recurrence { effectiveRecurrence = recurrence } else { effectiveRecurrence = old.recurrence }
+            if let rule = effectiveRecurrence, !rule.isEmpty,
+               let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
+                let spawned = try createTaskUnlocked(
+                    projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
+                    status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule
+                )
+                logEvent(spawned.id, "recurrence", "", rule)
+            }
+        }
 
         // History: log discrete-field changes (skip free-text title/detail — autosave makes them noisy).
         if let old {
@@ -538,7 +571,7 @@ public final class Store: @unchecked Sendable {
 
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
-        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order
+        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
@@ -553,6 +586,7 @@ public final class Store: @unchecked Sendable {
             priority: Priority(rawValue: colText(stmt, 7)) ?? .none,
             dueDate: date(8),
             tags: decodeTags(colText(stmt, 9)),
+            recurrence: colTextOpt(stmt, 16),
             startedAt: date(10),
             completedAt: date(11),
             effortSeconds: Int(sqlite3_column_int64(stmt, 12)),
@@ -560,6 +594,20 @@ public final class Store: @unchecked Sendable {
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14)),
             sortOrder: Int(sqlite3_column_int64(stmt, 15))
         )
+    }
+
+    /// Advance a due date by one recurrence interval using the current calendar.
+    /// Returns nil for an unrecognized rule.
+    static func advanceDueDate(from date: Date, rule: String) -> Date? {
+        let cal = Calendar.current
+        let comp: DateComponents
+        switch rule {
+        case "daily":   comp = DateComponents(day: 1)
+        case "weekly":  comp = DateComponents(day: 7)
+        case "monthly": comp = DateComponents(month: 1)
+        default:        return nil
+        }
+        return cal.date(byAdding: comp, to: date)
     }
 
     // Tags are stored as a comma-separated string.

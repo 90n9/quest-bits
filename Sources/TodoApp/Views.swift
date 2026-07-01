@@ -330,6 +330,9 @@ struct TaskRow: View {
                             .font(.caption2)
                             .foregroundStyle(isOverdue(due, task) ? Color.red : .secondary)
                     }
+                    if let rec = task.recurrence, !rec.isEmpty {
+                        Text("↻ \(rec)").font(.caption2).foregroundStyle(.secondary)
+                    }
                     ForEach(task.tags.prefix(3), id: \.self) { TagChip(text: $0) }
                 }
             }
@@ -389,6 +392,7 @@ struct TaskDetailView: View {
     @State private var hasDue = false
     @State private var dueDate = Date()
     @State private var tagsText = ""
+    @State private var recurrence = "none"   // "none" | "daily" | "weekly" | "monthly"
 
     var body: some View {
         Group {
@@ -415,6 +419,12 @@ struct TaskDetailView: View {
                         Toggle("Has due date", isOn: $hasDue)
                         if hasDue {
                             DatePicker("Due", selection: $dueDate, displayedComponents: .date)
+                        }
+                        Picker("Repeat", selection: $recurrence) {
+                            Text("Never").tag("none")
+                            Text("Daily").tag("daily")
+                            Text("Weekly").tag("weekly")
+                            Text("Monthly").tag("monthly")
                         }
                     }
                     Section("Tags") {
@@ -475,6 +485,7 @@ struct TaskDetailView: View {
                 .onChange(of: hasDue) { _, _ in autosave() }
                 .onChange(of: dueDate) { _, _ in autosave() }
                 .onChange(of: tagsText) { _, _ in autosave() }
+                .onChange(of: recurrence) { _, _ in autosave() }
             } else {
                 ContentUnavailableViewCompat(text: model.selectedTaskIds.count >= 2
                     ? "\(model.selectedTaskIds.count) tasks selected — use the bulk bar above"
@@ -497,6 +508,7 @@ struct TaskDetailView: View {
             || hasDue != (t.dueDate != nil)
             || (hasDue && !sameDay(dueDate, t.dueDate))
             || parsedTags != t.tags
+            || recurrence != (t.recurrence ?? "none")
     }
 
     private func sameDay(_ a: Date, _ b: Date?) -> Bool {
@@ -514,6 +526,7 @@ struct TaskDetailView: View {
         hasDue = t.dueDate != nil
         dueDate = t.dueDate ?? Date()
         tagsText = t.tags.joined(separator: ", ")
+        recurrence = t.recurrence ?? "none"
     }
 
     /// Persist current editor state if it differs from the stored task.
@@ -528,7 +541,8 @@ struct TaskDetailView: View {
             status: status,
             priority: priority,
             dueDate: .some(hasDue ? dueDate : nil),
-            tags: parsedTags
+            tags: parsedTags,
+            recurrence: .some(recurrence == "none" ? nil : recurrence)
         )
     }
 }

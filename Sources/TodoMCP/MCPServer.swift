@@ -122,7 +122,8 @@ final class MCPServer {
                 status: parseStatus(args["status"]) ?? .todo,
                 priority: parsePriority(args["priority"]) ?? .none,
                 dueDate: parseDate(args["due_date"]),
-                tags: parseTags(args["tags"]) ?? []
+                tags: parseTags(args["tags"]) ?? [],
+                recurrence: args["recurrence"] as? String
             )
             return try jsonString(taskDict(task))
 
@@ -143,6 +144,13 @@ final class MCPServer {
             } else {
                 dueArg = .none
             }
+            // recurrence double-optional: present+null clears it, absent leaves alone.
+            let recurArg: String??
+            if args.keys.contains("recurrence") {
+                recurArg = .some(args["recurrence"] as? String)
+            } else {
+                recurArg = .none
+            }
             try store.updateTask(
                 id: id,
                 title: args["title"] as? String,
@@ -151,7 +159,8 @@ final class MCPServer {
                 status: parseStatus(args["status"]),
                 priority: parsePriority(args["priority"]),
                 dueDate: dueArg,
-                tags: parseTags(args["tags"])
+                tags: parseTags(args["tags"]),
+                recurrence: recurArg
             )
             return try jsonString(taskDict(store.getTask(id: id)))
 
@@ -238,6 +247,7 @@ final class MCPServer {
             "priority": t.priority.rawValue,
             "due_date": t.dueDate.map(iso) ?? NSNull(),
             "tags": t.tags,
+            "recurrence": t.recurrence ?? NSNull(),
             "started_at": t.startedAt.map(iso) ?? NSNull(),
             "completed_at": t.completedAt.map(iso) ?? NSNull(),
             "effort_minutes": t.effortSeconds / 60,

@@ -160,9 +160,10 @@ final class AppModel: ObservableObject {
     }
 
     func updateTask(_ task: TodoTask, title: String? = nil, detail: String? = nil, link: String?? = nil,
-                    status: TaskStatus? = nil, priority: Priority? = nil, dueDate: Date?? = nil, tags: [String]? = nil) {
+                    status: TaskStatus? = nil, priority: Priority? = nil, dueDate: Date?? = nil, tags: [String]? = nil,
+                    recurrence: String?? = nil) {
         try? store.updateTask(id: task.id, title: title, detail: detail, link: link, status: status,
-                              priority: priority, dueDate: dueDate, tags: tags)
+                              priority: priority, dueDate: dueDate, tags: tags, recurrence: recurrence)
         reloadTasks()
     }
 

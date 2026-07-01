@@ -63,6 +63,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var priority: Priority
     public var dueDate: Date?
     public var tags: [String]
+    public var recurrence: String?   // nil = non-recurring; "daily" | "weekly" | "monthly"
     public var startedAt: Date?      // first time it went In Progress
     public var completedAt: Date?    // when it went Done
     public var effortSeconds: Int    // focused time accrued while In Progress + timer running
@@ -81,6 +82,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         priority: Priority = .none,
         dueDate: Date? = nil,
         tags: [String] = [],
+        recurrence: String? = nil,
         startedAt: Date? = nil,
         completedAt: Date? = nil,
         effortSeconds: Int = 0,
@@ -98,6 +100,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.priority = priority
         self.dueDate = dueDate
         self.tags = tags
+        self.recurrence = recurrence
         self.startedAt = startedAt
         self.completedAt = completedAt
         self.effortSeconds = effortSeconds

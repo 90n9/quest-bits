@@ -12,6 +12,7 @@ extension MCPServer {
         let priorityEnum: [String: Any] = ["type": "string", "enum": ["none", "low", "medium", "high"]]
         let dateStr: [String: Any] = ["type": "string", "description": "ISO-8601 or yyyy-MM-dd; null to clear"]
         let tagsArr: [String: Any] = ["type": "array", "items": str]
+        let recurrenceEnum: [String: Any] = ["type": "string", "enum": ["daily", "weekly", "monthly"], "description": "repeat interval; null to clear. On completion, spawns the next occurrence with the due date advanced."]
 
         return [
             ["name": "list_projects",
@@ -43,17 +44,17 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "create_task",
-             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags optional; status defaults to todo. Returns the task with its new code.",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. Returns the task with its new code.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null or due_date:null to clear them. Use this to update progress status, priority, due date, or tags.",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, or recurrence.",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr
+                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum
              ])],
 
             ["name": "delete_task",
