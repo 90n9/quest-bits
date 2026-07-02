@@ -59,6 +59,22 @@ echo "==> Embed Sparkle.framework"
 # Preserve the framework's nested XPC services (Downloader.xpc, Installer.xpc).
 cp -R "$SPARKLE_FRAMEWORK" "$APP/Contents/Frameworks/Sparkle.framework"
 
+echo "==> Bundle fonts (Alegreya + Quicksand, OFL-licensed)"
+# Registered automatically at launch via ATSApplicationFontsPath in Info.plist.
+mkdir -p "$APP/Contents/Resources/Fonts"
+cp "$ROOT/Resources/Fonts/"*.ttf "$ROOT/Resources/Fonts/"OFL-*.txt \
+    "$APP/Contents/Resources/Fonts/"
+
+echo "==> Bundle icons (Lucide ISC + Tabler MIT, license texts included)"
+mkdir -p "$APP/Contents/Resources/Icons"
+cp "$ROOT/Resources/Icons/"*.svg "$ROOT/Resources/Icons/"LICENSE-*.txt \
+    "$APP/Contents/Resources/Icons/"
+
+echo "==> Bundle frames + textures (Kenney / ambientCG, CC0)"
+mkdir -p "$APP/Contents/Resources/Frames" "$APP/Contents/Resources/Textures"
+cp "$ROOT/Resources/Frames/"* "$APP/Contents/Resources/Frames/"
+cp "$ROOT/Resources/Textures/"* "$APP/Contents/Resources/Textures/"
+
 echo "==> Write Info.plist"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -75,6 +91,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>ATSApplicationFontsPath</key><string>Fonts</string>
     <key>SUFeedURL</key><string>https://raw.githubusercontent.com/90n9/quest-bits-releases/main/appcast.xml</string>
     <key>SUPublicEDKey</key><string>hWHyyNWubIAV3ha5OmYQ5Gf7Pbd0rHV29jHM6p7eZ6o=</string>
     <key>SUEnableAutomaticChecks</key><$SU_AUTO_CHECKS/>

@@ -103,7 +103,7 @@ struct UpdateBanner: View {
             .padding(.horizontal, Theme.Spacing.md)
             .padding(.vertical, Theme.Spacing.xs)
             .frame(maxWidth: .infinity)
-            .background(Theme.Colors.primary)
+            .qbHearth()
         }
     }
 }
@@ -116,39 +116,80 @@ struct ProjectSidebar: View {
     @State private var editing: Project?      // non-nil → edit sheet open
     @State private var showTemplates = false
 
+    /// Cozy-RPG sidebar icons (bundled Lucide set) for the smart views.
+    private func qbSidebarIcon(_ v: SmartView) -> String {
+        v == .allTasks ? "lucide-map" : "lucide-swords"
+    }
+
+    /// Section header in the quest-log voice (micro-uppercase, steel).
+    private func sidebarHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(Theme.Fonts.microUppercase)
+            .tracking(0.5)
+            .foregroundStyle(Theme.Colors.steel)
+    }
+
+    /// Selected sidebar row: selection-gold card with a gold stroke (mockup
+    /// `nav-item-active`). Unselected rows stay transparent.
+    @ViewBuilder
+    private func sidebarRowCard(_ selected: Bool) -> some View {
+        if selected {
+            RoundedRectangle(cornerRadius: Theme.Radius.md)
+                .fill(Theme.Colors.surfacePricingFeatured)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.md)
+                        .stroke(Theme.Colors.brandYellow.opacity(0.7), lineWidth: 1)
+                )
+        } else {
+            Color.clear
+        }
+    }
+
     var body: some View {
         List(selection: Binding(
             get: { model.selectedProjectId },
             set: { model.selectProject($0) }
         )) {
-            Section("Views") {
+            Section {
                 ForEach(SmartView.allCases, id: \.self) { v in
-                    Label(v.title, systemImage: v.icon)
+                    Label { Text(v.title) } icon: { QBIcon(name: qbSidebarIcon(v)) }
+                        .font(Theme.Fonts.bodySmMedium)
                         .foregroundStyle(model.smartView == v ? Theme.Colors.brandBlue : Theme.Colors.ink)
                         .contentShape(Rectangle())
                         .onTapGesture { model.selectSmartView(v) }
-                        .listRowBackground(model.smartView == v ? Theme.Colors.surfacePricingFeatured : Color.clear)
+                        .listRowBackground(sidebarRowCard(model.smartView == v))
                 }
-                Label("Dashboard", systemImage: "chart.bar.xaxis")
+                Label { Text("Dashboard") } icon: { QBIcon(name: "lucide-castle") }
+                    .font(Theme.Fonts.bodySmMedium)
                     .foregroundStyle(model.showDashboard ? Theme.Colors.brandBlue : Theme.Colors.ink)
                     .contentShape(Rectangle())
                     .onTapGesture { model.selectDashboard() }
-                    .listRowBackground(model.showDashboard ? Theme.Colors.surfacePricingFeatured : Color.clear)
-                Label("Templates", systemImage: "doc.on.doc")
+                    .listRowBackground(sidebarRowCard(model.showDashboard))
+                Label { Text("Templates") } icon: { QBIcon(name: "lucide-backpack") }
+                    .font(Theme.Fonts.bodySmMedium)
                     .contentShape(Rectangle())
                     .onTapGesture { showTemplates = true }
                     .help("Manage reusable task templates")
+            } header: {
+                sidebarHeader("Quests")
             }
-            Section("Projects") {
+            Section {
                 ForEach(model.projects) { p in
                     HStack(spacing: 6) {
-                        Image(systemName: "folder")
-                        CodeBadge(code: p.code)
-                        Text(p.name)
+                        QBIcon(name: "lucide-door-open")
+                        Text(p.name).font(Theme.Fonts.bodySmMedium)
                         Spacer()
-                        Text("\(taskCount(p.id))").foregroundStyle(Theme.Colors.steel).font(Theme.Fonts.micro)
+                        CodeBadge(code: p.code)
+                        Text("\(taskCount(p.id))")
+                            .font(Theme.Fonts.micro)
+                            .foregroundStyle(Theme.Colors.slate)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Theme.Colors.surface, in: Capsule())
                     }
                     .tag(p.id)
+                    .listRowBackground(sidebarRowCard(
+                        model.smartView == nil && !model.showDashboard && model.selectedProjectId == p.id))
                     .help(p.detail.isEmpty ? p.name : p.detail)
                     .contextMenu {
                         Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
@@ -168,6 +209,8 @@ struct ProjectSidebar: View {
                         Button("Delete", role: .destructive) { model.deleteProject(p.id) }
                     }
                 }
+            } header: {
+                sidebarHeader("Quest Logs")
             }
         }
         .toolbar {
@@ -230,7 +273,7 @@ struct ProjectSheet: View {
         }
         .padding(Theme.Spacing.lg)
         .frame(width: 380)
-        .background(Theme.Colors.canvas)
+        .qbParchment()
     }
 }
 
@@ -372,6 +415,8 @@ func qbStatusColor(_ s: TaskStatus) -> Color {
 struct TaskListView: View {
     @EnvironmentObject var model: AppModel
     @State private var showNew = false
+    // Collapsed-done preference persists across launches.
+    @AppStorage("qbShowDoneTasks") private var showDone = false
     @State private var newTitle = ""
 
     var body: some View {
@@ -427,7 +472,7 @@ struct TaskListView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.Colors.canvas)
+            .qbParchment()
         } else if displayedTasks.isEmpty {
             ContentUnavailableViewCompat(
                 text: "No tasks match \u{201C}\(model.searchQuery.trimmingCharacters(in: .whitespaces))\u{201D}")
@@ -438,48 +483,33 @@ struct TaskListView: View {
                     Divider()
                 }
                 List(selection: $model.selectedTaskIds) {
-                    ForEach(displayedTasks) { task in
-                        TaskRow(task: task,
-                                subtasks: subtasks(of: task),
-                                showSubtaskUI: model.smartView == nil)
-                            .tag(task.id)
-                            // Replace the system accent selection fill — fixed ink/steel row
-                            // text is unreadable on it. Lavender featured-state matches the
-                            // sidebar selection treatment.
-                            .listRowBackground(model.selectedTaskIds.contains(task.id)
-                                ? Theme.Colors.surfacePricingFeatured : Color.clear)
-                            .contextMenu {
-                                Button("Copy Code (\(task.code))") { model.copyCode(task.code) }
-                                Button("Duplicate") { model.duplicateTask(task.id) }
-
-                                if !otherProjects.isEmpty {
-                                    Menu("Move to") {
-                                        ForEach(otherProjects) { p in
-                                            Button(p.name) { model.moveTask(task.id, toProject: p.id) }
-                                        }
-                                    }
-                                    Menu("Copy to") {
-                                        ForEach(otherProjects) { p in
-                                            Button(p.name) { model.copyTask(task.id, toProject: p.id) }
-                                        }
-                                    }
-                                }
-
-                                Divider()
-                                Button("Delete", role: .destructive) { model.deleteTask(task.id) }
-                            }
+                    ForEach(activeTasks) { task in
+                        taskRowCell(task)
                     }
                     .onMove { offsets, dest in
                         // Reordering rewrites a dense sort_order for exactly the ids passed in.
                         // That is only correct within a single project's full, unfiltered list.
-                        // While searching, displayedTasks is a filtered subset, so a drag would
+                        // While searching, activeTasks is a filtered subset, so a drag would
                         // clobber the ordering of hidden tasks. In a smart view the rows span
                         // multiple projects, so a global reorder scrambles each project's
                         // per-project ordering. Disable reordering in both cases.
                         guard model.smartView == nil, !isSearching else { return }
-                        model.moveTasks(displayedTasks, from: offsets, to: dest)
+                        model.moveTasks(activeTasks, from: offsets, to: dest)
+                    }
+                    // Done quests collapse into a toggle section at the bottom.
+                    if !doneTasks.isEmpty {
+                        doneToggleRow
+                        if showDone {
+                            ForEach(doneTasks) { task in
+                                taskRowCell(task)
+                            }
+                        }
                     }
                 }
+                // List draws its own system background; hide it so the parchment
+                // canvas shows through (matches sidebar/detail panes).
+                .scrollContentBackground(.hidden)
+                .qbParchment()
             }
         }
     }
@@ -503,21 +533,79 @@ struct TaskListView: View {
     /// When searching, keep a top-level task if it matches or any of its subtasks match.
     private var displayedTasks: [TodoTask] {
         let base = model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
-        let filtered: [TodoTask]
         if !isSearching {
-            filtered = base
+            return base
         } else if model.smartView == nil {
-            filtered = base.filter { task in
+            return base.filter { task in
                 model.taskMatchesSearch(task)
                     || model.tasks.contains { $0.parentId == task.id && model.taskMatchesSearch($0) }
             }
         } else {
-            filtered = base.filter { model.taskMatchesSearch($0) }
+            return base.filter { model.taskMatchesSearch($0) }
         }
-        // Done tasks sink to the bottom so new/in-progress work stays in view.
-        // Stable partition: manual sort order is preserved within each group.
-        // A manual drag while done rows are sunk persists this order via onMove.
-        return filtered.filter { $0.status != .done } + filtered.filter { $0.status == .done }
+    }
+
+    /// Done tasks live in a collapsed section at the bottom (see `doneToggleRow`);
+    /// active tasks keep their manual sort order.
+    private var activeTasks: [TodoTask] { displayedTasks.filter { $0.status != .done } }
+    private var doneTasks: [TodoTask] { displayedTasks.filter { $0.status == .done } }
+
+    /// One task row with selection background and context menu — shared by the
+    /// active list and the collapsed done section.
+    @ViewBuilder
+    private func taskRowCell(_ task: TodoTask) -> some View {
+        TaskRow(task: task,
+                subtasks: subtasks(of: task),
+                showSubtaskUI: model.smartView == nil)
+            .tag(task.id)
+            // Replace the system accent selection fill — fixed ink/steel row
+            // text is unreadable on it. Selection-gold matches the sidebar.
+            .listRowBackground(model.selectedTaskIds.contains(task.id)
+                ? Theme.Colors.surfacePricingFeatured : Color.clear)
+            .contextMenu {
+                Button("Copy Code (\(task.code))") { model.copyCode(task.code) }
+                Button("Duplicate") { model.duplicateTask(task.id) }
+
+                if !otherProjects.isEmpty {
+                    Menu("Move to") {
+                        ForEach(otherProjects) { p in
+                            Button(p.name) { model.moveTask(task.id, toProject: p.id) }
+                        }
+                    }
+                    Menu("Copy to") {
+                        ForEach(otherProjects) { p in
+                            Button(p.name) { model.copyTask(task.id, toProject: p.id) }
+                        }
+                    }
+                }
+
+                Divider()
+                Button("Delete", role: .destructive) { model.deleteTask(task.id) }
+            }
+    }
+
+    /// "Done (N)" collapse header — click to show/hide finished quests.
+    private var doneToggleRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: showDone ? "chevron.down" : "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Theme.Colors.steel)
+            Text("Done")
+                .font(Theme.Fonts.bodySmMedium)
+                .foregroundStyle(Theme.Colors.steel)
+            Text("\(doneTasks.count)")
+                .font(Theme.Fonts.micro)
+                .foregroundStyle(Theme.Colors.slate)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Theme.Colors.surface, in: Capsule())
+            Spacer()
+        }
+        .padding(.top, Theme.Spacing.xxs)
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeInOut(duration: 0.15)) { showDone.toggle() } }
+        .listRowBackground(Color.clear)
+        .help(showDone ? "Hide finished quests" : "Show finished quests")
     }
 
     /// Subtasks of a task, taken from the already-loaded flat list (project view only).
@@ -559,7 +647,7 @@ struct SearchBar: View {
         .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairline, lineWidth: 1))
         .padding(.horizontal, Theme.Spacing.sm)
         .padding(.vertical, Theme.Spacing.xs)
-        .background(Theme.Colors.canvas)
+        .qbParchment()
     }
 }
 
@@ -1052,133 +1140,7 @@ struct TaskDetailView: View {
     var body: some View {
         Group {
             if let task = currentTask {
-                Form {
-                    Section("Reference") {
-                        HStack {
-                            CodeBadge(code: task.code)
-                            Spacer()
-                            CopyCodeButton(code: task.code)
-                        }
-                    }
-                    Section("Task") {
-                        TextField("Title", text: $title)
-                        Picker("Status", selection: $status) {
-                            ForEach(TaskStatus.allCases, id: \.self) { Text($0.display).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        Picker("Priority", selection: $priority) {
-                            ForEach(Priority.allCases, id: \.self) { Text($0.display).tag($0) }
-                        }
-                    }
-                    Section("Due Date") {
-                        Toggle("Has due date", isOn: $hasDue)
-                        if hasDue {
-                            DatePicker("Due", selection: $dueDate, displayedComponents: .date)
-                        }
-                        Picker("Repeat", selection: $recurrence) {
-                            Text("Never").tag("none")
-                            Text("Daily").tag("daily")
-                            Text("Weekly").tag("weekly")
-                            Text("Monthly").tag("monthly")
-                        }
-                    }
-                    Section("Tags") {
-                        TextField("comma, separated, tags", text: $tagsText)
-                        if !parsedTags.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 6) {
-                                    ForEach(parsedTags, id: \.self) { TagChip(text: $0) }
-                                }
-                            }
-                        }
-                    }
-                    Section("Blocked By") {
-                        let deps = model.dependencies(of: task.id)
-                        if deps.isEmpty {
-                            Text("No blocking tasks").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
-                        } else {
-                            ForEach(deps, id: \.self) { depId in
-                                if let dep = model.task(byId: depId) {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: dep.status == .done ? "checkmark.circle.fill" : "circle")
-                                            .foregroundStyle(dep.status == .done ? Theme.Colors.successAccent : Theme.Colors.brandYellowDeep)
-                                        CodeBadge(code: dep.code)
-                                        Text(dep.title).lineLimit(1)
-                                        Spacer()
-                                        Button {
-                                            model.removeDependency(task.id, dependsOn: depId)
-                                        } label: {
-                                            Image(systemName: "xmark.circle.fill")
-                                        }
-                                        .buttonStyle(.borderless)
-                                        .foregroundStyle(Theme.Colors.steel)
-                                        .help("Remove dependency")
-                                    }
-                                }
-                            }
-                        }
-                        Menu("Add blocking task…") {
-                            ForEach(model.projects) { p in
-                                let cands = candidateDeps(for: task).filter { $0.projectId == p.id }
-                                if !cands.isEmpty {
-                                    Menu(p.name) {
-                                        ForEach(cands, id: \.id) { cand in
-                                            Button("\(cand.code)  \(cand.title)") {
-                                                model.addDependency(task.id, dependsOn: cand.id)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Section("Link") {
-                        HStack {
-                            TextField("https://…", text: $link)
-                            if let url = URL(string: link), !link.isEmpty {
-                                Link(destination: url) { Image(systemName: "arrow.up.right.square") }
-                            }
-                        }
-                    }
-                    Section("Detail") {
-                        TextEditor(text: $detail)
-                            .frame(minHeight: 120)
-                            .font(.body)
-                    }
-                    Section("Estimate") {
-                        Stepper(value: $estimateMinutes, in: 0...6000, step: 5) {
-                            Text(estimateMinutes == 0 ? "No estimate" : "Estimate: \(fmtMinutes(Double(estimateMinutes)))")
-                        }
-                        if estimateMinutes > 0 {
-                            EstimateVsActualView(estimateSeconds: estimateMinutes * 60,
-                                                 actualSeconds: task.effortSeconds)
-                                .padding(.vertical, 2)
-                        }
-                    }
-                    Section("Timing") {
-                        LabeledContent("Effort", value: fmtEffort(task.effortSeconds))
-                        if let s = task.startedAt {
-                            LabeledContent("Started", value: fmtDateTime(s))
-                        }
-                        if let c = task.completedAt {
-                            LabeledContent("Completed", value: fmtDateTime(c))
-                        }
-                        if let s = task.startedAt, let c = task.completedAt, c >= s {
-                            LabeledContent("Elapsed", value: fmtEffort(Int(c.timeIntervalSince(s))))
-                        }
-                    }
-                    Section {
-                        DisclosureGroup("History (\(model.history(forTask: task.id).count))") {
-                            let events = model.history(forTask: task.id)
-                            if events.isEmpty {
-                                Text("No changes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
-                            } else {
-                                ForEach(events) { e in HistoryRow(event: e) }
-                            }
-                        }
-                    }
-                }
-                .formStyle(.grouped)
+                sectionsScroll(task)
                 .onAppear { load(task) }
                 .onChange(of: model.selectedTaskId) { _, _ in if let t = currentTask { load(t) } }
                 // Auto-save: any field change persists immediately (no Save button).
@@ -1214,10 +1176,218 @@ struct TaskDetailView: View {
                     : "Select a task")
             }
         }
+        // Ornamental quest frame around the detail pane (decorative overlay only).
+        .padding(10)
+        .qbQuestFrame()
+        .padding(6)
     }
 
     private var parsedTags: [String] {
         tagsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    /// Label-left / control-right row inside a QBDetailSection (replaces the
+    /// implicit layout grouped Form rows used to provide).
+    @ViewBuilder
+    private func labeledRow(_ label: String, @ViewBuilder control: () -> some View) -> some View {
+        HStack {
+            Text(label).font(Theme.Fonts.bodySm).foregroundStyle(Theme.Colors.slate)
+            Spacer()
+            control()
+        }
+    }
+
+    // MARK: detail sections (split out — one inlined expression stalls the type checker)
+
+    private func sectionsScroll(_ task: TodoTask) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                referenceSection(task)
+                taskSection
+                dueDateSection
+                tagsSection
+                blockedSection(task)
+                linkSection
+                detailSection
+                estimateSection(task)
+                timingSection(task)
+                historySection(task)
+            }
+            .padding(Theme.Spacing.md)
+        }
+        .qbParchment()
+    }
+
+    private func referenceSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Reference") {
+            HStack {
+                CodeBadge(code: task.code)
+                Spacer()
+                CopyCodeButton(code: task.code)
+            }
+        }
+    }
+
+    private var taskSection: some View {
+        QBDetailSection("Task") {
+            TextField("Title", text: $title).qbField()
+            Picker("Status", selection: $status) {
+                ForEach(TaskStatus.allCases, id: \.self) { Text($0.display).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            labeledRow("Priority") {
+                Picker("", selection: $priority) {
+                    ForEach(Priority.allCases, id: \.self) { Text($0.display).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+        }
+    }
+
+    private var dueDateSection: some View {
+        QBDetailSection("Due Date") {
+            Toggle("Has due date", isOn: $hasDue)
+                .font(Theme.Fonts.bodySm)
+            if hasDue {
+                labeledRow("Due") {
+                    QBDateField(date: $dueDate)
+                }
+            }
+            labeledRow("Repeat") {
+                Picker("", selection: $recurrence) {
+                    Text("Never").tag("none")
+                    Text("Daily").tag("daily")
+                    Text("Weekly").tag("weekly")
+                    Text("Monthly").tag("monthly")
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+        }
+    }
+
+    private var tagsSection: some View {
+        QBDetailSection("Tags") {
+            TextField("comma, separated, tags", text: $tagsText).qbField()
+            if !parsedTags.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(parsedTags, id: \.self) { TagChip(text: $0) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func blockedSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Blocked By") {
+            let deps = model.dependencies(of: task.id)
+            if deps.isEmpty {
+                Text("No blocking tasks").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
+            } else {
+                ForEach(deps, id: \.self) { depId in
+                    if let dep = model.task(byId: depId) {
+                        HStack(spacing: 8) {
+                            Image(systemName: dep.status == .done ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(dep.status == .done ? Theme.Colors.successAccent : Theme.Colors.brandYellowDeep)
+                            CodeBadge(code: dep.code)
+                            Text(dep.title).font(Theme.Fonts.bodySm).lineLimit(1)
+                            Spacer()
+                            Button {
+                                model.removeDependency(task.id, dependsOn: depId)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(Theme.Colors.steel)
+                            .help("Remove dependency")
+                        }
+                    }
+                }
+            }
+            Menu("Add blocking task…") {
+                ForEach(model.projects) { p in
+                    let cands = candidateDeps(for: task).filter { $0.projectId == p.id }
+                    if !cands.isEmpty {
+                        Menu(p.name) {
+                            ForEach(cands, id: \.id) { cand in
+                                Button("\(cand.code)  \(cand.title)") {
+                                    model.addDependency(task.id, dependsOn: cand.id)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .font(Theme.Fonts.bodySmMedium)
+            .fixedSize()
+        }
+    }
+
+    private var linkSection: some View {
+        QBDetailSection("Link") {
+            HStack {
+                TextField("https://…", text: $link).qbField()
+                if let url = URL(string: link), !link.isEmpty {
+                    Link(destination: url) { Image(systemName: "arrow.up.right.square") }
+                }
+            }
+        }
+    }
+
+    private var detailSection: some View {
+        QBDetailSection("Detail") {
+            TextEditor(text: $detail)
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 120)
+                .qbField()
+        }
+    }
+
+    private func estimateSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Estimate") {
+            Stepper(value: $estimateMinutes, in: 0...6000, step: 5) {
+                Text(estimateMinutes == 0 ? "No estimate" : "Estimate: \(fmtMinutes(Double(estimateMinutes)))")
+                    .font(Theme.Fonts.bodySm)
+            }
+            if estimateMinutes > 0 {
+                EstimateVsActualView(estimateSeconds: estimateMinutes * 60,
+                                     actualSeconds: task.effortSeconds)
+                    .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func timingSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Timing") {
+            LabeledContent("Effort", value: fmtEffort(task.effortSeconds))
+            if let s = task.startedAt {
+                LabeledContent("Started", value: fmtDateTime(s))
+            }
+            if let c = task.completedAt {
+                LabeledContent("Completed", value: fmtDateTime(c))
+            }
+            if let s = task.startedAt, let c = task.completedAt, c >= s {
+                LabeledContent("Elapsed", value: fmtEffort(Int(c.timeIntervalSince(s))))
+            }
+        }
+        .font(Theme.Fonts.bodySm)
+    }
+
+    private func historySection(_ task: TodoTask) -> some View {
+        QBDetailSection {
+            DisclosureGroup("History (\(model.history(forTask: task.id).count))") {
+                let events = model.history(forTask: task.id)
+                if events.isEmpty {
+                    Text("No changes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
+                } else {
+                    ForEach(events) { e in HistoryRow(event: e) }
+                }
+            }
+            .font(Theme.Fonts.bodySmMedium)
+        }
     }
 
     /// Tasks eligible to become a blocking dependency: any task other than this one
@@ -1421,32 +1591,34 @@ struct PomodoroBar: View {
         HStack(spacing: 16) {
             // Phase + clock (heading-4 scale, monospaced digits for the countdown)
             HStack(spacing: 8) {
-                Text(phaseIcon(engine.phase)).font(.title2)
+                QBIcon(name: phaseIcon(engine.phase), size: 20)
+                    .foregroundStyle(Theme.Colors.brandYellow)
                 Text(engine.phase == .idle ? "Ready" : engine.clock)
                     .font(.system(size: 22, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Theme.Colors.ink)
+                    .foregroundStyle(Theme.Colors.onDark)
                     .frame(minWidth: 90, alignment: .leading)
                 Text(engine.phase.label)
                     .font(Theme.Fonts.bodySm)
-                    .foregroundStyle(Theme.Colors.slate)
+                    .foregroundStyle(Theme.Colors.onDarkMuted)
             }
 
-            Divider().frame(height: 24)
+            Rectangle().fill(Theme.Colors.onDarkMuted.opacity(0.35))
+                .frame(width: 1, height: 24)
 
             // Controls: Start/Pause is the primary CTA; Skip/Stop stay quiet.
             HStack(spacing: 10) {
                 if engine.running {
                     Button { engine.pause() } label: { Label("Pause", systemImage: "pause.fill") }
-                        .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                        .buttonStyle(QBOnDarkButtonStyle(compact: true))
                 } else {
                     Button { engine.startFocus() } label: { Label("Start", systemImage: "play.fill") }
-                        .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                        .buttonStyle(QBOnDarkButtonStyle(compact: true))
                 }
                 Button { engine.skip() } label: { Image(systemName: "forward.fill") }
-                    .buttonStyle(QBGhostButtonStyle())
+                    .buttonStyle(QBGhostButtonStyle(onDark: true))
                     .disabled(engine.phase == .idle)
                 Button { engine.stop() } label: { Image(systemName: "stop.fill") }
-                    .buttonStyle(QBGhostButtonStyle())
+                    .buttonStyle(QBGhostButtonStyle(onDark: true))
                     .disabled(engine.phase == .idle)
             }
 
@@ -1460,22 +1632,25 @@ struct PomodoroBar: View {
         }
         .padding(.horizontal, Theme.Spacing.md)
         .padding(.vertical, Theme.Spacing.xs)
-        .background(Theme.Colors.canvas)
+        .qbHearth()
     }
 
+    /// Bundled icon name per phase — hearth metaphor: campfire while focusing,
+    /// a tavern break, a proper rest, embers when idle.
     private func phaseIcon(_ phase: PomodoroPhase) -> String {
         switch phase {
-        case .focus: return "🍅"
-        case .shortBreak, .longBreak: return "☕️"
-        case .idle: return "⏰"
+        case .focus: return "tabler-campfire"
+        case .shortBreak: return "lucide-beer"
+        case .longBreak: return "lucide-bed"
+        case .idle: return "lucide-flame-kindling"
         }
     }
 
     private func statBadge(icon: String, value: String, label: String) -> some View {
         HStack(spacing: 5) {
-            Image(systemName: icon).foregroundStyle(Theme.Colors.steel)
-            Text(value).font(Theme.Fonts.bodyMdMedium.monospacedDigit()).foregroundStyle(Theme.Colors.ink)
-            Text(label).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.steel)
+            Image(systemName: icon).foregroundStyle(Theme.Colors.onDarkMuted)
+            Text(value).font(Theme.Fonts.bodyMdMedium.monospacedDigit()).foregroundStyle(Theme.Colors.onDark)
+            Text(label).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.onDarkMuted)
         }
     }
 }
@@ -1648,7 +1823,7 @@ struct NameSheet: View {
         }
         .padding(Theme.Spacing.lg)
         .frame(width: 340)
-        .background(Theme.Colors.canvas)
+        .qbParchment()
     }
 
     private func create() {
@@ -1790,7 +1965,7 @@ struct DashboardView: View {
             }
             .padding(Theme.Spacing.lg)
         }
-        .background(Theme.Colors.canvas)
+        .qbParchment()
         .navigationTitle("Dashboard")
         .onAppear { model.reloadDashboard() }
     }
@@ -1913,6 +2088,6 @@ struct ContentUnavailableViewCompat: View {
     var body: some View {
         VStack { Text(text).foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.subtitle) }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.Colors.canvas)
+            .qbParchment()
     }
 }

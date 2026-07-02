@@ -25,3 +25,8 @@ xcuserdata/
 
 # Vendored Sparkle framework (downloaded by Scripts/build-app.sh)
 vendor/
+
+# Design exploration scratch (theme picker + downloaded asset packs; kept local)
+assets-candidates/
+design-themes.html
+asset-candidates.html

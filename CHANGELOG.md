@@ -15,6 +15,40 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 _Nothing yet._
 
+## [1.2.0] - 2026-07-02
+
+### Added
+
+- Cozy RPG theme ("QuestBit"): parchment / bark / harvest-gold palette replacing
+  the previous white-and-blue design; DESIGN.md rewritten as the
+  `QuestBit-cozy-rpg` spec.
+- Bundled fonts (OFL): Alegreya for headings and the timer, Quicksand for body
+  text — registered from the app bundle at launch.
+- Bundled icon set: Lucide (ISC) and Tabler (MIT) SVG icons for the sidebar,
+  project rows, and pomodoro phases (campfire / beer / bed / embers); license
+  texts ship inside the app.
+- Decorative art (all CC0): Kenney fantasy border framing the task-detail pane,
+  ambientCG paper grain on parchment surfaces, and wood planks under the dark
+  hearth bars.
+- New due-date picker: a formatted-date button opens a calendar popover with
+  Today / Tomorrow / Next week quick picks (replaces the stepper field).
+- Done tasks collapse into a "Done (N)" toggle section at the bottom of the
+  task list; the expanded/collapsed state persists across launches.
+
+### Changed
+
+- Task-detail pane rebuilt from the system grouped form into themed parchment
+  section cards with bright vellum input fields.
+- Sidebar restyled as a quest log: "Quests" / "Quest Logs" headers, gold
+  selection cards, and per-project code + task-count pills.
+- Pomodoro bar and update banner are now dark-bark hearth surfaces with cream
+  text and wood-grain texture.
+
+### Fixed
+
+- Input fields in the task-detail pane rendered a doubled outline (a container
+  shadow cascaded onto every child view).
+
 ## [1.1.0] - 2026-07-02
 
 ### Added
@@ -68,6 +102,7 @@ server for Claude Code.
 - CI (`release.yml`) builds a universal DMG on `v*` tags and publishes it to the
   public releases repo.
 
-[Unreleased]: https://github.com/90n9/quest-bits/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/90n9/quest-bits/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/90n9/quest-bits/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/90n9/quest-bits/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/90n9/quest-bits/releases/tag/v1.0.0
