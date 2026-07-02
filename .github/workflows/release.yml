@@ -59,8 +59,13 @@ jobs:
             grab { print }
           ' CHANGELOG.md > dist-release/notes.md || true
 
+          # Drop trailing link-reference definitions ("[1.0.0]: https://…").
+          sed -i '' -e '/^\[[^]]*\]: /d' dist-release/notes.md 2>/dev/null || true
           # Trim leading/trailing blank lines; fall back if the section is empty.
           sed -i '' -e '/./,$!d' dist-release/notes.md 2>/dev/null || true
+          awk 'NF{n=NR} {l[NR]=$0} END{for(i=1;i<=n;i++) print l[i]}' \
+            dist-release/notes.md > dist-release/notes.trim && \
+            mv dist-release/notes.trim dist-release/notes.md
           if [ ! -s dist-release/notes.md ]; then
             echo "Release ${VERSION}. See the DMG below." > dist-release/notes.md
           fi
