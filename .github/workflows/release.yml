@@ -1,0 +1,64 @@
+# Build QuestBits in this PRIVATE repo, publish the DMG to the PUBLIC
+# downloads repo (90n9/quest-bits-releases).
+#
+# QuestBits is a native SwiftUI app compiled with swiftc (no Xcode/SPM) and
+# ad-hoc code-signed — see Scripts/build-app.sh. No Apple notarization, so the
+# README on the public repo documents the one-time Gatekeeper allow command.
+#
+# Trigger: push a tag like `v1.2.0`. The version CI stamps into the app bundle
+# is taken from the tag (the `v` is stripped).
+#
+# Required repo secret (Settings → Secrets and variables → Actions):
+#   RELEASES_REPO_TOKEN  fine-grained PAT with contents:write on
+#                        90n9/quest-bits-releases
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  PUBLIC_REPO: 90n9/quest-bits-releases
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app bundle (version from tag)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Strip the leading "v" from the tag for the bundle version string.
+          export VERSION="${VERSION#v}"
+          bash Scripts/build-app.sh
+
+      - name: Package DMG
+        run: bash Scripts/make-dmg.sh
+
+      - name: Stage release asset (versioned name)
+        id: stage
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist-release
+          cp build/QuestBits.dmg "dist-release/QuestBits_${VERSION}.dmg"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to public releases repo
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$PUBLIC_REPO" \
+            --title "QuestBits ${{ steps.stage.outputs.version }}" \
+            --notes "Download the DMG below. First launch needs a one-time Gatekeeper allow — see the repo README." \
+            "dist-release/QuestBits_${{ steps.stage.outputs.version }}.dmg"

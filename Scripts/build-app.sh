@@ -9,7 +9,7 @@ cd "$ROOT"
 
 APP_NAME="QuestBits"
 BUNDLE_ID="com.local.todoapp"
-VERSION="1.0.0"
+VERSION="${VERSION:-1.0.0}"
 OUT="$ROOT/build"
 APP="$OUT/$APP_NAME.app"
 CORE=(Sources/TodoCore/*.swift)
