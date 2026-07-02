@@ -55,8 +55,18 @@ public final class Store: @unchecked Sendable {
 
     // MARK: - Low-level helpers
 
-    private func exec(_ sql: String) {
+    @discardableResult
+    private func exec(_ sql: String) -> Int32 {
         sqlite3_exec(db, sql, nil, nil, nil)
+    }
+
+    /// Open a write transaction. Throws on SQLITE_BUSY (busy_timeout has already
+    /// elapsed) so callers never silently run their read-modify-write outside a
+    /// transaction — the cross-process serialization guarantee is real, not best-effort.
+    private func beginImmediate() throws {
+        if exec("BEGIN IMMEDIATE;") != SQLITE_OK {
+            throw StoreError.step("begin immediate failed: \(errmsg())")
+        }
     }
 
     private func errmsg() -> String { String(cString: sqlite3_errmsg(db)) }
@@ -371,8 +381,20 @@ public final class Store: @unchecked Sendable {
     private func createTaskUnlocked(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                                     status: TaskStatus = .todo, priority: Priority = .none,
                                     dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
-                                    parentId: Int64? = nil, estimateSeconds: Int = 0) throws -> TodoTask {
+                                    parentId: Int64? = nil, estimateSeconds: Int = 0,
+                                    enforceNesting: Bool = true) throws -> TodoTask {
         let now = Date()
+        // Enforce the one-level nesting invariant at the data layer so EVERY caller
+        // (MCP, UI, recurrence spawn) is covered: a parent must itself be top-level.
+        // moveTask's cascade and the recurrence subtask-clone only walk direct children,
+        // so a grandchild would silently orphan on those paths. Internal callers that
+        // already know the parent is top-level pass enforceNesting:false to skip the lookup.
+        if enforceNesting, let parentId {
+            let parentOfParent = queryString("SELECT parent_id FROM tasks WHERE id=?;", [.int(parentId)])
+            if parentOfParent != nil {
+                throw StoreError.step("cannot nest a subtask under another subtask (one level of nesting only)")
+            }
+        }
         // A subtask must not recur: on completion a recurring task spawns a fresh
         // top-level occurrence, so a recurring subtask would leak a detached duplicate.
         // Force recurrence to nil whenever this task has a parent.
@@ -557,8 +579,8 @@ public final class Store: @unchecked Sendable {
             // two processes (app + MCP) can race on, each spawning an occurrence. Wrap
             // both in a single BEGIN IMMEDIATE and re-check inside that the task was not
             // already done, so only a genuine todo/in_progress -> done transition spawns.
-            exec("BEGIN IMMEDIATE;")
             do {
+                try beginImmediate()
                 let currentStatus = queryString("SELECT status FROM tasks WHERE id=?;", [.int(id)])
                 try runWrite(updateSQL, binds)
                 if currentStatus != TaskStatus.done.rawValue,
@@ -572,18 +594,26 @@ public final class Store: @unchecked Sendable {
                     logEvent(spawned.id, "recurrence", "", rule)
                     // Carry the completed task's checklist: clone each direct subtask as a
                     // fresh todo under the new occurrence (title/detail/priority/tags/estimate).
+                    // spawned is known top-level, so skip the redundant per-subtask nesting check.
                     for sub in subtasksUnlocked(old.id) {
                         _ = try createTaskUnlocked(
                             projectId: spawned.projectId, title: sub.title, detail: sub.detail, link: nil,
                             status: .todo, priority: sub.priority, dueDate: nil, tags: sub.tags,
-                            recurrence: nil, parentId: spawned.id, estimateSeconds: sub.estimateSeconds
+                            recurrence: nil, parentId: spawned.id, estimateSeconds: sub.estimateSeconds,
+                            enforceNesting: false
                         )
                     }
                 }
-                exec("COMMIT;")
+                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             } catch {
+                // Clear any transaction left open (a failed COMMIT, or a BEGIN that hit an
+                // already-open connection) so the shared connection is never poisoned for
+                // later writes. ROLLBACK is a harmless no-op when no transaction is active.
                 exec("ROLLBACK;")
-                throw error
+                // Degrade gracefully: still mark the task done even if the atomic spawn
+                // could not run under write contention. A missed occurrence beats a failed
+                // mark-done or a stuck connection; nothing is orphaned (rolled back above).
+                try runWrite(updateSQL, binds)
             }
         } else {
             try runWrite(updateSQL, binds)
@@ -725,16 +755,18 @@ public final class Store: @unchecked Sendable {
         // The reachability check + INSERT is a read-modify-write two processes can race
         // on, each adding a reciprocal edge to form a permanent 2-cycle. Serialize them
         // with BEGIN IMMEDIATE and re-check reachability inside the transaction.
-        exec("BEGIN IMMEDIATE;")
         do {
+            try beginImmediate()
             // If dependsOnId already (transitively) depends on taskId, adding
             // taskId→dependsOnId would create a cycle.
             if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
                 throw StoreError.step("adding this dependency would create a cycle")
             }
             try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
-            exec("COMMIT;")
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
         } catch {
+            // ROLLBACK clears the transaction on any failure (including a BEGIN that hit an
+            // already-open connection), so the shared connection is never left poisoned.
             exec("ROLLBACK;")
             throw error
         }
