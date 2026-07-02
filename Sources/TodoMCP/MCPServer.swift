@@ -125,6 +125,11 @@ final class MCPServer {
             if let parentId, try store.getTask(id: parentId).parentId != nil {
                 throw MCPError.invalidArg("parent must be a top-level task; subtasks support only one level of nesting")
             }
+            // A subtask must not recur — on completion a recurring task spawns a fresh
+            // top-level occurrence, so a recurring subtask would leak a detached dupe.
+            if parentId != nil, let rec = args["recurrence"] as? String, !rec.isEmpty {
+                throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
+            }
             let projectId: Int64
             if args["project_id"] != nil || args["project_code"] != nil {
                 projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
@@ -171,6 +176,11 @@ final class MCPServer {
                 recurArg = .some(args["recurrence"] as? String)
             } else {
                 recurArg = .none
+            }
+            // A subtask must not recur — reject a non-nil recurrence on a subtask.
+            if let rec = args["recurrence"] as? String, !rec.isEmpty,
+               try store.getTask(id: id).parentId != nil {
+                throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
             }
             try store.updateTask(
                 id: id,

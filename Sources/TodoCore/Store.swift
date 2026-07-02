@@ -373,6 +373,10 @@ public final class Store: @unchecked Sendable {
                                     dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                                     parentId: Int64? = nil, estimateSeconds: Int = 0) throws -> TodoTask {
         let now = Date()
+        // A subtask must not recur: on completion a recurring task spawns a fresh
+        // top-level occurrence, so a recurring subtask would leak a detached duplicate.
+        // Force recurrence to nil whenever this task has a parent.
+        let effectiveRecurrence = parentId == nil ? recurrence : nil
         // Next per-project sequence number → task code.
         try runWrite("UPDATE projects SET task_seq = task_seq + 1 WHERE id=?;", [.int(projectId)])
         let seq = queryInt("SELECT task_seq FROM projects WHERE id=?;", [.int(projectId)]) ?? 1
@@ -386,7 +390,7 @@ public final class Store: @unchecked Sendable {
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
              .text(status.rawValue), .text(priority.rawValue), due, .text(encodeTags(tags)),
-             recurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
+             effectiveRecurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
              .int(Int64(max(0, estimateSeconds))),
              .int(Int64(now.timeIntervalSince1970)), .int(Int64(now.timeIntervalSince1970)), .int(projectId)]
         )
@@ -395,7 +399,7 @@ public final class Store: @unchecked Sendable {
         if status != .todo { logEvent(id, "status", "todo", status.rawValue) }
         return TodoTask(id: id, code: code, projectId: projectId, title: title, detail: detail, link: link,
                         status: status, priority: priority, dueDate: dueDate, tags: tags,
-                        recurrence: recurrence, effortSeconds: 0, estimateSeconds: max(0, estimateSeconds),
+                        recurrence: effectiveRecurrence, effortSeconds: 0, estimateSeconds: max(0, estimateSeconds),
                         parentId: parentId, createdAt: now, updatedAt: now, sortOrder: 0)
     }
 
@@ -420,7 +424,13 @@ public final class Store: @unchecked Sendable {
     /// Subtasks of a parent task, ordered like the main list.
     public func subtasks(parentId: Int64) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT \(Self.taskCols) FROM tasks WHERE parent_id=? ORDER BY sort_order, id;", [.int(parentId)])
+        return subtasksUnlocked(parentId)
+    }
+
+    /// Direct subtasks of a parent without taking the lock — for use inside
+    /// already-locked scopes (e.g. carrying a checklist onto a recurrence spawn).
+    private func subtasksUnlocked(_ parentId: Int64) -> [TodoTask] {
+        guard let stmt = try? prepare("SELECT \(Self.taskCols) FROM tasks WHERE parent_id=? ORDER BY sort_order, id;", [.int(parentId)]) else { return [] }
         defer { sqlite3_finalize(stmt) }
         var out: [TodoTask] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(taskFromRow(stmt)) }
@@ -521,29 +531,62 @@ public final class Store: @unchecked Sendable {
         if let priority { sets.append("priority=?"); binds.append(.text(priority.rawValue)) }
         if let dueDate { sets.append("due_date=?"); binds.append(dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null) }
         if let tags { sets.append("tags=?"); binds.append(.text(encodeTags(tags))) }
-        if let recurrence { sets.append("recurrence=?"); binds.append(recurrence.map(SQLValue.text) ?? .null) }
+        if let recurrence {
+            // Ignore a non-nil recurrence on a subtask (subtasks must not recur —
+            // it would spawn a detached top-level dupe). Clearing (nil) is allowed.
+            if !((old?.parentId != nil) && recurrence != nil) {
+                sets.append("recurrence=?"); binds.append(recurrence.map(SQLValue.text) ?? .null)
+            }
+        }
         if let estimateSeconds { sets.append("estimate_seconds=?"); binds.append(.int(Int64(max(0, estimateSeconds)))) }
         guard !sets.isEmpty else { return }
         sets.append("updated_at=?"); binds.append(.int(now))
         binds.append(.int(id))
-        try runWrite("UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
+        let updateSQL = "UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?;"
 
-        // Recurrence: when a recurring task transitions INTO done, spawn the next
-        // occurrence (fresh todo) with its due date advanced by the interval.
-        // createTaskUnlocked is used because we already hold the lock here.
-        if let status, status == .done, let old, old.status != .done {
-            // Effective recurrence: a value set in this same update wins, else the stored one.
-            let effectiveRecurrence: String?
-            if let recurrence { effectiveRecurrence = recurrence } else { effectiveRecurrence = old.recurrence }
-            if let rule = effectiveRecurrence, !rule.isEmpty,
-               let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
-                let spawned = try createTaskUnlocked(
-                    projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
-                    status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
-                    estimateSeconds: old.estimateSeconds
-                )
-                logEvent(spawned.id, "recurrence", "", rule)
+        // Recurrence: when a recurring, top-level task transitions INTO done, spawn the
+        // next occurrence (fresh todo) with its due date advanced by the interval.
+        // Effective recurrence: a value set in this same update wins, else the stored one.
+        let effectiveRecurrence: String?
+        if let recurrence { effectiveRecurrence = recurrence } else { effectiveRecurrence = old?.recurrence }
+        let mayRecur = status == .done && old != nil && (old?.parentId == nil)
+            && (effectiveRecurrence.map { !$0.isEmpty } ?? false)
+
+        if mayRecur, let old {
+            // The done-transition write + occurrence spawn is a read-modify-write that
+            // two processes (app + MCP) can race on, each spawning an occurrence. Wrap
+            // both in a single BEGIN IMMEDIATE and re-check inside that the task was not
+            // already done, so only a genuine todo/in_progress -> done transition spawns.
+            exec("BEGIN IMMEDIATE;")
+            do {
+                let currentStatus = queryString("SELECT status FROM tasks WHERE id=?;", [.int(id)])
+                try runWrite(updateSQL, binds)
+                if currentStatus != TaskStatus.done.rawValue,
+                   let rule = effectiveRecurrence, !rule.isEmpty,
+                   let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
+                    let spawned = try createTaskUnlocked(
+                        projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
+                        status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
+                        estimateSeconds: old.estimateSeconds
+                    )
+                    logEvent(spawned.id, "recurrence", "", rule)
+                    // Carry the completed task's checklist: clone each direct subtask as a
+                    // fresh todo under the new occurrence (title/detail/priority/tags/estimate).
+                    for sub in subtasksUnlocked(old.id) {
+                        _ = try createTaskUnlocked(
+                            projectId: spawned.projectId, title: sub.title, detail: sub.detail, link: nil,
+                            status: .todo, priority: sub.priority, dueDate: nil, tags: sub.tags,
+                            recurrence: nil, parentId: spawned.id, estimateSeconds: sub.estimateSeconds
+                        )
+                    }
+                }
+                exec("COMMIT;")
+            } catch {
+                exec("ROLLBACK;")
+                throw error
             }
+        } else {
+            try runWrite(updateSQL, binds)
         }
 
         // History: log discrete-field changes (skip free-text title/detail — autosave makes them noisy).
@@ -588,12 +631,25 @@ public final class Store: @unchecked Sendable {
     @discardableResult
     public func duplicateTask(id: Int64, toProjectId: Int64? = nil) throws -> TodoTask {
         let t = try getTask(id: id)
+        let targetProject = toProjectId ?? t.projectId
+        // Within the same project a copy stays a subtask of the same parent; copying
+        // to a different project would leave the child dangling (parent isn't moving),
+        // so it becomes a top-level task instead.
+        let newParentId: Int64? = (targetProject == t.projectId) ? t.parentId : nil
+        // Clone all planning fields; effort/started/completed reset to zero (createTask
+        // treats every new task as fresh work — it never carries effort or timestamps).
         return try createTask(
-            projectId: toProjectId ?? t.projectId,
+            projectId: targetProject,
             title: t.title,
             detail: t.detail,
             link: t.link,
-            status: t.status
+            status: t.status,
+            priority: t.priority,
+            dueDate: t.dueDate,
+            tags: t.tags,
+            recurrence: t.recurrence,
+            parentId: newParentId,
+            estimateSeconds: t.estimateSeconds
         )
     }
 
@@ -603,6 +659,7 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let oldCode = getTaskUnlocked(id).flatMap { queryString("SELECT code FROM projects WHERE id=?;", [.int($0.projectId)]) } ?? ""
         let newCode = queryString("SELECT code FROM projects WHERE id=?;", [.int(toProjectId)]) ?? ""
+        let now = Int64(Date().timeIntervalSince1970)
         try runWrite(
             """
             UPDATE tasks
@@ -611,7 +668,13 @@ public final class Store: @unchecked Sendable {
                 updated_at=?
             WHERE id=?;
             """,
-            [.int(toProjectId), .int(toProjectId), .int(Int64(Date().timeIntervalSince1970)), .int(id)]
+            [.int(toProjectId), .int(toProjectId), .int(now), .int(id)]
+        )
+        // Cascade the new project to direct subtasks so children follow the parent —
+        // otherwise they keep the old project_id and vanish from both projects.
+        try runWrite(
+            "UPDATE tasks SET project_id=?, updated_at=? WHERE parent_id=?;",
+            [.int(toProjectId), .int(now), .int(id)]
         )
         if oldCode != newCode { logEvent(id, "project", oldCode, newCode) }
     }
@@ -659,12 +722,22 @@ public final class Store: @unchecked Sendable {
         guard taskId != dependsOnId else {
             throw StoreError.step("a task cannot depend on itself")
         }
-        // If dependsOnId already (transitively) depends on taskId, adding
-        // taskId→dependsOnId would create a cycle.
-        if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
-            throw StoreError.step("adding this dependency would create a cycle")
+        // The reachability check + INSERT is a read-modify-write two processes can race
+        // on, each adding a reciprocal edge to form a permanent 2-cycle. Serialize them
+        // with BEGIN IMMEDIATE and re-check reachability inside the transaction.
+        exec("BEGIN IMMEDIATE;")
+        do {
+            // If dependsOnId already (transitively) depends on taskId, adding
+            // taskId→dependsOnId would create a cycle.
+            if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
+                throw StoreError.step("adding this dependency would create a cycle")
+            }
+            try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
+            exec("COMMIT;")
+        } catch {
+            exec("ROLLBACK;")
+            throw error
         }
-        try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
     }
 
     /// Remove the blocked-by edge `taskId`→`dependsOnId` (no-op if absent).
@@ -901,9 +974,11 @@ public final class Store: @unchecked Sendable {
             sqlite3_finalize(stmt)
         }
 
-        // Tasks completed in range → bucket by completed_at's local day.
+        // Tasks completed in range → bucket by completed_at's local day. Exclude subtasks
+        // (parent_id IS NOT NULL) so the dashboard reflects real top-level throughput, not
+        // individual checklist ticks. Recurrence occurrences are top-level, so still count.
         if let stmt = try? prepare(
-            "SELECT completed_at FROM tasks WHERE completed_at IS NOT NULL AND completed_at >= ? AND completed_at < ?;", [lo, hi]) {
+            "SELECT completed_at FROM tasks WHERE completed_at IS NOT NULL AND parent_id IS NULL AND completed_at >= ? AND completed_at < ?;", [lo, hi]) {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let day = cal.startOfDay(for: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)))
                 let key = fmt.string(from: day)
