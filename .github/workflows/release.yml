@@ -8,9 +8,12 @@
 # Trigger: push a tag like `v1.2.0`. The version CI stamps into the app bundle
 # is taken from the tag (the `v` is stripped).
 #
-# Required repo secret (Settings → Secrets and variables → Actions):
-#   RELEASES_REPO_TOKEN  fine-grained PAT with contents:write on
-#                        90n9/quest-bits-releases
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   RELEASES_REPO_TOKEN     fine-grained PAT with contents:write on
+#                           90n9/quest-bits-releases
+#   SPARKLE_ED_PRIVATE_KEY  Sparkle EdDSA private key (generate_keys -x output)
+#                           used to sign the DMG for auto-updates; the matching
+#                           public key is baked into Info.plist (SUPublicEDKey)
 
 name: release
 
@@ -30,6 +33,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Sparkle
+        uses: actions/cache@v4
+        with:
+          path: vendor/Sparkle
+          key: sparkle-2.6.4
 
       - name: Build app bundle (version from tag)
         env:
@@ -78,6 +87,38 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Sign DMG with Sparkle EdDSA key
+        id: sparkle_sign
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_PATH="dist-release/QuestBits_${VERSION}.dmg"
+
+          KEY_FILE="$(mktemp -t sparkle-key)"
+          # printf, not echo: preserve the key byte-for-byte as emitted by
+          # Sparkle's `generate_keys -x`.
+          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" > "$KEY_FILE"
+
+          SIGN_UPDATE="vendor/Sparkle/bin/sign_update"
+          if [[ ! -x "$SIGN_UPDATE" ]]; then
+            echo "sign_update not found at $SIGN_UPDATE" >&2
+            exit 1
+          fi
+
+          # Output looks like: sparkle:edSignature="BASE64" length="123456"
+          SIGN_OUTPUT="$("$SIGN_UPDATE" -f "$KEY_FILE" "$DMG_PATH")"
+          rm -f "$KEY_FILE"
+          ED_SIG=$(printf '%s' "$SIGN_OUTPUT" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
+          LENGTH=$(printf '%s' "$SIGN_OUTPUT" | sed -n 's/.*length="\([^"]*\)".*/\1/p')
+          if [[ -z "$ED_SIG" || -z "$LENGTH" ]]; then
+            echo "Failed to parse sign_update output: $SIGN_OUTPUT" >&2
+            exit 1
+          fi
+          echo "ED_SIGNATURE=${ED_SIG}" >> "$GITHUB_ENV"
+          echo "ENCLOSURE_LENGTH=${LENGTH}" >> "$GITHUB_ENV"
+
       - name: Publish to public releases repo
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
@@ -88,3 +129,89 @@ jobs:
             --title "QuestBits ${{ steps.stage.outputs.version }}" \
             --notes-file dist-release/notes.md \
             "dist-release/QuestBits_${{ steps.stage.outputs.version }}.dmg"
+
+      - name: Update appcast.xml in public releases repo
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          export VERSION
+          export DMG_URL="https://github.com/${PUBLIC_REPO}/releases/download/${GITHUB_REF_NAME}/QuestBits_${VERSION}.dmg"
+
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${PUBLIC_REPO}.git" public-repo
+
+          # Appcast description = this version's CHANGELOG section (same awk as
+          # the release-notes extractor above, without the download footer).
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1 }
+            grab && $0 ~ "^## \\[" && $0 !~ "\\[" ver "\\]" { exit }
+            grab { print }
+          ' CHANGELOG.md > appcast-notes.md || true
+
+          python3 - <<'PYEOF'
+          import os
+          from email.utils import formatdate
+          from xml.etree import ElementTree as ET
+
+          VERSION = os.environ["VERSION"]
+          DMG_URL = os.environ["DMG_URL"]
+          DMG_SIZE = os.environ["ENCLOSURE_LENGTH"]
+          ED_SIG = os.environ["ED_SIGNATURE"]
+
+          SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+          ET.register_namespace("sparkle", SPARKLE_NS)
+
+          try:
+              description = open("appcast-notes.md").read().strip()
+          except OSError:
+              description = ""
+          if not description:
+              description = f"QuestBits {VERSION}"
+
+          path = "public-repo/appcast.xml"
+          if os.path.exists(path):
+              tree = ET.parse(path)
+              rss = tree.getroot()
+          else:
+              rss = ET.Element("rss", {"version": "2.0"})
+              ET.SubElement(rss, "channel")
+              tree = ET.ElementTree(rss)
+
+          channel = rss.find("channel")
+          if channel is None:
+              raise SystemExit("appcast.xml missing <channel>")
+
+          item = ET.Element("item")
+          ET.SubElement(item, "title").text = f"QuestBits {VERSION}"
+          ET.SubElement(item, f"{{{SPARKLE_NS}}}version").text = VERSION
+          ET.SubElement(item, f"{{{SPARKLE_NS}}}shortVersionString").text = VERSION
+          ET.SubElement(item, "pubDate").text = formatdate(localtime=False, usegmt=True)
+          desc = ET.SubElement(item, "description")
+          # ElementTree has no native CDATA; mark for post-processing.
+          desc.text = f"__CDATA_OPEN__{description}__CDATA_CLOSE__"
+          ET.SubElement(item, f"{{{SPARKLE_NS}}}minimumSystemVersion").text = "14.0"
+          ET.SubElement(item, "enclosure", {
+              "url": DMG_URL,
+              "length": DMG_SIZE,
+              "type": "application/octet-stream",
+              f"{{{SPARKLE_NS}}}edSignature": ED_SIG,
+              f"{{{SPARKLE_NS}}}version": VERSION,
+              f"{{{SPARKLE_NS}}}shortVersionString": VERSION,
+          })
+
+          # Newest first — Sparkle reads top-down.
+          channel.insert(0, item)
+          ET.indent(tree, space="    ")
+          xml = ET.tostring(rss, encoding="unicode", xml_declaration=True)
+          xml = xml.replace("__CDATA_OPEN__", "<![CDATA[").replace("__CDATA_CLOSE__", "]]>")
+          with open(path, "w") as f:
+              f.write(xml + "\n")
+          PYEOF
+
+          cd public-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          git commit -m "appcast: QuestBits ${VERSION}"
+          git push origin HEAD:main

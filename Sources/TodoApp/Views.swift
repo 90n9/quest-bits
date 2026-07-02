@@ -10,6 +10,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            UpdateBanner()
             NavigationSplitView {
                 ProjectSidebar()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
@@ -62,12 +63,48 @@ struct ToastView: View {
     let text: String
     var body: some View {
         Label(text, systemImage: "checkmark.circle.fill")
-            .font(.callout.weight(.medium))
-            .foregroundStyle(.white)
+            .font(Theme.Fonts.captionBold)
+            .foregroundStyle(Theme.Colors.onPrimary)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(Color.green.opacity(0.92), in: Capsule())
-            .shadow(radius: 6, y: 2)
+            .background(Theme.Colors.successAccent, in: Capsule())
+            .shadow(color: Theme.Colors.inkDeep.opacity(0.12), radius: 12, y: 4)
+    }
+}
+
+/// `promo-banner`: black strip above the content when Sparkle finds a newer
+/// version. Yellow "NEW" chip (`badge-promo`), on-dark copy, white pill
+/// "Update Now" (`button-on-dark`) that re-opens Sparkle's install dialog.
+struct UpdateBanner: View {
+    @ObservedObject private var notifier = UpdateNotifier.shared
+
+    var body: some View {
+        if let version = notifier.availableVersion {
+            HStack(spacing: Theme.Spacing.sm) {
+                Text("NEW")
+                    .qbBadge(background: Theme.Colors.brandYellow, foreground: Theme.Colors.primary)
+                Text("QuestBits \(version) is available")
+                    .font(Theme.Fonts.bodySmMedium)
+                    .foregroundStyle(Theme.Colors.onDark)
+                    .lineLimit(1)
+                Spacer(minLength: Theme.Spacing.xs)
+                Button("Update Now") { notifier.onInstallTapped?() }
+                    .buttonStyle(QBOnDarkButtonStyle(compact: true))
+                Button {
+                    notifier.dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.Colors.onDarkMuted)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss until the next check")
+            }
+            .padding(.horizontal, Theme.Spacing.md)
+            .padding(.vertical, Theme.Spacing.xs)
+            .frame(maxWidth: .infinity)
+            .background(Theme.Colors.primary)
+        }
     }
 }
 
@@ -87,16 +124,16 @@ struct ProjectSidebar: View {
             Section("Views") {
                 ForEach(SmartView.allCases, id: \.self) { v in
                     Label(v.title, systemImage: v.icon)
-                        .foregroundStyle(model.smartView == v ? Color.accentColor : .primary)
+                        .foregroundStyle(model.smartView == v ? Theme.Colors.brandBlue : Theme.Colors.ink)
                         .contentShape(Rectangle())
                         .onTapGesture { model.selectSmartView(v) }
-                        .listRowBackground(model.smartView == v ? Color.accentColor.opacity(0.15) : Color.clear)
+                        .listRowBackground(model.smartView == v ? Theme.Colors.surfacePricingFeatured : Color.clear)
                 }
                 Label("Dashboard", systemImage: "chart.bar.xaxis")
-                    .foregroundStyle(model.showDashboard ? Color.accentColor : .primary)
+                    .foregroundStyle(model.showDashboard ? Theme.Colors.brandBlue : Theme.Colors.ink)
                     .contentShape(Rectangle())
                     .onTapGesture { model.selectDashboard() }
-                    .listRowBackground(model.showDashboard ? Color.accentColor.opacity(0.15) : Color.clear)
+                    .listRowBackground(model.showDashboard ? Theme.Colors.surfacePricingFeatured : Color.clear)
                 Label("Templates", systemImage: "doc.on.doc")
                     .contentShape(Rectangle())
                     .onTapGesture { showTemplates = true }
@@ -109,7 +146,7 @@ struct ProjectSidebar: View {
                         CodeBadge(code: p.code)
                         Text(p.name)
                         Spacer()
-                        Text("\(taskCount(p.id))").foregroundStyle(.secondary).font(.caption)
+                        Text("\(taskCount(p.id))").foregroundStyle(Theme.Colors.steel).font(Theme.Fonts.micro)
                     }
                     .tag(p.id)
                     .help(p.detail.isEmpty ? p.name : p.detail)
@@ -170,27 +207,30 @@ struct ProjectSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(title).font(.headline)
+            Text(title).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
             TextField("Project name", text: $name)
                 .textFieldStyle(.roundedBorder)
-            Text("Description").font(.caption).foregroundStyle(.secondary)
+            Text("Description").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
             TextEditor(text: $detail)
                 .frame(height: 90)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
                 Button("Save") {
                     let n = name.trimmingCharacters(in: .whitespaces)
                     if !n.isEmpty { onSave(n, detail) }
                     dismiss()
                 }
+                .buttonStyle(QBPrimaryButtonStyle(compact: true))
                 .keyboardShortcut(.defaultAction)
                 .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
-        .padding(20)
+        .padding(Theme.Spacing.lg)
         .frame(width: 380)
+        .background(Theme.Colors.canvas)
     }
 }
 
@@ -218,38 +258,39 @@ struct TemplatesSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Task Templates").font(.headline)
+                Text("Task Templates").font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
             }
-            .padding(16)
+            .padding(Theme.Spacing.md)
             Divider()
             Form {
                 Section("Templates") {
                     if model.templates.isEmpty {
                         Text("No templates yet. Add one below.")
-                            .foregroundStyle(.secondary).font(.caption)
+                            .foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
                     } else {
                         ForEach(model.templates) { t in
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
                                     if t.priority != .none {
                                         Image(systemName: "flag.fill").font(.caption2)
-                                            .foregroundStyle(priorityColor(t.priority))
+                                            .foregroundStyle(qbPriorityColor(t.priority))
                                     }
-                                    Text(t.name).font(.body.weight(.medium))
+                                    Text(t.name).font(Theme.Fonts.bodySmMedium).foregroundStyle(Theme.Colors.ink)
                                     Spacer()
                                     Button(role: .destructive) { model.deleteTemplate(t.id) } label: {
                                         Image(systemName: "trash")
                                     }
-                                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+                                    .buttonStyle(.borderless).foregroundStyle(Theme.Colors.steel)
                                     .help("Delete template")
                                 }
-                                Text(t.title).font(.caption).foregroundStyle(.secondary)
+                                Text(t.title).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
                                 HStack(spacing: 6) {
                                     if t.estimateSeconds > 0 {
                                         Label(fmtEffort(t.estimateSeconds), systemImage: "target")
-                                            .font(.caption2).foregroundStyle(.secondary)
+                                            .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                                     }
                                     ForEach(t.tags.prefix(4), id: \.self) { TagChip(text: $0) }
                                 }
@@ -270,8 +311,9 @@ struct TemplatesSheet: View {
                     }
                     TextEditor(text: $detail)
                         .frame(height: 60)
-                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
                     Button("Add Template") { addTemplate() }
+                        .buttonStyle(QBSecondaryButtonStyle(compact: true))
                         .disabled(!canAdd)
                 }
             }
@@ -292,14 +334,36 @@ struct TemplatesSheet: View {
         )
         name = ""; title = ""; detail = ""; priority = .none; tagsText = ""; estimateMinutes = 0
     }
+}
 
-    private func priorityColor(_ p: Priority) -> Color {
-        switch p {
-        case .high: return .red
-        case .medium: return .orange
-        case .low: return .blue
-        case .none: return .secondary
-        }
+// MARK: - Shared token mappings
+
+/// Priority accent, from the DESIGN.md tag-chip text colors (coral-dark / yellow-dark / brand-blue).
+func qbPriorityColor(_ p: Priority) -> Color {
+    switch p {
+    case .high: return Theme.Colors.coralDark
+    case .medium: return Theme.Colors.yellowDark
+    case .low: return Theme.Colors.brandBlue
+    case .none: return Theme.Colors.stone
+    }
+}
+
+/// Priority chip pair, per `badge-tag-coral` / `badge-tag-yellow` / `badge-tag-purple`.
+func qbPriorityChipColors(_ p: Priority) -> (bg: Color, fg: Color) {
+    switch p {
+    case .high: return (Theme.Colors.coralLight, Theme.Colors.coralDark)
+    case .medium: return (Theme.Colors.surfaceYellow, Theme.Colors.yellowDark)
+    case .low: return (Theme.Colors.surfacePricingFeatured, Theme.Colors.brandBlue)
+    case .none: return (Theme.Colors.surface, Theme.Colors.steel)
+    }
+}
+
+/// Task-status accent: stone (todo), yellow-deep (in progress), success-accent (done).
+func qbStatusColor(_ s: TaskStatus) -> Color {
+    switch s {
+    case .todo: return Theme.Colors.stone
+    case .inProgress: return Theme.Colors.brandYellowDeep
+    case .done: return Theme.Colors.successAccent
     }
 }
 
@@ -329,7 +393,7 @@ struct TaskListView: View {
                 Button { showNew = true } label: {
                     Label("New Task", systemImage: "plus")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(QBPrimaryButtonStyle(compact: true))
                 .help("New Task (⌘N)")
                 .disabled(model.selectedProjectId == nil)
             }
@@ -351,17 +415,19 @@ struct TaskListView: View {
 
     @ViewBuilder private var taskContent: some View {
         if model.tasks.isEmpty {
-            VStack(spacing: 12) {
+            VStack(spacing: Theme.Spacing.md) {
                 Text(model.smartView != nil ? "No tasks here" : "No tasks in this project")
-                    .foregroundStyle(.secondary)
+                    .font(Theme.Fonts.subtitle)
+                    .foregroundStyle(Theme.Colors.slate)
                 if model.smartView == nil {
                     Button { showNew = true } label: {
                         Label("New Task", systemImage: "plus")
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(QBPrimaryButtonStyle())
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.Colors.canvas)
         } else if displayedTasks.isEmpty {
             ContentUnavailableViewCompat(
                 text: "No tasks match \u{201C}\(model.searchQuery.trimmingCharacters(in: .whitespaces))\u{201D}")
@@ -377,6 +443,11 @@ struct TaskListView: View {
                                 subtasks: subtasks(of: task),
                                 showSubtaskUI: model.smartView == nil)
                             .tag(task.id)
+                            // Replace the system accent selection fill — fixed ink/steel row
+                            // text is unreadable on it. Lavender featured-state matches the
+                            // sidebar selection treatment.
+                            .listRowBackground(model.selectedTaskIds.contains(task.id)
+                                ? Theme.Colors.surfacePricingFeatured : Color.clear)
                             .contextMenu {
                                 Button("Copy Code (\(task.code))") { model.copyCode(task.code) }
                                 Button("Duplicate") { model.duplicateTask(task.id) }
@@ -432,14 +503,21 @@ struct TaskListView: View {
     /// When searching, keep a top-level task if it matches or any of its subtasks match.
     private var displayedTasks: [TodoTask] {
         let base = model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
-        guard isSearching else { return base }
-        if model.smartView == nil {
-            return base.filter { task in
+        let filtered: [TodoTask]
+        if !isSearching {
+            filtered = base
+        } else if model.smartView == nil {
+            filtered = base.filter { task in
                 model.taskMatchesSearch(task)
                     || model.tasks.contains { $0.parentId == task.id && model.taskMatchesSearch($0) }
             }
+        } else {
+            filtered = base.filter { model.taskMatchesSearch($0) }
         }
-        return base.filter { model.taskMatchesSearch($0) }
+        // Done tasks sink to the bottom so new/in-progress work stays in view.
+        // Stable partition: manual sort order is preserved within each group.
+        // A manual drag while done rows are sunk persists this order via onMove.
+        return filtered.filter { $0.status != .done } + filtered.filter { $0.status == .done }
     }
 
     /// Subtasks of a task, taken from the already-loaded flat list (project view only).
@@ -458,22 +536,30 @@ struct SearchBar: View {
     @Binding var query: String
 
     var body: some View {
+        // `search-pill`: surface background, steel text, body-sm, 8px corners, hairline border.
         HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            Image(systemName: "magnifyingglass").foregroundStyle(Theme.Colors.steel)
             TextField("Search tasks", text: $query)
                 .textFieldStyle(.plain)
+                .font(Theme.Fonts.bodySm)
+                // Spec's steel is the rest/placeholder tone; entered text stays ink for legibility.
+                .foregroundStyle(Theme.Colors.ink)
             if !query.isEmpty {
                 Button { query = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.Colors.steel)
                 .help("Clear search")
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(.bar)
+        .padding(.horizontal, Theme.Spacing.md)
+        .frame(height: 40)
+        .background(Theme.Colors.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.md))
+        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairline, lineWidth: 1))
+        .padding(.horizontal, Theme.Spacing.sm)
+        .padding(.vertical, Theme.Spacing.xs)
+        .background(Theme.Colors.canvas)
     }
 }
 
@@ -485,38 +571,48 @@ struct BulkActionBar: View {
     @State private var tagText = ""
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: Theme.Spacing.xs) {
             Text("\(model.selectedTaskIds.count) selected")
-                .font(.subheadline.weight(.semibold))
+                .font(Theme.Fonts.bodySmMedium)
+                .foregroundStyle(Theme.Colors.ink)
 
             Spacer()
 
-            Menu("Status") {
+            Menu {
                 ForEach(TaskStatus.allCases, id: \.self) { s in
                     Button(s.display) { model.bulkSetStatus(s) }
                 }
-            }
-            Menu("Priority") {
+            } label: { FilterPillLabel(text: "Status") }
+                .menuStyle(.button).buttonStyle(.plain).fixedSize()
+            Menu {
                 ForEach(Priority.allCases, id: \.self) { p in
                     Button(p.display) { model.bulkSetPriority(p) }
                 }
-            }
+            } label: { FilterPillLabel(text: "Priority") }
+                .menuStyle(.button).buttonStyle(.plain).fixedSize()
             if !otherProjects.isEmpty {
-                Menu("Move") {
+                Menu {
                     ForEach(otherProjects) { p in Button(p.name) { model.bulkMove(toProject: p.id) } }
-                }
-                Menu("Copy") {
+                } label: { FilterPillLabel(text: "Move") }
+                    .menuStyle(.button).buttonStyle(.plain).fixedSize()
+                Menu {
                     ForEach(otherProjects) { p in Button(p.name) { model.bulkCopy(toProject: p.id) } }
-                }
+                } label: { FilterPillLabel(text: "Copy") }
+                    .menuStyle(.button).buttonStyle(.plain).fixedSize()
             }
             Button("Add Tags") { showTagSheet = true }
-            Button(role: .destructive) { model.bulkDelete() } label: { Image(systemName: "trash") }
+                .buttonStyle(QBGhostButtonStyle())
+            Button(role: .destructive) { model.bulkDelete() } label: {
+                Image(systemName: "trash").foregroundStyle(Theme.Colors.coralDark)
+            }
+                .buttonStyle(QBGhostButtonStyle())
                 .help("Delete selected")
             Button("Clear") { model.selectedTaskIds = [] }
+                .buttonStyle(QBGhostButtonStyle())
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.bar)
+        .padding(.horizontal, Theme.Spacing.sm)
+        .padding(.vertical, Theme.Spacing.xs)
+        .background(Theme.Colors.surface)
         .sheet(isPresented: $showTagSheet) {
             NameSheet(title: "Add tags to \(model.selectedTaskIds.count) tasks",
                       placeholder: "comma, separated, tags", text: $tagText) {
@@ -525,6 +621,23 @@ struct BulkActionBar: View {
                 tagText = ""
             }
         }
+    }
+}
+
+/// `filter-dropdown` chrome for Menu labels: pill, canvas background, hairline-strong border.
+struct FilterPillLabel: View {
+    let text: String
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(text)
+            Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+        }
+        .font(Theme.Fonts.bodySmMedium)
+        .foregroundStyle(Theme.Colors.ink)
+        .padding(.horizontal, Theme.Spacing.md)
+        .padding(.vertical, Theme.Spacing.xs)
+        .background(Theme.Colors.canvas, in: Capsule())
+        .overlay(Capsule().stroke(Theme.Colors.hairlineStrong, lineWidth: 1))
     }
 }
 
@@ -549,7 +662,7 @@ struct TaskRow: View {
                     model.cycleStatus(task)
                 }) {
                     Image(systemName: statusIcon)
-                        .foregroundStyle(statusColor)
+                        .foregroundStyle(qbStatusColor(task.status))
                         .font(.system(size: 16))
                 }
                 .buttonStyle(.plain)
@@ -558,53 +671,54 @@ struct TaskRow: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         if task.priority != .none {
-                            Image(systemName: "flag.fill").font(.caption2).foregroundStyle(priorityColor)
+                            Image(systemName: "flag.fill").font(.caption2).foregroundStyle(qbPriorityColor(task.priority))
                         }
                         CodeBadge(code: task.code)
                         Text(task.title)
+                            .font(Theme.Fonts.bodySm)
                             .strikethrough(task.status == .done)
-                            .foregroundStyle(task.status == .done ? .secondary : .primary)
+                            .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
                         if !subtasks.isEmpty {
                             Text("\(doneCount)/\(subtasks.count)")
-                                .font(.caption2.monospacedDigit().weight(.medium))
+                                .font(Theme.Fonts.micro.monospacedDigit())
                                 .padding(.horizontal, 6).padding(.vertical, 1)
-                                .background(Color.secondary.opacity(0.15), in: Capsule())
-                                .foregroundStyle(doneCount == subtasks.count ? Color.green : .secondary)
+                                .background(Theme.Colors.surface, in: Capsule())
+                                .foregroundStyle(doneCount == subtasks.count ? Theme.Colors.successAccent : Theme.Colors.steel)
                                 .help("\(doneCount) of \(subtasks.count) subtasks done")
                         }
                         if isBlocked {
                             Text("🔒 blocked")
-                                .font(.caption2.weight(.medium))
+                                .font(Theme.Fonts.micro)
                                 .padding(.horizontal, 6).padding(.vertical, 1)
-                                .background(Color.red.opacity(0.15), in: Capsule())
-                                .foregroundStyle(.red)
+                                .background(Theme.Colors.brandRed, in: Capsule())
+                                .foregroundStyle(Theme.Colors.coralDark)
                                 .help("Blocked by an unfinished dependency")
                         }
                     }
                     HStack(spacing: 8) {
                         if task.link != nil && !(task.link?.isEmpty ?? true) {
-                            Image(systemName: "link").font(.caption2).foregroundStyle(.secondary)
+                            Image(systemName: "link").font(.caption2).foregroundStyle(Theme.Colors.steel)
                         }
                         if task.effortSeconds > 0 {
                             Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
-                                .font(.caption2).foregroundStyle(.secondary)
+                                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                         }
                         if task.estimateSeconds > 0 {
                             EstimateBadge(estimateSeconds: task.estimateSeconds, actualSeconds: task.effortSeconds)
                         }
                         if let due = task.dueDate {
                             Label(dueText(due), systemImage: "calendar")
-                                .font(.caption2)
-                                .foregroundStyle(isOverdue(due, task) ? Color.red : .secondary)
+                                .font(Theme.Fonts.micro)
+                                .foregroundStyle(isOverdue(due, task) ? Theme.Colors.coralDark : Theme.Colors.steel)
                         }
                         if let rec = task.recurrence, !rec.isEmpty {
-                            Text("↻ \(rec)").font(.caption2).foregroundStyle(.secondary)
+                            Text("↻ \(rec)").font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                         }
                         ForEach(task.tags.prefix(3), id: \.self) { TagChip(text: $0) }
                     }
                 }
                 Spacer()
-                Text(task.status.display).font(.caption2).foregroundStyle(.secondary)
+                Text(task.status.display).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.stone)
             }
 
             // Subtasks (one level of nesting), shown only for top-level tasks in a project view.
@@ -614,14 +728,16 @@ struct TaskRow: View {
                 }
                 if addingSubtask {
                     HStack(spacing: 8) {
-                        Image(systemName: "square").foregroundStyle(.secondary)
+                        Image(systemName: "square").foregroundStyle(Theme.Colors.steel)
                         TextField("Subtask title", text: $newSubtaskTitle)
                             .textFieldStyle(.roundedBorder)
-                            .font(.callout)
+                            .font(Theme.Fonts.bodySm)
                             .onSubmit { commitSubtask() }
                         Button("Add") { commitSubtask() }
+                            .buttonStyle(QBPrimaryButtonStyle(compact: true))
                             .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
                         Button("Cancel") { addingSubtask = false; newSubtaskTitle = "" }
+                            .buttonStyle(QBGhostButtonStyle())
                     }
                     .padding(.leading, 26)
                 } else {
@@ -629,10 +745,8 @@ struct TaskRow: View {
                         addingSubtask = true
                     } label: {
                         Label("subtask", systemImage: "plus")
-                            .font(.caption)
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.accentColor)
+                    .buttonStyle(QBLinkButtonStyle())
                     .padding(.leading, 26)
                 }
             }
@@ -647,14 +761,6 @@ struct TaskRow: View {
         addingSubtask = false
     }
 
-    private var priorityColor: Color {
-        switch task.priority {
-        case .high: return .red
-        case .medium: return .orange
-        case .low: return .blue
-        case .none: return .secondary
-        }
-    }
 
     private func dueText(_ d: Date) -> String {
         let f = DateFormatter()
@@ -675,13 +781,6 @@ struct TaskRow: View {
         case .done: return "checkmark.circle.fill"
         }
     }
-    private var statusColor: Color {
-        switch task.status {
-        case .todo: return .secondary
-        case .inProgress: return .orange
-        case .done: return .green
-        }
-    }
 }
 
 /// A single subtask line: checkbox + title, indented under its parent.
@@ -693,16 +792,16 @@ struct SubtaskRow: View {
         HStack(spacing: 8) {
             Button(action: { model.toggleSubtaskDone(sub) }) {
                 Image(systemName: sub.status == .done ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(sub.status == .done ? Color.green : .secondary)
+                    .foregroundStyle(sub.status == .done ? Theme.Colors.successAccent : Theme.Colors.steel)
                     .font(.system(size: 14))
             }
             .buttonStyle(.plain)
             .help("Toggle done")
 
             Text(sub.title)
-                .font(.callout)
+                .font(Theme.Fonts.bodySm)
                 .strikethrough(sub.status == .done)
-                .foregroundStyle(sub.status == .done ? .secondary : .primary)
+                .foregroundStyle(sub.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
             Spacer()
         }
         .padding(.leading, 26)
@@ -791,13 +890,13 @@ struct BoardColumn: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
-                Image(systemName: icon).foregroundStyle(tint)
-                Text(status.display).font(.headline)
+                Image(systemName: icon).foregroundStyle(qbStatusColor(status))
+                Text(status.display).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
                 Text("\(tasks.count)")
-                    .font(.caption.monospacedDigit().weight(.medium))
+                    .font(Theme.Fonts.micro.monospacedDigit())
                     .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(Color.secondary.opacity(0.15), in: Capsule())
-                    .foregroundStyle(.secondary)
+                    .background(Theme.Colors.canvas, in: Capsule())
+                    .foregroundStyle(Theme.Colors.steel)
                 Spacer()
             }
             .padding(.horizontal, 4)
@@ -812,7 +911,7 @@ struct BoardColumn: View {
                     }
                     if tasks.isEmpty {
                         Text("No tasks")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.stone)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 20)
                     }
@@ -824,12 +923,13 @@ struct BoardColumn: View {
         .frame(maxHeight: .infinity, alignment: .top)
         .padding(10)
         .background(
-            (targeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06)),
-            in: RoundedRectangle(cornerRadius: 12)
+            (targeted ? Theme.Colors.surfacePricingFeatured : Theme.Colors.surface),
+            in: RoundedRectangle(cornerRadius: Theme.Radius.lg)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(targeted ? Color.accentColor : Color.clear, lineWidth: 2)
+            RoundedRectangle(cornerRadius: Theme.Radius.lg)
+                .stroke(targeted ? Theme.Colors.brandBlue : Theme.Colors.hairlineSoft,
+                        lineWidth: targeted ? 2 : 1)
         )
         .onDrop(of: [.plainText], isTargeted: $targeted) { providers in
             handleDrop(providers)
@@ -859,13 +959,6 @@ struct BoardColumn: View {
         case .done: return "checkmark.circle.fill"
         }
     }
-    private var tint: Color {
-        switch status {
-        case .todo: return .secondary
-        case .inProgress: return .orange
-        case .done: return .green
-        }
-    }
 }
 
 /// A draggable card: code, priority, title, and effort/due when present.
@@ -878,44 +971,47 @@ struct BoardCard: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 if task.priority != .none {
-                    Image(systemName: "flag.fill").font(.caption2).foregroundStyle(priorityColor)
+                    Image(systemName: "flag.fill").font(.caption2).foregroundStyle(qbPriorityColor(task.priority))
                 }
                 CodeBadge(code: task.code)
                 Spacer()
             }
             Text(task.title)
-                .font(.callout)
+                .font(Theme.Fonts.bodySm)
                 .lineLimit(3)
-                .foregroundStyle(task.status == .done ? .secondary : .primary)
+                .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
                 .strikethrough(task.status == .done)
             HStack(spacing: 8) {
                 if task.priority != .none {
+                    let chip = qbPriorityChipColors(task.priority)
                     Text(task.priority.display)
-                        .font(.caption2.weight(.medium))
+                        .font(Theme.Fonts.micro)
                         .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(priorityColor.opacity(0.15), in: Capsule())
-                        .foregroundStyle(priorityColor)
+                        .background(chip.bg, in: Capsule())
+                        .foregroundStyle(chip.fg)
                 }
                 if task.effortSeconds > 0 {
                     Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                 }
                 if task.estimateSeconds > 0 {
                     EstimateBadge(estimateSeconds: task.estimateSeconds, actualSeconds: task.effortSeconds)
                 }
                 if let due = task.dueDate {
                     Label(dueText(due), systemImage: "calendar")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                 }
                 ForEach(task.tags.prefix(2), id: \.self) { TagChip(text: $0) }
             }
         }
-        .padding(10)
+        .padding(Theme.Spacing.sm)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        // `template-card`: canvas surface, 16px corners, hairline border; selection uses
+        // the featured-card treatment (2px brand-blue).
+        .background(Theme.Colors.canvas, in: RoundedRectangle(cornerRadius: Theme.Radius.xl))
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(model.selectedTaskId == task.id ? Color.accentColor : Color.secondary.opacity(0.18),
+            RoundedRectangle(cornerRadius: Theme.Radius.xl)
+                .stroke(model.selectedTaskId == task.id ? Theme.Colors.brandBlue : Theme.Colors.hairline,
                         lineWidth: model.selectedTaskId == task.id ? 2 : 1)
         )
         .contentShape(Rectangle())
@@ -923,14 +1019,6 @@ struct BoardCard: View {
         .help(task.title)
     }
 
-    private var priorityColor: Color {
-        switch task.priority {
-        case .high: return .red
-        case .medium: return .orange
-        case .low: return .blue
-        case .none: return .secondary
-        }
-    }
 
     private func dueText(_ d: Date) -> String {
         let f = DateFormatter()
@@ -1007,13 +1095,13 @@ struct TaskDetailView: View {
                     Section("Blocked By") {
                         let deps = model.dependencies(of: task.id)
                         if deps.isEmpty {
-                            Text("No blocking tasks").foregroundStyle(.secondary).font(.caption)
+                            Text("No blocking tasks").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
                         } else {
                             ForEach(deps, id: \.self) { depId in
                                 if let dep = model.task(byId: depId) {
                                     HStack(spacing: 8) {
                                         Image(systemName: dep.status == .done ? "checkmark.circle.fill" : "circle")
-                                            .foregroundStyle(dep.status == .done ? Color.green : Color.orange)
+                                            .foregroundStyle(dep.status == .done ? Theme.Colors.successAccent : Theme.Colors.brandYellowDeep)
                                         CodeBadge(code: dep.code)
                                         Text(dep.title).lineLimit(1)
                                         Spacer()
@@ -1023,7 +1111,7 @@ struct TaskDetailView: View {
                                             Image(systemName: "xmark.circle.fill")
                                         }
                                         .buttonStyle(.borderless)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(Theme.Colors.steel)
                                         .help("Remove dependency")
                                     }
                                 }
@@ -1083,7 +1171,7 @@ struct TaskDetailView: View {
                         DisclosureGroup("History (\(model.history(forTask: task.id).count))") {
                             let events = model.history(forTask: task.id)
                             if events.isEmpty {
-                                Text("No changes yet").foregroundStyle(.secondary).font(.caption)
+                                Text("No changes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
                             } else {
                                 ForEach(events) { e in HistoryRow(event: e) }
                             }
@@ -1197,13 +1285,13 @@ struct HistoryRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             HStack {
-                Text(label).font(.caption.weight(.medium))
+                Text(label).font(Theme.Fonts.captionBold).foregroundStyle(Theme.Colors.ink)
                 Spacer()
-                Text(fmtDateTime(event.timestamp)).font(.caption2).foregroundStyle(.secondary)
+                Text(fmtDateTime(event.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
             if event.field != "created" {
                 Text(event.oldValue.isEmpty ? "→ \(event.newValue)" : "\(event.oldValue) → \(event.newValue)")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
         }
         .padding(.vertical, 1)
@@ -1244,13 +1332,14 @@ struct EstimateBadge: View {
         HStack(spacing: 3) {
             Image(systemName: "target").font(.caption2)
             Text("est \(fmtEffort(estimateSeconds))")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.Colors.steel)
             if actualSeconds > 0 && delta > 0 {
                 Text(over ? "+\(fmtEffort(delta))" : "-\(fmtEffort(delta))")
-                    .foregroundStyle(over ? Color.red : Color.green)
+                    .foregroundStyle(over ? Theme.Colors.coralDark : Theme.Colors.successAccent)
             }
         }
-        .font(.caption2)
+        .font(Theme.Fonts.micro)
+        .foregroundStyle(Theme.Colors.steel)
         .help("Estimate \(fmtEffort(estimateSeconds)) vs actual \(fmtEffort(actualSeconds))")
     }
 }
@@ -1273,28 +1362,28 @@ struct EstimateVsActualView: View {
                 Spacer()
                 Text(fmtEffort(estimateSeconds)).monospacedDigit()
             }
-            .font(.caption).foregroundStyle(.secondary)
+            .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.15))
+                    Capsule().fill(Theme.Colors.hairlineSoft)
                     Capsule()
-                        .fill(over ? Color.red : Color.green)
+                        .fill(over ? Theme.Colors.brandCoral : Theme.Colors.successAccent)
                         .frame(width: CGFloat(ratio) * geo.size.width)
                 }
             }
             .frame(height: 8)
             HStack {
                 Text("Actual \(fmtEffort(actualSeconds))")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
                 Spacer()
                 if actualSeconds == 0 {
-                    Text("not started").font(.caption2).foregroundStyle(.secondary)
+                    Text("not started").font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.stone)
                 } else if delta == 0 {
-                    Text("on estimate").font(.caption2).foregroundStyle(.green)
+                    Text("on estimate").font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.successAccent)
                 } else {
                     Text(over ? "over by \(fmtEffort(delta)) (\(pct)%)" : "under by \(fmtEffort(delta)) (\(pct)%)")
-                        .font(.caption2)
-                        .foregroundStyle(over ? Color.red : Color.green)
+                        .font(Theme.Fonts.micro)
+                        .foregroundStyle(over ? Theme.Colors.coralDark : Theme.Colors.successAccent)
                 }
             }
         }
@@ -1310,15 +1399,15 @@ func fmtDateTime(_ d: Date) -> String {
     return f.string(from: d)
 }
 
-/// Small tag pill.
+/// Small tag pill — `badge-tag-purple`: lavender surface, brand-blue text, full pill.
 struct TagChip: View {
     let text: String
     var body: some View {
         Text(text)
-            .font(.caption2)
-            .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(Color.accentColor.opacity(0.15), in: Capsule())
-            .foregroundStyle(Color.accentColor)
+            .font(Theme.Fonts.micro)
+            .padding(.horizontal, 8).padding(.vertical, 2)
+            .background(Theme.Colors.surfacePricingFeatured, in: Capsule())
+            .foregroundStyle(Theme.Colors.brandBlue)
     }
 }
 
@@ -1330,27 +1419,34 @@ struct PomodoroBar: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            // Phase + clock
+            // Phase + clock (heading-4 scale, monospaced digits for the countdown)
             HStack(spacing: 8) {
                 Text(phaseIcon(engine.phase)).font(.title2)
                 Text(engine.phase == .idle ? "Ready" : engine.clock)
-                    .font(.system(.title2, design: .monospaced))
+                    .font(.system(size: 22, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Theme.Colors.ink)
                     .frame(minWidth: 90, alignment: .leading)
-                Text(engine.phase.label).foregroundStyle(.secondary)
+                Text(engine.phase.label)
+                    .font(Theme.Fonts.bodySm)
+                    .foregroundStyle(Theme.Colors.slate)
             }
 
             Divider().frame(height: 24)
 
-            // Controls
+            // Controls: Start/Pause is the primary CTA; Skip/Stop stay quiet.
             HStack(spacing: 10) {
                 if engine.running {
                     Button { engine.pause() } label: { Label("Pause", systemImage: "pause.fill") }
+                        .buttonStyle(QBPrimaryButtonStyle(compact: true))
                 } else {
                     Button { engine.startFocus() } label: { Label("Start", systemImage: "play.fill") }
+                        .buttonStyle(QBPrimaryButtonStyle(compact: true))
                 }
                 Button { engine.skip() } label: { Image(systemName: "forward.fill") }
+                    .buttonStyle(QBGhostButtonStyle())
                     .disabled(engine.phase == .idle)
                 Button { engine.stop() } label: { Image(systemName: "stop.fill") }
+                    .buttonStyle(QBGhostButtonStyle())
                     .disabled(engine.phase == .idle)
             }
 
@@ -1362,9 +1458,9 @@ struct PomodoroBar: View {
                 statBadge(icon: "clock", value: "\(model.stats.totalFocusSeconds / 60)m", label: "focus today")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.bar)
+        .padding(.horizontal, Theme.Spacing.md)
+        .padding(.vertical, Theme.Spacing.xs)
+        .background(Theme.Colors.canvas)
     }
 
     private func phaseIcon(_ phase: PomodoroPhase) -> String {
@@ -1377,9 +1473,9 @@ struct PomodoroBar: View {
 
     private func statBadge(icon: String, value: String, label: String) -> some View {
         HStack(spacing: 5) {
-            Image(systemName: icon).foregroundStyle(.secondary)
-            Text(value).font(.headline.monospacedDigit())
-            Text(label).font(.caption).foregroundStyle(.secondary)
+            Image(systemName: icon).foregroundStyle(Theme.Colors.steel)
+            Text(value).font(Theme.Fonts.bodyMdMedium.monospacedDigit()).foregroundStyle(Theme.Colors.ink)
+            Text(label).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.steel)
         }
     }
 }
@@ -1415,6 +1511,11 @@ struct SettingsView: View {
             Section("Timer Behavior") {
                 Toggle("Auto-start next phase", isOn: $autoAdvance)
                 Toggle("Count break time as effort", isOn: $breaksEffort)
+            }
+            Section("Updates") {
+                LabeledContent("Version",
+                               value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")
+                Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
             }
             Section("Claude Code (MCP)") {
                 LabeledContent("Status", value: mcpStatus)
@@ -1530,21 +1631,24 @@ struct NameSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(title).font(.headline)
+            Text(title).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
             TextField(placeholder, text: $text)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { create() }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
                     .keyboardShortcut(.cancelAction)
                 Button("Create") { create() }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
                     .keyboardShortcut(.defaultAction)
                     .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
-        .padding(20)
+        .padding(Theme.Spacing.lg)
         .frame(width: 340)
+        .background(Theme.Colors.canvas)
     }
 
     private func create() {
@@ -1554,16 +1658,18 @@ struct NameSheet: View {
     }
 }
 
-/// Small monospaced pill showing a project/task code.
+/// Small monospaced chip showing a project/task code — surface fill, steel text,
+/// `{rounded.xs}` corners (monospaced code reads better rectangular than as a pill).
 struct CodeBadge: View {
     let code: String
     var body: some View {
         Text(code)
-            .font(.system(.caption2, design: .monospaced).weight(.semibold))
+            .font(Theme.Fonts.codeBadge)
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
-            .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
-            .foregroundStyle(.secondary)
+            .background(Theme.Colors.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.xs))
+            .overlay(RoundedRectangle(cornerRadius: Theme.Radius.xs).stroke(Theme.Colors.hairline, lineWidth: 1))
+            .foregroundStyle(Theme.Colors.steel)
     }
 }
 
@@ -1591,10 +1697,12 @@ struct CopyCodeButton: View {
         } label: {
             Label(copied ? "Copied!" : "Copy code",
                   systemImage: copied ? "checkmark.circle.fill" : "doc.on.doc")
-                .foregroundStyle(copied ? Color.green : Color.accentColor)
+                .font(Theme.Fonts.bodySmMedium)
+                .foregroundStyle(copied ? Theme.Colors.successAccent : Theme.Colors.brandBlue)
                 .scaleEffect(copied ? 1.05 : 1.0)
                 .contentTransition(.symbolEffect(.replace))
         }
+        .buttonStyle(.plain)
         .disabled(copied)
     }
 }
@@ -1645,37 +1753,44 @@ struct DashboardView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                Text("Stats").font(.largeTitle.bold())
+                Text("Stats")
+                    .font(Theme.Fonts.heading3)
+                    .foregroundStyle(Theme.Colors.ink)
 
                 // Summary tiles (last 7 days + all-time tracked effort).
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
-                    StatTile(icon: "clock", tint: .orange, value: fmtEffort(totalFocusSeconds), label: "Focus (7d)")
-                    StatTile(icon: "checkmark.seal", tint: .red, value: "\(totalPomodoros)", label: "Pomodoros (7d)")
-                    StatTile(icon: "checkmark.circle", tint: .green, value: "\(totalCompleted)", label: "Completed (7d)")
-                    StatTile(icon: "hourglass", tint: .blue, value: fmtEffort(totalTrackedSeconds), label: "Tracked effort")
+                    StatTile(icon: "clock", tint: Theme.Colors.brandYellowDeep,
+                             value: fmtEffort(totalFocusSeconds), label: "Focus (7d)")
+                    StatTile(icon: "checkmark.seal", tint: Theme.Colors.brandCoral,
+                             value: "\(totalPomodoros)", label: "Pomodoros (7d)")
+                    StatTile(icon: "checkmark.circle", tint: Theme.Colors.successAccent,
+                             value: "\(totalCompleted)", label: "Completed (7d)")
+                    StatTile(icon: "hourglass", tint: Theme.Colors.brandBlue,
+                             value: fmtEffort(totalTrackedSeconds), label: "Tracked effort")
                 }
 
                 ChartCard(title: "Focus per day", subtitle: "minutes, last 7 days") {
-                    BarChartView(data: focusData, unit: "min", tint: .orange) { fmtMinutes($0) }
+                    BarChartView(data: focusData, unit: "min", tint: Theme.Colors.brandYellowDeep) { fmtMinutes($0) }
                 }
                 ChartCard(title: "Pomodoros per day", subtitle: "completed focus sessions") {
-                    BarChartView(data: pomodoroData, unit: "count", tint: .red) { "\(Int($0))" }
+                    BarChartView(data: pomodoroData, unit: "count", tint: Theme.Colors.brandCoral) { "\(Int($0))" }
                 }
                 ChartCard(title: "Tasks completed per day", subtitle: "last 7 days") {
-                    BarChartView(data: completedData, unit: "count", tint: .green) { "\(Int($0))" }
+                    BarChartView(data: completedData, unit: "count", tint: Theme.Colors.successAccent) { "\(Int($0))" }
                 }
                 ChartCard(title: "Effort per project", subtitle: "minutes tracked, top projects") {
                     if effortData.isEmpty {
                         Text("No tracked effort yet — run a focus timer on an in-progress task.")
-                            .font(.callout).foregroundStyle(.secondary)
+                            .font(Theme.Fonts.bodySm).foregroundStyle(Theme.Colors.slate)
                             .frame(maxWidth: .infinity, minHeight: 120)
                     } else {
-                        BarChartView(data: effortData, unit: "min", tint: .blue) { fmtMinutes($0) }
+                        BarChartView(data: effortData, unit: "min", tint: Theme.Colors.brandBlue) { fmtMinutes($0) }
                     }
                 }
             }
-            .padding(20)
+            .padding(Theme.Spacing.lg)
         }
+        .background(Theme.Colors.canvas)
         .navigationTitle("Dashboard")
         .onAppear { model.reloadDashboard() }
     }
@@ -1704,12 +1819,13 @@ struct StatTile: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Image(systemName: icon).font(.title3).foregroundStyle(tint)
-            Text(value).font(.title2.bold().monospacedDigit())
-            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text(value)
+                .font(Theme.Fonts.heading4.monospacedDigit())
+                .foregroundStyle(Theme.Colors.ink)
+            Text(label).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.steel)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .qbCard(padding: Theme.Spacing.md)
     }
 }
 
@@ -1722,14 +1838,13 @@ struct ChartCard<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                Text(title).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
+                Text(subtitle).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.steel)
             }
             content
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        .qbCard(padding: Theme.Spacing.md)
     }
 }
 
@@ -1751,7 +1866,7 @@ struct BarChartView: View {
                 .foregroundStyle(tint.gradient)
                 .annotation(position: .top) {
                     if d.value > 0 {
-                        Text(format(d.value)).font(.caption2).foregroundStyle(.secondary)
+                        Text(format(d.value)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                     }
                 }
             }
@@ -1778,12 +1893,12 @@ struct FallbackBarChart: View {
                 ForEach(data) { d in
                     VStack(spacing: 4) {
                         Text(d.value > 0 ? format(d.value) : "")
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                             .frame(height: 14)
-                        RoundedRectangle(cornerRadius: 4)
+                        RoundedRectangle(cornerRadius: Theme.Radius.xs)
                             .fill(tint)
                             .frame(height: CGFloat(d.value / maxV) * barArea)
-                        Text(d.label).font(.caption2).foregroundStyle(.secondary)
+                        Text(d.label).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -1796,7 +1911,8 @@ struct FallbackBarChart: View {
 struct ContentUnavailableViewCompat: View {
     let text: String
     var body: some View {
-        VStack { Text(text).foregroundStyle(.secondary).font(.title3) }
+        VStack { Text(text).foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.subtitle) }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.Colors.canvas)
     }
 }

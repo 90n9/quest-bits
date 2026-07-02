@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import UserNotifications
+import Sparkle
 
 @main
 struct TodoAppMain: App {
@@ -13,6 +14,9 @@ struct TodoAppMain: App {
                 .environmentObject(delegate.model)
                 .environmentObject(delegate.model.pomodoro)
                 .frame(minWidth: 820, minHeight: 520)
+                // DESIGN.md defines light tokens only — lock the app to light appearance.
+                .preferredColorScheme(.light)
+                .tint(Theme.Colors.brandBlue)
         }
         .windowToolbarStyle(.unified)
         .commands { TodoCommands(model: delegate.model, shortcuts: delegate.shortcuts) }
@@ -33,6 +37,8 @@ struct TodoAppMain: App {
             SettingsView()
                 .environmentObject(delegate.model)
                 .environmentObject(delegate.shortcuts)
+                .preferredColorScheme(.light)
+                .tint(Theme.Colors.brandBlue)
         }
     }
 }
@@ -49,6 +55,11 @@ struct TodoCommands: Commands {
     }
 
     var body: some Commands {
+        // "Check for Updates…" in the app menu, right under "About".
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
+        }
+
         // Replace (not append to) the .newItem group: a WindowGroup auto-installs a
         // "New Window" command bound to ⌘N. Appending our New Task (also ⌘N) leaves
         // two ⌘N bindings and New Window wins, so the shortcut never creates a task.
@@ -91,16 +102,49 @@ struct TodoCommands: Commands {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     let shortcuts = ShortcutStore()
+    var updaterController: SPUStandardUpdaterController!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MCPRegistration.registerIfNeeded()
         requestNotificationPermission()
         wirePomodoroNotifications()
+
+        // Sparkle auto-updater. `startingUpdater: true` schedules the first
+        // background check per SUScheduledCheckInterval from Info.plist
+        // (auto-checks are compiled off in local dev builds — see build-app.sh).
+        // Sparkle's standard user driver presents the native "new version",
+        // download-progress, and install-and-relaunch dialogs.
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: self,
+            userDriverDelegate: nil
+        )
+
+        // Every UI entry point (banner button, menu-bar item, app menu,
+        // Settings) routes through the same updater.
+        UpdateNotifier.shared.onInstallTapped = { [weak self] in
+            self?.updaterController.checkForUpdates(nil)
+        }
+        UpdateNotifier.shared.requestCheck = { [weak self] in
+            self?.updaterController.checkForUpdates(nil)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep running in the menu bar after the window closes.
         false
+    }
+
+    // MARK: - Sparkle
+
+    /// Fires when Sparkle confirms an appcast entry is newer than the running
+    /// build. Surface it in the in-window banner so the user can act even if
+    /// they dismissed the native dialog. Deliberately NOT hooking
+    /// `didDownloadUpdate` for a "restart now" alert: that fires before the
+    /// update is extracted/validated/staged — Sparkle's own user driver shows
+    /// the correct "Install and Relaunch" dialog once staging completes.
+    nonisolated func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        UpdateNotifier.shared.setAvailable(version: item.displayVersionString)
     }
 
     // MARK: - Notifications
@@ -121,6 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
+
+extension AppDelegate: SPUUpdaterDelegate {}
 
 // MARK: - Menu bar timer
 
@@ -147,6 +193,10 @@ struct MenuBarContent: View {
     @EnvironmentObject var engine: PomodoroEngine
 
     var body: some View {
+        // No live clock here: the countdown ticking every second while the menu is
+        // open forces an NSMenu rebuild per tick, which desyncs the hover highlight
+        // (the blue highlight lands on the wrong item). The menu-bar label already
+        // shows the live mm:ss; the dropdown only needs the (rarely-changing) phase.
         Text(phaseHeadline)
 
         if let active = model.inProgressTasks.first {
@@ -167,11 +217,12 @@ struct MenuBarContent: View {
         Divider()
 
         Button("Show Main Window") { Self.showMainWindow() }
+        Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
         Button("Quit Todo") { NSApp.terminate(nil) }
     }
 
     private var phaseHeadline: String {
-        engine.phase == .idle ? "Ready" : "\(engine.phase.label) — \(engine.clock)"
+        engine.phase == .idle ? "Ready" : engine.phase.label
     }
 
     /// Bring the main window forward (recreating window behavior of the old

@@ -15,6 +15,29 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 _Nothing yet._
 
+## [1.1.0] - 2026-07-02
+
+### Added
+
+- Auto-update via Sparkle: the app checks for new releases hourly, shows an
+  in-app "Update Now" banner plus the native install dialog, and offers
+  "Check for Updates…" in the app menu, menu-bar dropdown, and Settings.
+
+### Changed
+
+- Full visual refresh aligned to the DESIGN.md design system (Miro-style
+  tokens): pill buttons, pastel badges, hairline cards, brand palette,
+  light-appearance lock.
+- Done tasks now sink to the bottom of the task list so new and in-progress
+  work stays in view.
+
+### Fixed
+
+- Menu-bar dropdown hover highlighted the wrong item while the timer was
+  running (the live countdown rebuilt the menu every second).
+- Selected task rows were unreadable (dark text on the system blue selection
+  fill); selection now uses the lavender featured-state background.
+
 ## [1.0.0] - 2026-07-02
 
 First public release — a native macOS todo + Pomodoro app with a bundled MCP
@@ -45,5 +68,6 @@ server for Claude Code.
 - CI (`release.yml`) builds a universal DMG on `v*` tags and publishes it to the
   public releases repo.
 
-[Unreleased]: https://github.com/90n9/quest-bits/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/90n9/quest-bits/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/90n9/quest-bits/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/90n9/quest-bits/releases/tag/v1.0.0
