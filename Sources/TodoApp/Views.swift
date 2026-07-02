@@ -17,7 +17,7 @@ struct ContentView: View {
                 if model.showDashboard {
                     DashboardView()
                         .navigationSplitViewColumnWidth(min: 420, ideal: 560)
-                } else if model.boardView {
+                } else if model.boardView && model.boardAvailable {
                     BoardView()
                         .navigationSplitViewColumnWidth(min: 520, ideal: 820)
                 } else {
@@ -42,6 +42,17 @@ struct ContentView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .zIndex(1)
             }
+        }
+        // Single app-level blocked-task confirmation. Every path that moves a blocked
+        // task to In Progress (list, board drag, bulk bar, Task menu) routes here.
+        .alert("Task is blocked",
+               isPresented: Binding(get: { model.blockedConfirm != nil },
+                                    set: { if !$0 { model.blockedConfirm = nil } }),
+               presenting: model.blockedConfirm) { confirm in
+            Button("Cancel", role: .cancel) { confirm.onCancel?() }
+            Button("Start anyway") { confirm.onConfirm() }
+        } message: { confirm in
+            Text(confirm.message)
         }
     }
 }
@@ -389,10 +400,12 @@ struct TaskListView: View {
                     }
                     .onMove { offsets, dest in
                         // Reordering rewrites a dense sort_order for exactly the ids passed in.
-                        // That is only correct when displayedTasks is the full unfiltered list;
-                        // while searching it is a filtered subset, so a drag would clobber the
-                        // ordering of hidden tasks. Disable reordering during search.
-                        guard !isSearching else { return }
+                        // That is only correct within a single project's full, unfiltered list.
+                        // While searching, displayedTasks is a filtered subset, so a drag would
+                        // clobber the ordering of hidden tasks. In a smart view the rows span
+                        // multiple projects, so a global reorder scrambles each project's
+                        // per-project ordering. Disable reordering in both cases.
+                        guard model.smartView == nil, !isSearching else { return }
                         model.moveTasks(displayedTasks, from: offsets, to: dest)
                     }
                 }
@@ -523,7 +536,6 @@ struct TaskRow: View {
 
     @State private var addingSubtask = false
     @State private var newSubtaskTitle = ""
-    @State private var showBlockedAlert = false
 
     private var doneCount: Int { subtasks.filter { $0.status == .done }.count }
     private var isBlocked: Bool { model.blockedTaskIds.contains(task.id) }
@@ -532,12 +544,9 @@ struct TaskRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 10) {
                 Button(action: {
-                    // Cycling todo → In Progress on a blocked task asks for confirmation.
-                    if task.status == .todo && isBlocked {
-                        showBlockedAlert = true
-                    } else {
-                        model.cycleStatus(task)
-                    }
+                    // Cycling status routes through the shared blocked guard in the model,
+                    // which surfaces the confirmation for a blocked todo → In Progress move.
+                    model.cycleStatus(task)
                 }) {
                     Image(systemName: statusIcon)
                         .foregroundStyle(statusColor)
@@ -629,12 +638,6 @@ struct TaskRow: View {
             }
         }
         .padding(.vertical, 2)
-        .alert("Task is blocked", isPresented: $showBlockedAlert) {
-            Button("Cancel", role: .cancel) {}
-            Button("Start anyway") { model.cycleStatus(task) }
-        } message: {
-            Text("This task is blocked by an unfinished dependency. Move it to In Progress anyway?")
-        }
     }
 
     private func commitSubtask() {
@@ -713,16 +716,20 @@ struct ViewModeToggle: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        Picker("View", selection: Binding(
-            get: { model.boardView },
-            set: { model.boardView = $0 }
-        )) {
-            Image(systemName: "list.bullet").tag(false)
-            Image(systemName: "rectangle.split.3x1").tag(true)
+        // Only offer the board where all three status columns can populate. Single-status
+        // smart views force the list, so hide the toggle there.
+        if model.boardAvailable {
+            Picker("View", selection: Binding(
+                get: { model.boardView },
+                set: { model.boardView = $0 }
+            )) {
+                Image(systemName: "list.bullet").tag(false)
+                Image(systemName: "rectangle.split.3x1").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .help("Switch between list and board")
         }
-        .pickerStyle(.segmented)
-        .fixedSize()
-        .help("Switch between list and board")
     }
 }
 
@@ -732,9 +739,12 @@ struct BoardView: View {
     @EnvironmentObject var model: AppModel
 
     /// Cards shown on the board: top-level tasks in a project view (subtasks stay
-    /// nested in the list); the flat filtered set in a smart view.
+    /// nested in the list); the flat set in a smart view. The board honors the same
+    /// search query as the list, so toggling list ↔ board keeps the filter consistent.
     private var boardTasks: [TodoTask] {
-        model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
+        let base = model.smartView == nil ? model.tasks.filter { $0.parentId == nil } : model.tasks
+        guard !model.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty else { return base }
+        return base.filter { model.taskMatchesSearch($0) }
     }
 
     var body: some View {
@@ -742,15 +752,19 @@ struct BoardView: View {
             if model.selectedProjectId == nil && model.smartView == nil {
                 ContentUnavailableViewCompat(text: "Select a view or project")
             } else {
-                ScrollView(.horizontal, showsIndicators: true) {
-                    HStack(alignment: .top, spacing: 14) {
-                        ForEach(TaskStatus.allCases, id: \.self) { status in
-                            BoardColumn(status: status,
-                                        tasks: boardTasks.filter { $0.status == status })
+                VStack(spacing: 0) {
+                    SearchBar(query: $model.searchQuery)
+                    Divider()
+                    ScrollView(.horizontal, showsIndicators: true) {
+                        HStack(alignment: .top, spacing: 14) {
+                            ForEach(TaskStatus.allCases, id: \.self) { status in
+                                BoardColumn(status: status,
+                                            tasks: boardTasks.filter { $0.status == status })
+                            }
                         }
+                        .padding(16)
+                        .frame(maxHeight: .infinity, alignment: .top)
                     }
-                    .padding(16)
-                    .frame(maxHeight: .infinity, alignment: .top)
                 }
             }
         }
@@ -829,7 +843,9 @@ struct BoardColumn: View {
             guard let str = obj as? String, let id = Int64(str) else { return }
             Task { @MainActor in
                 if let task = model.task(byId: id), task.status != status {
-                    model.updateTask(task, status: status)
+                    // Route through the shared blocked guard so a drag onto In Progress
+                    // gets the same confirmation as the list/bulk/menu paths.
+                    model.setStatus(task, to: status)
                 }
             }
         }
@@ -1082,8 +1098,10 @@ struct TaskDetailView: View {
                 .onChange(of: detail) { _, _ in autosave() }
                 .onChange(of: link) { _, _ in autosave() }
                 .onChange(of: status) { old, new in
-                    // Moving a blocked task to In Progress requires confirmation.
-                    if new == .inProgress, let t = currentTask, model.blockedTaskIds.contains(t.id) {
+                    // Moving a blocked task to In Progress requires confirmation. Uses the
+                    // shared guard decision; keeps a local alert so the picker can revert
+                    // on cancel (the segmented control's binding is view-local state).
+                    if let t = currentTask, model.blockedConfirmNeeded(forIds: [t.id], to: new) {
                         statusBeforeBlock = old
                         showBlockedAlert = true
                     } else {

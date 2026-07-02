@@ -11,6 +11,22 @@ enum SmartView: String, CaseIterable {
 
     var title: String { self == .allTasks ? "All Tasks" : "In Progress" }
     var icon: String { self == .allTasks ? "tray.full" : "circle.lefthalf.filled" }
+
+    /// True when the view pre-filters tasks to a single status. The kanban board
+    /// is meaningless here (only one of its three columns can ever populate), so
+    /// the board toggle is suppressed for these views.
+    var isSingleStatus: Bool { self == .inProgress }
+}
+
+/// A pending blocked-task confirmation surfaced by a single app-level alert.
+/// Any call site that would move a blocked task to In Progress stashes one of
+/// these on the model instead of owning its own alert, so the confirm-then-proceed
+/// UX is identical across the list, board, bulk bar, and menu.
+struct BlockedConfirm: Identifiable {
+    let id = UUID()
+    let message: String
+    let onConfirm: () -> Void
+    var onCancel: (() -> Void)? = nil
 }
 
 @MainActor
@@ -34,6 +50,10 @@ final class AppModel: ObservableObject {
     // Recomputed alongside the displayed task list.
     @Published var blockedTaskIds: Set<Int64> = []
 
+    // Non-nil while an app-level blocked-task confirmation is on screen. Set by any
+    // path that tries to move a blocked task to In Progress; presented once by the root.
+    @Published var blockedConfirm: BlockedConfirm?
+
     // Reusable task templates (managed via the Templates sheet + MCP).
     @Published var templates: [TaskTemplate] = []
 
@@ -44,6 +64,15 @@ final class AppModel: ObservableObject {
 
     /// The single selected task id, or nil when zero or multiple are selected.
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
+
+    /// Whether the kanban board is offered for the current view. The board needs all
+    /// three status columns to be meaningful, so it is suppressed in single-status
+    /// smart views (which pre-filter tasks to one status). Available in project views
+    /// and multi-status smart views (e.g. All Tasks).
+    var boardAvailable: Bool {
+        if let sv = smartView { return !sv.isSingleStatus }
+        return true
+    }
     @Published var stats: DailyStats = DailyStats(date: "", completedPomodoros: 0, totalFocusSeconds: 0)
     @Published var settings: PomodoroSettings = .standard
 
@@ -252,7 +281,28 @@ final class AppModel: ObservableObject {
         case .inProgress: next = .done
         case .done: next = .todo
         }
-        updateTask(task, status: next)
+        setStatus(task, to: next)
+    }
+
+    /// Shared blocked-guard decision: true iff moving these tasks to `status` should
+    /// prompt for confirmation — i.e. the target is In Progress and at least one task
+    /// is currently blocked by an unfinished dependency. Marking Done is never guarded.
+    func blockedConfirmNeeded(forIds ids: [Int64], to status: TaskStatus) -> Bool {
+        guard status == .inProgress else { return false }
+        return ids.contains { blockedTaskIds.contains($0) }
+    }
+
+    /// Move a single task to `status`, routing through the blocked guard. If the task
+    /// is blocked and the target is In Progress, stashes a confirmation (advisory —
+    /// the user can proceed); otherwise applies immediately.
+    func setStatus(_ task: TodoTask, to status: TaskStatus) {
+        if blockedConfirmNeeded(forIds: [task.id], to: status) {
+            blockedConfirm = BlockedConfirm(
+                message: "This task is blocked by an unfinished dependency. Move it to In Progress anyway?",
+                onConfirm: { [weak self] in self?.updateTask(task, status: status) })
+        } else {
+            updateTask(task, status: status)
+        }
     }
 
     func deleteTask(_ id: Int64) {
@@ -387,9 +437,22 @@ final class AppModel: ObservableObject {
     private var selectionCount: Int { selectedTaskIds.count }
 
     func bulkSetStatus(_ status: TaskStatus) {
-        for id in selectedTaskIds { try? store.updateTask(id: id, status: status) }
+        let ids = Array(selectedTaskIds)
+        if blockedConfirmNeeded(forIds: ids, to: status) {
+            let blocked = ids.filter { blockedTaskIds.contains($0) }.count
+            let noun = blocked == 1 ? "task is" : "tasks are"
+            blockedConfirm = BlockedConfirm(
+                message: "\(blocked) selected \(noun) blocked by an unfinished dependency. Move to In Progress anyway?",
+                onConfirm: { [weak self] in self?.performBulkSetStatus(status, ids: ids) })
+        } else {
+            performBulkSetStatus(status, ids: Array(selectedTaskIds))
+        }
+    }
+
+    private func performBulkSetStatus(_ status: TaskStatus, ids: [Int64]) {
+        for id in ids { try? store.updateTask(id: id, status: status) }
         reloadTasks()
-        flashToast("Set \(selectionCount) to \(status.display)")
+        flashToast("Set \(ids.count) to \(status.display)")
     }
 
     func bulkSetPriority(_ priority: Priority) {
