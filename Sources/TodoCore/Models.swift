@@ -116,6 +116,31 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// A reusable task template: preset fields that spawn a real task on demand.
+public struct TaskTemplate: Identifiable, Codable, Hashable, Sendable {
+    public var id: Int64
+    public var name: String            // template handle, e.g. "Bug report"
+    public var title: String           // title applied to spawned tasks
+    public var detail: String
+    public var priority: Priority
+    public var tags: [String]
+    public var estimateSeconds: Int    // planned effort carried onto spawned tasks (0 = unset)
+    public var createdAt: Date
+
+    public init(id: Int64, name: String, title: String, detail: String = "",
+                priority: Priority = .none, tags: [String] = [],
+                estimateSeconds: Int = 0, createdAt: Date) {
+        self.id = id
+        self.name = name
+        self.title = title
+        self.detail = detail
+        self.priority = priority
+        self.tags = tags
+        self.estimateSeconds = estimateSeconds
+        self.createdAt = createdAt
+    }
+}
+
 /// An entry in a task's change history.
 public struct TaskEvent: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64

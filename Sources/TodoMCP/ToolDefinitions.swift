@@ -104,6 +104,23 @@ extension MCPServer {
              "description": "Remove a blocked-by dependency: task (`id`/`code`) no longer depends on (`depends_on_id`/`depends_on_code`).",
              "inputSchema": obj(["id": int, "code": str, "depends_on_id": int, "depends_on_code": str])],
 
+            ["name": "list_templates",
+             "description": "List all reusable task templates. Each has an `id`, `name`, and the preset fields (title, detail, priority, tags, estimate_minutes) applied to tasks spawned from it.",
+             "inputSchema": obj([:])],
+
+            ["name": "create_template",
+             "description": "Create a reusable task template. `name` is the template's handle; `title` is applied to tasks spawned from it. detail, priority, tags, estimate_minutes optional. Returns the template with its new id.",
+             "inputSchema": obj([
+                "name": str, "title": str, "detail": str, "priority": priorityEnum,
+                "tags": tagsArr, "estimate_minutes": estimateInt
+             ], required: ["name", "title"])],
+
+            ["name": "new_task_from_template",
+             "description": "Create a real task from a template (`template_id`) into a project (`project_id` or `project_code`). Copies the template's title, detail, priority, tags, and estimate. Returns the new task with its code.",
+             "inputSchema": obj([
+                "template_id": int, "project_id": int, "project_code": str
+             ], required: ["template_id"])],
+
             ["name": "daily_stats",
              "description": "Today's pomodoro stats: completed count and total focus minutes.",
              "inputSchema": obj([:])]

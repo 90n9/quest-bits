@@ -66,6 +66,7 @@ struct ProjectSidebar: View {
     @EnvironmentObject var model: AppModel
     @State private var showNew = false
     @State private var editing: Project?      // non-nil → edit sheet open
+    @State private var showTemplates = false
 
     var body: some View {
         List(selection: Binding(
@@ -85,6 +86,10 @@ struct ProjectSidebar: View {
                     .contentShape(Rectangle())
                     .onTapGesture { model.selectDashboard() }
                     .listRowBackground(model.showDashboard ? Color.accentColor.opacity(0.15) : Color.clear)
+                Label("Templates", systemImage: "doc.on.doc")
+                    .contentShape(Rectangle())
+                    .onTapGesture { showTemplates = true }
+                    .help("Manage reusable task templates")
             }
             Section("Projects") {
                 ForEach(model.projects) { p in
@@ -100,6 +105,18 @@ struct ProjectSidebar: View {
                     .contextMenu {
                         Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
                         Button("Edit…") { editing = p }
+                        if model.templates.isEmpty {
+                            Button("New Task from Template…") { showTemplates = true }
+                        } else {
+                            Menu("New Task from Template") {
+                                ForEach(model.templates) { t in
+                                    Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
+                                }
+                                Divider()
+                                Button("Manage Templates…") { showTemplates = true }
+                            }
+                        }
+                        Divider()
                         Button("Delete", role: .destructive) { model.deleteProject(p.id) }
                     }
                 }
@@ -121,6 +138,7 @@ struct ProjectSidebar: View {
                 model.updateProject(p.id, name: name, detail: detail)
             }
         }
+        .sheet(isPresented: $showTemplates) { TemplatesSheet() }
         .onChange(of: model.pendingNewProject) { _, pending in
             if pending { showNew = true; model.pendingNewProject = false }
         }
@@ -162,6 +180,115 @@ struct ProjectSheet: View {
         }
         .padding(20)
         .frame(width: 380)
+    }
+}
+
+/// Manage reusable task templates: browse existing ones, delete, and add new.
+/// New tasks are spawned from a template via a project's context menu (or MCP).
+struct TemplatesSheet: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name = ""
+    @State private var title = ""
+    @State private var detail = ""
+    @State private var priority: Priority = .none
+    @State private var tagsText = ""
+    @State private var estimateMinutes = 0
+
+    private var parsedTags: [String] {
+        tagsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    private var canAdd: Bool {
+        !name.trimmingCharacters(in: .whitespaces).isEmpty
+            && !title.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Task Templates").font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+            Divider()
+            Form {
+                Section("Templates") {
+                    if model.templates.isEmpty {
+                        Text("No templates yet. Add one below.")
+                            .foregroundStyle(.secondary).font(.caption)
+                    } else {
+                        ForEach(model.templates) { t in
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    if t.priority != .none {
+                                        Image(systemName: "flag.fill").font(.caption2)
+                                            .foregroundStyle(priorityColor(t.priority))
+                                    }
+                                    Text(t.name).font(.body.weight(.medium))
+                                    Spacer()
+                                    Button(role: .destructive) { model.deleteTemplate(t.id) } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+                                    .help("Delete template")
+                                }
+                                Text(t.title).font(.caption).foregroundStyle(.secondary)
+                                HStack(spacing: 6) {
+                                    if t.estimateSeconds > 0 {
+                                        Label(fmtEffort(t.estimateSeconds), systemImage: "target")
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    ForEach(t.tags.prefix(4), id: \.self) { TagChip(text: $0) }
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+                Section("New Template") {
+                    TextField("Template name (e.g. Bug report)", text: $name)
+                    TextField("Task title", text: $title)
+                    Picker("Priority", selection: $priority) {
+                        ForEach(Priority.allCases, id: \.self) { Text($0.display).tag($0) }
+                    }
+                    TextField("comma, separated, tags", text: $tagsText)
+                    Stepper(value: $estimateMinutes, in: 0...6000, step: 5) {
+                        Text(estimateMinutes == 0 ? "No estimate" : "Estimate: \(fmtMinutes(Double(estimateMinutes)))")
+                    }
+                    TextEditor(text: $detail)
+                        .frame(height: 60)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                    Button("Add Template") { addTemplate() }
+                        .disabled(!canAdd)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 460, height: 580)
+    }
+
+    private func addTemplate() {
+        guard canAdd else { return }
+        model.addTemplate(
+            name: name.trimmingCharacters(in: .whitespaces),
+            title: title.trimmingCharacters(in: .whitespaces),
+            detail: detail,
+            priority: priority,
+            tags: parsedTags,
+            estimateSeconds: estimateMinutes * 60
+        )
+        name = ""; title = ""; detail = ""; priority = .none; tagsText = ""; estimateMinutes = 0
+    }
+
+    private func priorityColor(_ p: Priority) -> Color {
+        switch p {
+        case .high: return .red
+        case .medium: return .orange
+        case .low: return .blue
+        case .none: return .secondary
+        }
     }
 }
 

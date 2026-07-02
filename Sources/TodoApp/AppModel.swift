@@ -34,6 +34,9 @@ final class AppModel: ObservableObject {
     // Recomputed alongside the displayed task list.
     @Published var blockedTaskIds: Set<Int64> = []
 
+    // Reusable task templates (managed via the Templates sheet + MCP).
+    @Published var templates: [TaskTemplate] = []
+
     // Stats dashboard: when shown, the content column swaps to the dashboard.
     @Published var showDashboard = false
     @Published var daySeries: [DayStat] = []
@@ -100,6 +103,7 @@ final class AppModel: ObservableObject {
 
     func reloadAll() {
         projects = (try? store.listProjects()) ?? []
+        templates = (try? store.listTemplates()) ?? []
         if let sel = selectedProjectId, !projects.contains(where: { $0.id == sel }) {
             selectedProjectId = projects.first?.id
         }
@@ -282,6 +286,33 @@ final class AppModel: ObservableObject {
         ordered.move(fromOffsets: offsets, toOffset: destination)
         try? store.reorderTasks(orderedIds: ordered.map { $0.id })
         reloadTasks()
+    }
+
+    // MARK: - Templates
+
+    func reloadTemplates() {
+        templates = (try? store.listTemplates()) ?? []
+    }
+
+    func addTemplate(name: String, title: String, detail: String = "", priority: Priority = .none,
+                     tags: [String] = [], estimateSeconds: Int = 0) {
+        _ = try? store.createTemplate(name: name, title: title, detail: detail,
+                                      priority: priority, tags: tags, estimateSeconds: estimateSeconds)
+        reloadTemplates()
+    }
+
+    func deleteTemplate(_ id: Int64) {
+        try? store.deleteTemplate(id: id)
+        reloadTemplates()
+    }
+
+    /// Instantiate a template into a project. Selects the new task when its project
+    /// is the one on screen, and flashes a confirmation toast.
+    func newTaskFromTemplate(_ templateId: Int64, intoProject pid: Int64) {
+        guard let task = try? store.instantiateTemplate(id: templateId, intoProjectId: pid) else { return }
+        reloadTasks()
+        if smartView == nil && selectedProjectId == pid { selectedTaskIds = [task.id] }
+        flashToast("Added \(task.code)")
     }
 
     // MARK: - Dependencies (blocked-by)

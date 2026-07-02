@@ -201,6 +201,20 @@ public final class Store: @unchecked Sendable {
 
         // --- Additive migration: time estimate (compared against effort_seconds) ---
         if !columnExists("tasks", "estimate_seconds") { exec("ALTER TABLE tasks ADD COLUMN estimate_seconds INTEGER NOT NULL DEFAULT 0;") }
+
+        // --- Additive migration: reusable task templates ---
+        exec("""
+        CREATE TABLE IF NOT EXISTS task_templates (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL,
+            title            TEXT NOT NULL,
+            detail           TEXT NOT NULL DEFAULT '',
+            priority         TEXT NOT NULL DEFAULT 'none',
+            tags             TEXT NOT NULL DEFAULT '',
+            estimate_seconds INTEGER NOT NULL DEFAULT 0,
+            created_at       REAL NOT NULL
+        );
+        """)
     }
 
     /// Assign codes to any pre-existing rows that lack them.
@@ -746,6 +760,71 @@ public final class Store: @unchecked Sendable {
     }
     private func decodeTags(_ s: String) -> [String] {
         s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    // MARK: - Task templates
+
+    /// Create a reusable task template.
+    @discardableResult
+    public func createTemplate(name: String, title: String, detail: String = "",
+                               priority: Priority = .none, tags: [String] = [],
+                               estimateSeconds: Int = 0) throws -> TaskTemplate {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        try runWrite(
+            "INSERT INTO task_templates (name, title, detail, priority, tags, estimate_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+            [.text(name), .text(title), .text(detail), .text(priority.rawValue),
+             .text(encodeTags(tags)), .int(Int64(max(0, estimateSeconds))),
+             .int(Int64(now.timeIntervalSince1970))]
+        )
+        let id = lastInsertId()
+        return TaskTemplate(id: id, name: name, title: title, detail: detail,
+                            priority: priority, tags: tags,
+                            estimateSeconds: max(0, estimateSeconds), createdAt: now)
+    }
+
+    public func listTemplates() throws -> [TaskTemplate] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            "SELECT id, name, title, detail, priority, tags, estimate_seconds, created_at FROM task_templates ORDER BY name COLLATE NOCASE, id;", [])
+        defer { sqlite3_finalize(stmt) }
+        var out: [TaskTemplate] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append(TaskTemplate(
+                id: sqlite3_column_int64(stmt, 0),
+                name: colText(stmt, 1),
+                title: colText(stmt, 2),
+                detail: colText(stmt, 3),
+                priority: Priority(rawValue: colText(stmt, 4)) ?? .none,
+                tags: decodeTags(colText(stmt, 5)),
+                estimateSeconds: Int(sqlite3_column_int64(stmt, 6)),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 7))
+            ))
+        }
+        return out
+    }
+
+    public func deleteTemplate(id: Int64) throws {
+        lock.lock(); defer { lock.unlock() }
+        try runWrite("DELETE FROM task_templates WHERE id=?;", [.int(id)])
+    }
+
+    /// Spawn a real task from a template into the given project. Reuses createTask
+    /// so the task gets a fresh code and a "created" history entry. Composes
+    /// listTemplates/createTask (each locks) — must NOT hold the lock here.
+    @discardableResult
+    public func instantiateTemplate(id: Int64, intoProjectId projectId: Int64) throws -> TodoTask {
+        guard let tpl = try listTemplates().first(where: { $0.id == id }) else {
+            throw StoreError.notFound("template \(id)")
+        }
+        return try createTask(
+            projectId: projectId,
+            title: tpl.title,
+            detail: tpl.detail,
+            priority: tpl.priority,
+            tags: tpl.tags,
+            estimateSeconds: tpl.estimateSeconds
+        )
     }
 
     // MARK: - Focus sessions & stats

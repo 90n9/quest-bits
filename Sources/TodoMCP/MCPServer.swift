@@ -250,6 +250,26 @@ final class MCPServer {
             try store.removeDependency(taskId: tid, dependsOnId: dep)
             return try jsonString(taskDict(store.getTask(id: tid)))
 
+        case "list_templates":
+            return try jsonString(store.listTemplates().map(templateDict))
+
+        case "create_template":
+            let tpl = try store.createTemplate(
+                name: try requireString(args, "name"),
+                title: try requireString(args, "title"),
+                detail: args["detail"] as? String ?? "",
+                priority: parsePriority(args["priority"]) ?? .none,
+                tags: parseTags(args["tags"]) ?? [],
+                estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60
+            )
+            return try jsonString(templateDict(tpl))
+
+        case "new_task_from_template":
+            let templateId = try requireInt(args, "template_id")
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let task = try store.instantiateTemplate(id: templateId, intoProjectId: pid)
+            return try jsonString(taskDict(task))
+
         case "daily_stats":
             let stats = try store.dailyStats()
             return try jsonString([
@@ -293,6 +313,20 @@ final class MCPServer {
             "estimate_seconds": t.estimateSeconds,
             "created_at": iso(t.createdAt),
             "updated_at": iso(t.updatedAt)
+        ]
+    }
+
+    private func templateDict(_ t: TaskTemplate) -> [String: Any] {
+        [
+            "id": t.id,
+            "name": t.name,
+            "title": t.title,
+            "detail": t.detail,
+            "priority": t.priority.rawValue,
+            "tags": t.tags,
+            "estimate_minutes": t.estimateSeconds / 60,
+            "estimate_seconds": t.estimateSeconds,
+            "created_at": iso(t.createdAt)
         ]
     }
 
