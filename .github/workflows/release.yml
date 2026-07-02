@@ -43,13 +43,34 @@ jobs:
       - name: Package DMG
         run: bash Scripts/make-dmg.sh
 
-      - name: Stage release asset (versioned name)
+      - name: Stage release asset + notes (versioned name)
         id: stage
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist-release
           cp build/QuestBits.dmg "dist-release/QuestBits_${VERSION}.dmg"
+
+          # Extract this version's section from CHANGELOG.md ("## [VERSION] ..."
+          # up to the next "## " heading) to use as the release body.
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' CHANGELOG.md > dist-release/notes.md || true
+
+          # Trim leading/trailing blank lines; fall back if the section is empty.
+          sed -i '' -e '/./,$!d' dist-release/notes.md 2>/dev/null || true
+          if [ ! -s dist-release/notes.md ]; then
+            echo "Release ${VERSION}. See the DMG below." > dist-release/notes.md
+          fi
+
+          {
+            echo ""
+            echo "---"
+            echo "Download the DMG below. First launch needs a one-time Gatekeeper allow — see the repo README."
+          } >> dist-release/notes.md
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish to public releases repo
@@ -60,5 +81,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --repo "$PUBLIC_REPO" \
             --title "QuestBits ${{ steps.stage.outputs.version }}" \
-            --notes "Download the DMG below. First launch needs a one-time Gatekeeper allow — see the repo README." \
+            --notes-file dist-release/notes.md \
             "dist-release/QuestBits_${{ steps.stage.outputs.version }}.dmg"
