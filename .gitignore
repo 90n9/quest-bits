@@ -1,4 +1,24 @@
+# Build artifacts
 .build/
 build/
+DerivedData/
 *.dmg
+*.app
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
+# Xcode (if ever opened there)
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# macOS
 .DS_Store
+*.swp
+
+# Machine-specific / local
+.mcp.json
+.claude/settings.local.json
+.playwright-mcp/

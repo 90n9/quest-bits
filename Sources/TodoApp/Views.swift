@@ -1509,7 +1509,7 @@ struct SettingsView: View {
 
     private func exportBackup() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "TodoApp-backup.sqlite"
+        panel.nameFieldStringValue = "QuestBits-backup.sqlite"
         panel.canCreateDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
             do { try model.store.backup(to: url); model.flashToast("Backup saved") }

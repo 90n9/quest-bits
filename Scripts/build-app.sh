@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build TodoApp.app entirely with swiftc (no Xcode, no SPM).
+# Build QuestBits.app entirely with swiftc (no Xcode, no SPM).
 # Compiles the SwiftUI app + the bundled MCP server, assembles the .app bundle,
 # writes Info.plist, and ad-hoc code-signs ("Sign to Run Locally").
 set -euo pipefail
@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="TodoApp"
+APP_NAME="QuestBits"
 BUNDLE_ID="com.local.todoapp"
 VERSION="1.0.0"
 OUT="$ROOT/build"
@@ -22,7 +22,7 @@ echo "==> Compile MCP server (todo-mcp)"
 swiftc -O "${CORE[@]}" Sources/TodoMCP/*.swift -lsqlite3 \
     -o "$APP/Contents/Resources/mcp-server/todo-mcp"
 
-echo "==> Compile app (TodoApp)"
+echo "==> Compile app (QuestBits)"
 swiftc -O "${CORE[@]}" Sources/TodoApp/*.swift -lsqlite3 \
     -o "$APP/Contents/MacOS/$APP_NAME"
 
@@ -33,7 +33,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>$APP_NAME</string>
-    <key>CFBundleDisplayName</key><string>Todo + Pomodoro</string>
+    <key>CFBundleDisplayName</key><string>QuestBits</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
     <key>CFBundlePackageType</key><string>APPL</string>

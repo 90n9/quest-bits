@@ -1,4 +1,4 @@
-# Todo + Pomodoro
+# QuestBits
 
 A native macOS todo-list app with a built-in Pomodoro focus timer — and a bundled
 MCP server so **Claude Code** can create, edit, and update your tasks for you.
@@ -16,7 +16,7 @@ MCP server so **Claude Code** can create, edit, and update your tasks for you.
 
 ## Install
 
-1. Open `build/TodoApp.dmg` and drag **TodoApp** into Applications.
+1. Open `build/QuestBits.dmg` and drag **QuestBits** into Applications.
 2. First open (unsigned build, no Apple Developer cert): **right-click the app → Open**,
    then confirm. macOS shows a one-time "unidentified developer" prompt. On the
    machine that built it, there's no prompt.
@@ -116,7 +116,7 @@ Claude calls `move_task {code:"GEN-3", to_project_code:"DFC"}`.
 **Manual smoke test** (no restart needed):
 
 ```bash
-MCP="build/TodoApp.app/Contents/Resources/mcp-server/todo-mcp"
+MCP="build/QuestBits.app/Contents/Resources/mcp-server/todo-mcp"
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}' | "$MCP"
 ```
 
@@ -138,19 +138,19 @@ SwiftUI app  ─┐                          ┌─ MCP server (todo-mcp)
 - **App** — SwiftUI: projects sidebar → task list → task detail, plus a menu-bar
   countdown. Polls the DB file every 1.5 s and reloads on external (MCP) writes.
 - **MCP server** — a single Swift binary inside the bundle at
-  `TodoApp.app/Contents/Resources/mcp-server/todo-mcp`. Speaks JSON-RPC 2.0 over
+  `QuestBits.app/Contents/Resources/mcp-server/todo-mcp`. Speaks JSON-RPC 2.0 over
   stdio; no external SDK.
 - **Pomodoro** — global timer; completed focus sessions logged to the DB for
   daily stats.
 
 ```
-todo-app/
+quest-bits/
 ├── Sources/
 │   ├── TodoCore/    Models + SQLite store (shared by both binaries)
 │   ├── TodoApp/     SwiftUI app, menu bar, pomodoro engine, file-watch, MCP self-register
 │   └── TodoMCP/     MCP JSON-RPC stdio server
 ├── Scripts/         build-app.sh, make-dmg.sh
-└── build/           TodoApp.app, TodoApp.dmg
+└── build/           QuestBits.app, QuestBits.dmg
 ```
 
 ---
@@ -160,8 +160,8 @@ todo-app/
 No Xcode needed — built directly with `swiftc` (Swift 6.3, macOS 14+).
 
 ```bash
-Scripts/build-app.sh   # compile app + MCP, assemble TodoApp.app, ad-hoc code-sign
-Scripts/make-dmg.sh    # package into build/TodoApp.dmg
+Scripts/build-app.sh   # compile app + MCP, assemble QuestBits.app, ad-hoc code-sign
+Scripts/make-dmg.sh    # package into build/QuestBits.dmg
 ```
 
 ---
