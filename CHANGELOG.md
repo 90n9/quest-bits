@@ -13,6 +13,10 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.2.3] - 2026-07-09
+
 ### Changed
 
 - MCP registration key renamed from `todo` to `quest-bits` (`todo-dev` →
