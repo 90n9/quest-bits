@@ -23,6 +23,23 @@ MCP server so **Claude Code** can create, edit, and update your tasks for you.
 3. On first launch the app registers its MCP server into `~/.claude.json`
    automatically (under `mcpServers.todo`).
 
+### "QuestBits is damaged and can't be opened"
+
+QuestBits is not notarized by Apple (no Apple Developer certificate), so
+Gatekeeper quarantines the downloaded app and — on recent macOS versions — may
+refuse to open it at all, claiming it is "damaged". The app is fine; clear the
+quarantine flag once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/QuestBits.app
+```
+
+Then open the app normally. Alternatively: try to open the app once, then go to
+**System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+
+You only need this on the first launch of a downloaded build — auto-updates and
+rebuilds on the same machine don't re-trigger it.
+
 ---
 
 ## Using the app

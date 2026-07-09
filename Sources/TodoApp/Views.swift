@@ -213,6 +213,13 @@ struct ProjectSidebar: View {
                 sidebarHeader("Quest Logs")
             }
         }
+        .safeAreaInset(edge: .bottom) {
+            Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")")
+                .font(.caption2)
+                .foregroundStyle(Theme.Colors.stone)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 6)
+        }
         .toolbar {
             ToolbarItem {
                 Button { showNew = true } label: { Image(systemName: "plus") }

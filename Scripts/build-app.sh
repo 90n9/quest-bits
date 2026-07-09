@@ -70,6 +70,9 @@ mkdir -p "$APP/Contents/Resources/Icons"
 cp "$ROOT/Resources/Icons/"*.svg "$ROOT/Resources/Icons/"LICENSE-*.txt \
     "$APP/Contents/Resources/Icons/"
 
+echo "==> Bundle app icon"
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+
 echo "==> Bundle frames + textures (Kenney / ambientCG, CC0)"
 mkdir -p "$APP/Contents/Resources/Frames" "$APP/Contents/Resources/Textures"
 cp "$ROOT/Resources/Frames/"* "$APP/Contents/Resources/Frames/"
@@ -85,6 +88,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>QuestBits</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
@@ -93,7 +97,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key><true/>
     <key>ATSApplicationFontsPath</key><string>Fonts</string>
     <key>SUFeedURL</key><string>https://raw.githubusercontent.com/90n9/quest-bits-releases/main/appcast.xml</string>
-    <key>SUPublicEDKey</key><string>hWHyyNWubIAV3ha5OmYQ5Gf7Pbd0rHV29jHM6p7eZ6o=</string>
+    <key>SUPublicEDKey</key><string>cYcjCtkaa77+ITn9yilFD2oMc8oDKXDcmsP0rYpeLzM=</string>
     <key>SUEnableAutomaticChecks</key><$SU_AUTO_CHECKS/>
     <key>SUScheduledCheckInterval</key><integer>3600</integer>
     <key>SUEnableInstallerLauncherService</key><true/>

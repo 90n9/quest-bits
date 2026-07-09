@@ -15,6 +15,26 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 _Nothing yet._
 
+## [1.2.1] - 2026-07-09
+
+### Fixed
+
+- Auto-update signature verification: the Sparkle public key baked into the app
+  did not match the private key CI signs releases with, so every shipped build
+  silently rejected updates. The correct public key is now baked in.
+  **Note:** builds ≤ 1.2.0 carry the wrong key and cannot auto-update to this
+  release — update them once manually by downloading the DMG.
+
+### Added
+
+- Custom app icon (parchment quest-scroll) bundled into the app and DMG.
+- App version shown in the sidebar footer.
+
+### Changed
+
+- README: added Gatekeeper instructions for opening un-notarized downloads
+  ("damaged app" fix via `xattr -dr com.apple.quarantine`).
+
 ## [1.2.0] - 2026-07-02
 
 ### Added
