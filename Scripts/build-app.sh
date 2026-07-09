@@ -20,7 +20,10 @@ else
     BUNDLE_ID="com.local.todoapp.dev"
     DEV_DEFINE="-D DEV_BUILD"
 fi
-VERSION="${VERSION:-1.0.0}"
+# Version: CI passes the git tag via $VERSION. Local builds default to the
+# latest tag + commits-since + short hash (e.g. 1.2.1-3-g65a2000) so the
+# footer shows where the build actually came from, never a stale 1.0.0.
+VERSION="${VERSION:-$(git -C "$ROOT" describe --tags --always 2>/dev/null | sed 's/^v//' || echo 0.0.0)}"
 OUT="$ROOT/build"
 APP="$OUT/$APP_NAME.app"
 CORE=(Sources/TodoCore/*.swift)
