@@ -29,9 +29,16 @@ public final class Store: @unchecked Sendable {
     public let dbURL: URL
 
     /// Default shared location: ~/Library/Application Support/TodoApp/db.sqlite
+    /// Dev builds (compiled with -D DEV_BUILD) use a separate TodoAppDev
+    /// directory so experiments never touch production data.
     public static func defaultDatabaseURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("TodoApp", isDirectory: true)
+        #if DEV_BUILD
+        let dir = "TodoAppDev"
+        #else
+        let dir = "TodoApp"
+        #endif
+        return base.appendingPathComponent(dir, isDirectory: true)
                    .appendingPathComponent("db.sqlite", isDirectory: false)
     }
 

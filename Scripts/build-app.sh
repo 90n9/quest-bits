@@ -7,8 +7,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP_NAME="QuestBits"
-BUNDLE_ID="com.local.todoapp"
+# Flavor: CI builds (and FLAVOR=prod) produce the production "QuestBits" app.
+# Everything else is a "QuestBits Dev" app with its own bundle id, its own
+# database (~/Library/Application Support/TodoAppDev/), and its own MCP
+# registration key (todo-dev) — so trying new features never touches prod data.
+if [[ "${GITHUB_ACTIONS:-}" == "true" || "${FLAVOR:-}" == "prod" ]]; then
+    APP_NAME="QuestBits"
+    BUNDLE_ID="com.local.todoapp"
+    DEV_DEFINE=""
+else
+    APP_NAME="QuestBits Dev"
+    BUNDLE_ID="com.local.todoapp.dev"
+    DEV_DEFINE="-D DEV_BUILD"
+fi
 VERSION="${VERSION:-1.0.0}"
 OUT="$ROOT/build"
 APP="$OUT/$APP_NAME.app"
@@ -46,11 +57,12 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/mcp-server" "$APP/Contents/Frameworks"
 
 echo "==> Compile MCP server (todo-mcp)"
-swiftc -O "${CORE[@]}" Sources/TodoMCP/*.swift -lsqlite3 \
+# $DEV_DEFINE is intentionally unquoted: empty for prod, two words for dev.
+swiftc -O $DEV_DEFINE "${CORE[@]}" Sources/TodoMCP/*.swift -lsqlite3 \
     -o "$APP/Contents/Resources/mcp-server/todo-mcp"
 
-echo "==> Compile app (QuestBits)"
-swiftc -O "${CORE[@]}" Sources/TodoApp/*.swift -lsqlite3 \
+echo "==> Compile app ($APP_NAME)"
+swiftc -O $DEV_DEFINE "${CORE[@]}" Sources/TodoApp/*.swift -lsqlite3 \
     -F "$SPARKLE_DIR" -framework Sparkle \
     -Xlinker -rpath -Xlinker "@executable_path/../Frameworks" \
     -o "$APP/Contents/MacOS/$APP_NAME"
@@ -85,7 +97,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>$APP_NAME</string>
-    <key>CFBundleDisplayName</key><string>QuestBits</string>
+    <key>CFBundleDisplayName</key><string>$APP_NAME</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>

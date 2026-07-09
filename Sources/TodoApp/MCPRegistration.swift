@@ -4,6 +4,14 @@ import Foundation
 /// Merges into the existing file (never clobbers other config) and only rewrites when the
 /// command path is missing or has changed (e.g. app moved to /Applications).
 enum MCPRegistration {
+    /// Dev builds register under a separate key so they never clobber the
+    /// production app's registration (both can coexist in ~/.claude.json).
+    #if DEV_BUILD
+    private static let serverKey = "todo-dev"
+    #else
+    private static let serverKey = "todo"
+    #endif
+
     private static var configURL: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
     }
@@ -19,10 +27,10 @@ enum MCPRegistration {
         }
 
         var servers = root["mcpServers"] as? [String: Any] ?? [:]
-        let existing = (servers["todo"] as? [String: Any])?["command"] as? String
+        let existing = (servers[serverKey] as? [String: Any])?["command"] as? String
         if !force, existing == mcpPath { return true } // already up to date
 
-        servers["todo"] = [
+        servers[serverKey] = [
             "command": mcpPath,
             "args": [String](),
             "env": [String: String]()
@@ -40,7 +48,7 @@ enum MCPRegistration {
         guard let data = try? Data(contentsOf: configURL),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let servers = obj["mcpServers"] as? [String: Any],
-              let todo = servers["todo"] as? [String: Any] else { return nil }
+              let todo = servers[serverKey] as? [String: Any] else { return nil }
         return todo["command"] as? String
     }
 

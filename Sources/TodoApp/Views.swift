@@ -214,11 +214,21 @@ struct ProjectSidebar: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")")
-                .font(.caption2)
-                .foregroundStyle(Theme.Colors.stone)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 6)
+            HStack(spacing: 6) {
+                Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.Colors.stone)
+                #if DEV_BUILD
+                Text("DEV")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(.orange))
+                #endif
+            }
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, 6)
         }
         .toolbar {
             ToolbarItem {

@@ -13,7 +13,12 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Dev/prod build flavors: local builds now produce an isolated "QuestBits Dev"
+  app (own bundle id, own `TodoAppDev` database, own `todo-dev` MCP
+  registration, orange DEV badge in the sidebar footer) so experiments never
+  touch production data. `FLAVOR=prod` or CI builds the production app.
 
 ## [1.2.1] - 2026-07-09
 

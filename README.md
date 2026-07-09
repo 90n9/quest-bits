@@ -177,9 +177,15 @@ quest-bits/
 No Xcode needed — built directly with `swiftc` (Swift 6.3, macOS 14+).
 
 ```bash
-Scripts/build-app.sh   # compile app + MCP, assemble QuestBits.app, ad-hoc code-sign
-Scripts/make-dmg.sh    # package into build/QuestBits.dmg
+Scripts/build-app.sh             # dev build → "build/QuestBits Dev.app" (default locally)
+FLAVOR=prod Scripts/build-app.sh # production build → build/QuestBits.app
+Scripts/make-dmg.sh              # package build/QuestBits.app into build/QuestBits.dmg
 ```
+
+Local builds default to a separate **QuestBits Dev** app so experiments are safe:
+own bundle id, own database (`~/Library/Application Support/TodoAppDev/`), own MCP
+registration (`todo-dev`), and an orange **DEV** badge in the sidebar footer. It
+coexists with the production app without touching its data.
 
 ---
 
