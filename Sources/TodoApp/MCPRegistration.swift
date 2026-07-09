@@ -6,10 +6,14 @@ import Foundation
 enum MCPRegistration {
     /// Dev builds register under a separate key so they never clobber the
     /// production app's registration (both can coexist in ~/.claude.json).
+    /// `legacyKey` is the name older builds used; each flavor migrates only
+    /// its own legacy entry so it never touches the other flavor's config.
     #if DEV_BUILD
-    private static let serverKey = "todo-dev"
+    private static let serverKey = "quest-bits-dev"
+    private static let legacyKey = "todo-dev"
     #else
-    private static let serverKey = "todo"
+    private static let serverKey = "quest-bits"
+    private static let legacyKey = "todo"
     #endif
 
     private static var configURL: URL {
@@ -27,8 +31,18 @@ enum MCPRegistration {
         }
 
         var servers = root["mcpServers"] as? [String: Any] ?? [:]
+
+        // Migrate the legacy key name, but only if it points at a QuestBits
+        // bundled server — never an unrelated entry the user named "todo".
+        var migratedLegacy = false
+        if let legacyCmd = (servers[legacyKey] as? [String: Any])?["command"] as? String,
+           legacyCmd.hasSuffix("/mcp-server/todo-mcp") {
+            servers.removeValue(forKey: legacyKey)
+            migratedLegacy = true
+        }
+
         let existing = (servers[serverKey] as? [String: Any])?["command"] as? String
-        if !force, existing == mcpPath { return true } // already up to date
+        if !force, !migratedLegacy, existing == mcpPath { return true } // already up to date
 
         servers[serverKey] = [
             "command": mcpPath,

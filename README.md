@@ -21,7 +21,7 @@ MCP server so **Claude Code** can create, edit, and update your tasks for you.
    then confirm. macOS shows a one-time "unidentified developer" prompt. On the
    machine that built it, there's no prompt.
 3. On first launch the app registers its MCP server into `~/.claude.json`
-   automatically (under `mcpServers.todo`).
+   automatically (under `mcpServers.quest-bits`).
 
 ### "QuestBits is damaged and can't be opened"
 
@@ -184,7 +184,7 @@ Scripts/make-dmg.sh              # package build/QuestBits.app into build/QuestB
 
 Local builds default to a separate **QuestBits Dev** app so experiments are safe:
 own bundle id, own database (`~/Library/Application Support/TodoAppDev/`), own MCP
-registration (`todo-dev`), and an orange **DEV** badge in the sidebar footer. It
+registration (`quest-bits-dev`), and an orange **DEV** badge in the sidebar footer. It
 coexists with the production app without touching its data.
 
 ---

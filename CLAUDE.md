@@ -17,7 +17,7 @@ VERSION=1.2.0 Scripts/build-app.sh  # override bundle version (CI passes the git
 **Dev vs prod flavor.** Local builds default to a fully isolated **QuestBits Dev** app
 (compiled with `-D DEV_BUILD` into *both* binaries): bundle id `com.local.todoapp.dev`,
 database `~/Library/Application Support/TodoAppDev/`, MCP registration key
-`mcpServers.todo-dev`, orange DEV badge in the sidebar footer. It never touches
+`mcpServers.quest-bits-dev`, orange DEV badge in the sidebar footer. It never touches
 production data or the prod `todo` registration. CI builds (`GITHUB_ACTIONS=true`)
 and `FLAVOR=prod` produce the production QuestBits.app.
 
@@ -60,7 +60,7 @@ SwiftUI app (window + menu bar)  ─┐                        ┌─ todo-mcp (
 - **No push/FSEvents.** `AppModel` polls the DB on a 1.5s `Timer` (`AppModel.swift`) — external MCP writes surface with up to ~1.5s lag. This is deliberate; keep the polling model unless replacing it wholesale.
 - **`Store` (`TodoCore/Store.swift`, ~1.5k lines) is the single source of truth** for all data mutation and the widest / most delicate file. Cross-process writes use `BEGIN IMMEDIATE` with re-checks *inside* the transaction (e.g. dependency-cycle and reachability guards), plus a one-level transaction-nesting guard. Preserve this pattern — naive `INSERT`/`UPDATE` outside a transaction can race the other process.
 - **MCP server** speaks JSON-RPC 2.0 over stdio with **no external SDK** — hand-rolled in `TodoMCP/MCPServer.swift`; tool schemas in `TodoMCP/ToolDefinitions.swift`; entrypoint `main.swift` is just `MCPServer().run()`.
-- **Self-registration:** on first launch the app writes itself into `~/.claude.json` under `mcpServers.todo` — `mcpServers.todo-dev` for dev-flavor builds (`TodoApp/MCPRegistration.swift`).
+- **Self-registration:** on first launch the app writes itself into `~/.claude.json` under `mcpServers.quest-bits` — `mcpServers.quest-bits-dev` for dev-flavor builds (`TodoApp/MCPRegistration.swift`). Each flavor auto-migrates its own legacy key name (`todo` / `todo-dev`) when it points at a QuestBits binary.
 - **App scene** is a `WindowGroup` + `MenuBarExtra` (`TodoApp/TodoApp.swift`) — the menu-bar countdown is the real `MenuBarExtra`, not a hand-rolled `NSStatusItem`. Pomodoro logic in `PomodoroEngine.swift`, local notifications in `NotificationScheduler.swift`, key commands in `Shortcuts.swift`. Nearly all UI is in `Views.swift`.
 
 ### id-or-code duality

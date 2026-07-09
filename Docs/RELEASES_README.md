@@ -46,7 +46,7 @@ in-app updates are signed and don't re-trigger Gatekeeper.
 ## Using it with Claude Code
 
 On first launch the app registers its MCP server in `~/.claude.json` under
-`mcpServers.todo`. Start a fresh Claude Code session, then just ask:
+`mcpServers.quest-bits`. Start a fresh Claude Code session, then just ask:
 
 ```
 list my todo projects

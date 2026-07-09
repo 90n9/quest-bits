@@ -13,7 +13,12 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- MCP registration key renamed from `todo` to `quest-bits` (`todo-dev` →
+  `quest-bits-dev` for dev builds) so the entry in `~/.claude.json` clearly
+  identifies this app. On launch the app migrates its own legacy entry
+  automatically (only when it points at a QuestBits binary).
 
 ## [1.2.2] - 2026-07-09
 
