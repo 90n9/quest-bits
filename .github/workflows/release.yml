@@ -209,9 +209,12 @@ jobs:
               f.write(xml + "\n")
           PYEOF
 
+          # Keep the public repo's README in sync with the canonical copy here.
+          cp Docs/RELEASES_README.md public-repo/README.md
+
           cd public-repo
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add appcast.xml
+          git add appcast.xml README.md
           git commit -m "appcast: QuestBits ${VERSION}"
           git push origin HEAD:main
