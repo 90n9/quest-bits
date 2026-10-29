@@ -13,6 +13,24 @@ public enum TaskStatus: String, Codable, CaseIterable, Sendable {
         case .done: return "Done"
         }
     }
+
+    /// A closed task is finished with: it is never reported blocked, and as a
+    /// dependency it no longer blocks anything.
+    public var isClosed: Bool {
+        switch self {
+        case .todo, .inProgress: return false
+        case .done: return true
+        }
+    }
+
+    /// Entering this status means work has begun, so `started_at` is stamped
+    /// (once) if it is still empty.
+    public var impliesStarted: Bool {
+        switch self {
+        case .todo: return false
+        case .inProgress, .done: return true
+        }
+    }
 }
 
 /// Task priority. `none` = unset.
@@ -64,8 +82,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var dueDate: Date?
     public var tags: [String]
     public var recurrence: String?   // nil = non-recurring; "daily" | "weekly" | "monthly"
-    public var startedAt: Date?      // first time it went In Progress
-    public var completedAt: Date?    // when it went Done
+    public var startedAt: Date?      // first time it went In Progress (or straight to Done)
+    public var completedAt: Date?    // when it went Done; cleared on reopen
     public var effortSeconds: Int    // focused time accrued while In Progress + timer running
     public var estimateSeconds: Int  // planned effort; 0 = unset (compared to effortSeconds)
     public var parentId: Int64?      // nil = top-level; else the parent task (one level of nesting)

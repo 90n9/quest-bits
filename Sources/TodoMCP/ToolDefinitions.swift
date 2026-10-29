@@ -97,7 +97,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "add_dependency",
-             "description": "Make a task blocked by another. The task (`id`/`code`) stays blocked until the dependency (`depends_on_id`/`depends_on_code`) is done. Rejects self-dependency and cycles.",
+             "description": "Make a task blocked by another. The task (`id`/`code`) stays blocked until the dependency (`depends_on_id`/`depends_on_code`) is done; a task that is itself done is never blocked. Rejects self-dependency and cycles.",
              "inputSchema": obj(["id": int, "code": str, "depends_on_id": int, "depends_on_code": str])],
 
             ["name": "remove_dependency",

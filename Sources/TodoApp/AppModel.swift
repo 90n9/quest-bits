@@ -286,10 +286,17 @@ final class AppModel: ObservableObject {
 
     /// Shared blocked-guard decision: true iff moving these tasks to `status` should
     /// prompt for confirmation — i.e. the target is In Progress and at least one task
-    /// is currently blocked by an unfinished dependency. Marking Done is never guarded.
+    /// has an unfinished dependency. Marking Done is never guarded.
     func blockedConfirmNeeded(forIds ids: [Int64], to status: TaskStatus) -> Bool {
         guard status == .inProgress else { return false }
-        return ids.contains { blockedTaskIds.contains($0) }
+        return !idsWithOpenDependency(ids).isEmpty
+    }
+
+    /// Which of `ids` have an unfinished dependency, whatever their own status. Not
+    /// `blockedTaskIds`: a done task is never reported blocked, but reopening it into
+    /// In Progress while a dependency is open should still prompt.
+    private func idsWithOpenDependency(_ ids: [Int64]) -> Set<Int64> {
+        (try? store.idsWithOpenDependency(ids)) ?? []
     }
 
     /// Move a single task to `status`, routing through the blocked guard. If the task
@@ -439,7 +446,7 @@ final class AppModel: ObservableObject {
     func bulkSetStatus(_ status: TaskStatus) {
         let ids = Array(selectedTaskIds)
         if blockedConfirmNeeded(forIds: ids, to: status) {
-            let blocked = ids.filter { blockedTaskIds.contains($0) }.count
+            let blocked = idsWithOpenDependency(ids).count
             let noun = blocked == 1 ? "task is" : "tasks are"
             blockedConfirm = BlockedConfirm(
                 message: "\(blocked) selected \(noun) blocked by an unfinished dependency. Move to In Progress anyway?",

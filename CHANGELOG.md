@@ -22,6 +22,25 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   null, empty or default fields (no priority, no tags, no link, zero effort or
   estimate, `blocked: false`) are left out. `effort_seconds` and
   `estimate_seconds` are dropped in favour of the `*_minutes` fields.
+- Reopening a done task (back to Todo or In Progress) now clears its
+  `completed_at`, so it no longer counts as completed in the activity stats.
+  Marking an already-done task done again keeps the original `completed_at`.
+
+### Fixed
+
+- A task that is itself done is no longer reported as `blocked`, even when one
+  of its dependencies is still open.
+- `started_at` and `completed_at` are now set on every path that changes a
+  task's status: creating a task straight into In Progress or Done (MCP
+  `create_task` with `status`), bulk status updates, and moving a task from
+  Todo straight to Done (which used to leave `started_at` empty). All of them
+  share one timestamp rule. Duplicating or copying a done task keeps the
+  original's `started_at` / `completed_at`, so the copy does not count as a
+  new completion today.
+- One-time repair on first launch: done and in-progress tasks missing
+  `completed_at` / `started_at` get them back from the task's status history,
+  falling back to its last-updated time; reopened tasks still carrying a
+  `completed_at` have it cleared.
 
 ## [1.2.3] - 2026-07-09
 
