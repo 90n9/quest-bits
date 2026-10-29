@@ -115,6 +115,8 @@ struct ProjectSidebar: View {
     @State private var showNew = false
     @State private var editing: Project?      // non-nil → edit sheet open
     @State private var showTemplates = false
+    @State private var archiving: ArchiveRequest?   // non-nil → archive confirm sheet open
+    @AppStorage("qbArchivedExpanded") private var archivedExpanded = false
 
     /// Cozy-RPG sidebar icons (bundled Lucide set) for the smart views.
     private func qbSidebarIcon(_ v: SmartView) -> String {
@@ -174,43 +176,18 @@ struct ProjectSidebar: View {
                 sidebarHeader("Quests")
             }
             Section {
-                ForEach(model.projects) { p in
-                    HStack(spacing: 6) {
-                        QBIcon(name: "lucide-door-open")
-                        Text(p.name).font(Theme.Fonts.bodySmMedium)
-                        Spacer()
-                        CodeBadge(code: p.code)
-                        Text("\(taskCount(p.id))")
-                            .font(Theme.Fonts.micro)
-                            .foregroundStyle(Theme.Colors.slate)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Theme.Colors.surface, in: Capsule())
-                    }
-                    .tag(p.id)
-                    .listRowBackground(sidebarRowCard(
-                        model.smartView == nil && !model.showDashboard && model.selectedProjectId == p.id))
-                    .help(p.detail.isEmpty ? p.name : p.detail)
-                    .contextMenu {
-                        Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
-                        Button("Edit…") { editing = p }
-                        if model.templates.isEmpty {
-                            Button("New Task from Template…") { showTemplates = true }
-                        } else {
-                            Menu("New Task from Template") {
-                                ForEach(model.templates) { t in
-                                    Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
-                                }
-                                Divider()
-                                Button("Manage Templates…") { showTemplates = true }
-                            }
-                        }
-                        Divider()
-                        Button("Delete", role: .destructive) { model.deleteProject(p.id) }
-                    }
-                }
+                ForEach(model.activeProjects) { p in projectRow(p) }
+                    // Drag to reorder; only active projects — the Archived group has no onMove.
+                    .onMove { offsets, dest in model.moveProjects(from: offsets, to: dest) }
             } header: {
                 sidebarHeader("Quest Logs")
+            }
+            if !model.archivedProjects.isEmpty {
+                Section(isExpanded: $archivedExpanded) {
+                    ForEach(model.archivedProjects) { p in projectRow(p) }
+                } header: {
+                    sidebarHeader("Archived")
+                }
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -247,13 +224,160 @@ struct ProjectSidebar: View {
             }
         }
         .sheet(isPresented: $showTemplates) { TemplatesSheet() }
+        // The selected project just got archived (here or by an agent): open the Archived
+        // group so its row, and the selection, stay visible.
+        .onChange(of: selectedIsArchived) { _, archived in
+            if archived { archivedExpanded = true }
+        }
+        .sheet(item: $archiving) { req in
+            ArchiveProjectSheet(project: req.project, openCount: req.openCount) {
+                model.setArchived(req.project.id, true)
+            }
+        }
         .onChange(of: model.pendingNewProject) { _, pending in
             if pending { showNew = true; model.pendingNewProject = false }
         }
     }
 
-    private func taskCount(_ pid: Int64) -> Int {
-        (try? model.store.listTasks(projectId: pid).count) ?? 0
+    /// True while the selected sidebar item is an archived project.
+    private var selectedIsArchived: Bool {
+        guard model.smartView == nil, !model.showDashboard, let sel = model.selectedProjectId else { return false }
+        return model.archivedProjects.contains { $0.id == sel }
+    }
+
+    /// A project row (active or archived — archived rows are dimmed) with its context menu.
+    /// The trailing number is the open tasks; the bar under the name is done out of the
+    /// tasks still counted (dropped is in neither). A clay dot marks tasks waiting on the
+    /// user. A project with no tasks shows an empty bar, so every row keeps one height.
+    private func projectRow(_ p: Project) -> some View {
+        let counts = model.projectCounts[p.id] ?? ProjectCounts()
+        return HStack(spacing: 6) {
+            QBIcon(name: "lucide-door-open")
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(p.name).font(Theme.Fonts.bodySmMedium)
+                    Spacer()
+                    CodeBadge(code: p.code)
+                    if counts.waitingOnUser > 0 {
+                        Circle()
+                            .fill(qbStatusColor(.waiting))
+                            .frame(width: 6, height: 6)
+                            .help("\(counts.waitingOnUser) waiting on you")
+                    }
+                    Text("\(counts.open)")
+                        .font(Theme.Fonts.micro)
+                        .foregroundStyle(Theme.Colors.slate)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Theme.Colors.surface, in: Capsule())
+                        .help("\(counts.open) open")
+                }
+                ProjectProgressBar(done: counts.done, total: counts.progressTotal)
+                    .help("\(counts.done) of \(counts.progressTotal) done")
+            }
+        }
+        .opacity(p.isArchived ? 0.6 : 1)
+        .tag(p.id)
+        .listRowBackground(sidebarRowCard(
+            model.smartView == nil && !model.showDashboard && model.selectedProjectId == p.id))
+        .help(p.detail.isEmpty ? p.name : p.detail)
+        .contextMenu {
+            Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
+            Button("Edit…") { editing = p }
+            // No new tasks in an archived project (the store refuses them too).
+            if !p.isArchived {
+                if model.templates.isEmpty {
+                    Button("New Task from Template…") { showTemplates = true }
+                } else {
+                    Menu("New Task from Template") {
+                        ForEach(model.templates) { t in
+                            Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
+                        }
+                        Divider()
+                        Button("Manage Templates…") { showTemplates = true }
+                    }
+                }
+            }
+            Divider()
+            if p.isArchived {
+                Button("Unarchive") { model.setArchived(p.id, false) }
+            } else {
+                Button("Archive") { requestArchive(p) }
+            }
+            Button("Delete", role: .destructive) { model.deleteProject(p.id) }
+        }
+    }
+
+    /// Archive straight away when nothing is open; otherwise confirm with the open count.
+    private func requestArchive(_ p: Project) {
+        let open = model.projectCounts[p.id]?.open ?? 0
+        if open == 0 {
+            model.setArchived(p.id, true)
+        } else {
+            archiving = ArchiveRequest(project: p, openCount: open)
+        }
+    }
+
+}
+
+/// The thin done/total bar under a sidebar project name; empty when `total` is 0.
+private struct ProjectProgressBar: View {
+    let done: Int
+    let total: Int
+
+    var body: some View {
+        let ratio = total > 0 ? min(Double(done) / Double(total), 1) : 0
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Theme.Colors.hairlineSoft)
+                Capsule()
+                    .fill(qbStatusColor(.done))
+                    .frame(width: CGFloat(ratio) * geo.size.width)
+            }
+        }
+        .frame(height: 3)
+    }
+}
+
+/// A pending archive of a project that still has open tasks (drives the confirm sheet).
+private struct ArchiveRequest: Identifiable {
+    let project: Project
+    let openCount: Int
+    var id: Int64 { project.id }
+}
+
+/// Confirms archiving a project that still has open tasks. The tasks are kept as they
+/// are; the project moves to the sidebar's Archived group.
+struct ArchiveProjectSheet: View {
+    let project: Project
+    let openCount: Int
+    let onArchive: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Archive \(project.name)?").font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
+            Text("\(openCount) open task\(openCount == 1 ? "" : "s") will stay open. "
+                 + "Archived projects leave All Tasks, In Progress and the menu bar, "
+                 + "but you can still open them from the Archived group.")
+                .font(Theme.Fonts.bodySm)
+                .foregroundStyle(Theme.Colors.slate)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                Button("Archive") {
+                    onArchive()
+                    dismiss()
+                }
+                .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: 380)
+        .qbParchment()
     }
 }
 
@@ -418,12 +542,44 @@ func qbPriorityChipColors(_ p: Priority) -> (bg: Color, fg: Color) {
     }
 }
 
-/// Task-status accent: stone (todo), yellow-deep (in progress), success-accent (done).
+/// Task-status accent: stone (todo), yellow-deep (in progress), clay (waiting),
+/// success-accent (done), muted (dropped).
 func qbStatusColor(_ s: TaskStatus) -> Color {
     switch s {
     case .todo: return Theme.Colors.stone
     case .inProgress: return Theme.Colors.brandYellowDeep
+    case .waiting: return Theme.Colors.brandCoral
     case .done: return Theme.Colors.successAccent
+    case .dropped: return Theme.Colors.muted
+    }
+}
+
+/// Status glyph, shared by list rows and board column headers.
+func qbStatusIcon(_ s: TaskStatus) -> String {
+    switch s {
+    case .todo: return "circle"
+    case .inProgress: return "circle.lefthalf.filled"
+    case .waiting: return "pause.circle"
+    case .done: return "checkmark.circle.fill"
+    case .dropped: return "xmark.circle"
+    }
+}
+
+/// Title color for a task row/card: closed tasks fade (done to stone, dropped further,
+/// to muted); callers also strike through any closed title.
+func qbTitleColor(_ s: TaskStatus) -> Color {
+    switch s {
+    case .todo, .inProgress, .waiting: return Theme.Colors.ink
+    case .done: return Theme.Colors.stone
+    case .dropped: return Theme.Colors.muted
+    }
+}
+
+/// Who a waiting task waits on, as the app's own user reads it ("Waiting on Me").
+func qbWaitingOnLabel(_ w: WaitingOn) -> String {
+    switch w {
+    case .user: return "Me"
+    case .external: return "External"
     }
 }
 
@@ -457,7 +613,7 @@ struct TaskListView: View {
                 }
                 .buttonStyle(QBPrimaryButtonStyle(compact: true))
                 .help("New Task (⌘N)")
-                .disabled(model.selectedProjectId == nil)
+                .disabled(!model.canAddTask)
             }
         }
         .sheet(isPresented: $showNew) {
@@ -469,7 +625,7 @@ struct TaskListView: View {
         }
         .onChange(of: model.pendingNewTask) { _, pending in
             if pending {
-                if model.selectedProjectId != nil { showNew = true }
+                if model.canAddTask { showNew = true }
                 model.pendingNewTask = false
             }
         }
@@ -481,7 +637,7 @@ struct TaskListView: View {
                 Text(model.smartView != nil ? "No tasks here" : "No tasks in this project")
                     .font(Theme.Fonts.subtitle)
                     .foregroundStyle(Theme.Colors.slate)
-                if model.smartView == nil {
+                if model.canAddTask {
                     Button { showNew = true } label: {
                         Label("New Task", systemImage: "plus")
                     }
@@ -513,7 +669,7 @@ struct TaskListView: View {
                         guard model.smartView == nil, !isSearching else { return }
                         model.moveTasks(activeTasks, from: offsets, to: dest)
                     }
-                    // Done quests collapse into a toggle section at the bottom.
+                    // Closed (done and dropped) quests collapse into a toggle section at the bottom.
                     if !doneTasks.isEmpty {
                         doneToggleRow
                         if showDone {
@@ -536,9 +692,10 @@ struct TaskListView: View {
         return model.projects.first(where: { $0.id == model.selectedProjectId })?.name ?? "Tasks"
     }
 
-    /// Projects other than the one currently selected (move/copy targets).
+    /// Active projects other than the one currently selected (move/copy targets;
+    /// archived projects are left out).
     private var otherProjects: [Project] {
-        model.projects.filter { $0.id != model.selectedProjectId }
+        model.activeProjects.filter { $0.id != model.selectedProjectId }
     }
 
     private var isSearching: Bool {
@@ -562,10 +719,10 @@ struct TaskListView: View {
         }
     }
 
-    /// Done tasks live in a collapsed section at the bottom (see `doneToggleRow`);
-    /// active tasks keep their manual sort order.
-    private var activeTasks: [TodoTask] { displayedTasks.filter { $0.status != .done } }
-    private var doneTasks: [TodoTask] { displayedTasks.filter { $0.status == .done } }
+    /// Closed tasks (done and dropped) live in a collapsed section at the bottom (see
+    /// `doneToggleRow`); active tasks keep their manual sort order.
+    private var activeTasks: [TodoTask] { displayedTasks.filter { !$0.status.isClosed } }
+    private var doneTasks: [TodoTask] { displayedTasks.filter { $0.status.isClosed } }
 
     /// One task row with selection background and context menu — shared by the
     /// active list and the collapsed done section.
@@ -601,7 +758,7 @@ struct TaskListView: View {
             }
     }
 
-    /// "Done (N)" collapse header — click to show/hide finished quests.
+    /// "Done (N)" collapse header — click to show/hide finished (done and dropped) quests.
     private var doneToggleRow: some View {
         HStack(spacing: 6) {
             Image(systemName: showDone ? "chevron.down" : "chevron.right")
@@ -685,7 +842,13 @@ struct BulkActionBar: View {
 
             Menu {
                 ForEach(TaskStatus.allCases, id: \.self) { s in
-                    Button(s.display) { model.bulkSetStatus(s) }
+                    if s == .waiting {
+                        ForEach(WaitingOn.allCases, id: \.self) { on in
+                            Button("Waiting on \(qbWaitingOnLabel(on))") { model.bulkSetStatus(s, waitingOn: on) }
+                        }
+                    } else {
+                        Button(s.display) { model.bulkSetStatus(s) }
+                    }
                 }
             } label: { FilterPillLabel(text: "Status") }
                 .menuStyle(.button).buttonStyle(.plain).fixedSize()
@@ -756,6 +919,8 @@ struct TaskRow: View {
     @State private var newSubtaskTitle = ""
 
     private var doneCount: Int { subtasks.filter { $0.status == .done }.count }
+    /// Subtasks still part of the work: dropped ones leave the n/total count.
+    private var countedSubtasks: Int { subtasks.filter { $0.status != .dropped }.count }
     private var isBlocked: Bool { model.blockedTaskIds.contains(task.id) }
 
     var body: some View {
@@ -766,7 +931,7 @@ struct TaskRow: View {
                     // which surfaces the confirmation for a blocked todo → In Progress move.
                     model.cycleStatus(task)
                 }) {
-                    Image(systemName: statusIcon)
+                    Image(systemName: qbStatusIcon(task.status))
                         .foregroundStyle(qbStatusColor(task.status))
                         .font(.system(size: 16))
                 }
@@ -781,15 +946,15 @@ struct TaskRow: View {
                         CodeBadge(code: task.code)
                         Text(task.title)
                             .font(Theme.Fonts.bodySm)
-                            .strikethrough(task.status == .done)
-                            .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
-                        if !subtasks.isEmpty {
-                            Text("\(doneCount)/\(subtasks.count)")
+                            .strikethrough(task.status.isClosed)
+                            .foregroundStyle(qbTitleColor(task.status))
+                        if countedSubtasks > 0 {
+                            Text("\(doneCount)/\(countedSubtasks)")
                                 .font(Theme.Fonts.micro.monospacedDigit())
                                 .padding(.horizontal, 6).padding(.vertical, 1)
                                 .background(Theme.Colors.surface, in: Capsule())
-                                .foregroundStyle(doneCount == subtasks.count ? Theme.Colors.successAccent : Theme.Colors.steel)
-                                .help("\(doneCount) of \(subtasks.count) subtasks done")
+                                .foregroundStyle(doneCount == countedSubtasks ? Theme.Colors.successAccent : Theme.Colors.steel)
+                                .help("\(doneCount) of \(countedSubtasks) subtasks done")
                         }
                         if isBlocked {
                             Text("🔒 blocked")
@@ -799,8 +964,14 @@ struct TaskRow: View {
                                 .foregroundStyle(Theme.Colors.coralDark)
                                 .help("Blocked by an unfinished dependency")
                         }
+                        WaitingChip(task: task)
                     }
                     HStack(spacing: 8) {
+                        if task.status == .waiting, let reason = task.waitingReason, !reason.isEmpty {
+                            Text(reason)
+                                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+                                .lineLimit(1)
+                        }
                         if task.link != nil && !(task.link?.isEmpty ?? true) {
                             Image(systemName: "link").font(.caption2).foregroundStyle(Theme.Colors.steel)
                         }
@@ -831,28 +1002,31 @@ struct TaskRow: View {
                 ForEach(subtasks) { sub in
                     SubtaskRow(sub: sub)
                 }
-                if addingSubtask {
-                    HStack(spacing: 8) {
-                        Image(systemName: "square").foregroundStyle(Theme.Colors.steel)
-                        TextField("Subtask title", text: $newSubtaskTitle)
-                            .textFieldStyle(.roundedBorder)
-                            .font(Theme.Fonts.bodySm)
-                            .onSubmit { commitSubtask() }
-                        Button("Add") { commitSubtask() }
-                            .buttonStyle(QBPrimaryButtonStyle(compact: true))
-                            .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
-                        Button("Cancel") { addingSubtask = false; newSubtaskTitle = "" }
-                            .buttonStyle(QBGhostButtonStyle())
+                // An archived project takes no new subtasks (the store refuses them).
+                if model.canAddTask(to: task.projectId) {
+                    if addingSubtask {
+                        HStack(spacing: 8) {
+                            Image(systemName: "square").foregroundStyle(Theme.Colors.steel)
+                            TextField("Subtask title", text: $newSubtaskTitle)
+                                .textFieldStyle(.roundedBorder)
+                                .font(Theme.Fonts.bodySm)
+                                .onSubmit { commitSubtask() }
+                            Button("Add") { commitSubtask() }
+                                .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                                .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+                            Button("Cancel") { addingSubtask = false; newSubtaskTitle = "" }
+                                .buttonStyle(QBGhostButtonStyle())
+                        }
+                        .padding(.leading, 26)
+                    } else {
+                        Button {
+                            addingSubtask = true
+                        } label: {
+                            Label("subtask", systemImage: "plus")
+                        }
+                        .buttonStyle(QBLinkButtonStyle())
+                        .padding(.leading, 26)
                     }
-                    .padding(.leading, 26)
-                } else {
-                    Button {
-                        addingSubtask = true
-                    } label: {
-                        Label("subtask", systemImage: "plus")
-                    }
-                    .buttonStyle(QBLinkButtonStyle())
-                    .padding(.leading, 26)
                 }
             }
         }
@@ -876,15 +1050,7 @@ struct TaskRow: View {
     }
 
     private func isOverdue(_ d: Date, _ t: TodoTask) -> Bool {
-        t.status != .done && Calendar.current.startOfDay(for: d) < Calendar.current.startOfDay(for: Date())
-    }
-
-    private var statusIcon: String {
-        switch task.status {
-        case .todo: return "circle"
-        case .inProgress: return "circle.lefthalf.filled"
-        case .done: return "checkmark.circle.fill"
-        }
+        !t.status.isClosed && Calendar.current.startOfDay(for: d) < Calendar.current.startOfDay(for: Date())
     }
 }
 
@@ -896,8 +1062,8 @@ struct SubtaskRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Button(action: { model.toggleSubtaskDone(sub) }) {
-                Image(systemName: sub.status == .done ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(sub.status == .done ? Theme.Colors.successAccent : Theme.Colors.steel)
+                Image(systemName: subtaskBox)
+                    .foregroundStyle(sub.status.isClosed ? qbStatusColor(sub.status) : Theme.Colors.steel)
                     .font(.system(size: 14))
             }
             .buttonStyle(.plain)
@@ -905,11 +1071,19 @@ struct SubtaskRow: View {
 
             Text(sub.title)
                 .font(Theme.Fonts.bodySm)
-                .strikethrough(sub.status == .done)
-                .foregroundStyle(sub.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
+                .strikethrough(sub.status.isClosed)
+                .foregroundStyle(qbTitleColor(sub.status))
             Spacer()
         }
         .padding(.leading, 26)
+    }
+
+    private var subtaskBox: String {
+        switch sub.status {
+        case .done: return "checkmark.square.fill"
+        case .dropped: return "xmark.square"
+        case .todo, .inProgress, .waiting: return "square"
+        }
     }
 }
 
@@ -920,7 +1094,7 @@ struct ViewModeToggle: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        // Only offer the board where all three status columns can populate. Single-status
+        // Only offer the board where every status column can populate. Single-status
         // smart views force the list, so hide the toggle there.
         if model.boardAvailable {
             Picker("View", selection: Binding(
@@ -937,10 +1111,13 @@ struct ViewModeToggle: View {
     }
 }
 
-/// Kanban board: one column per status (Todo / In Progress / Done) for the
+/// Kanban board: one column per status (Todo / In Progress / Waiting / Done) for the
 /// current project or smart view. Cards drag between columns to change status.
+/// Dropped has no column of its own: dropped cards sit, faded, in Done (closed).
 struct BoardView: View {
     @EnvironmentObject var model: AppModel
+
+    private static let columns = TaskStatus.allCases.filter { $0.boardColumn == $0 }
 
     /// Cards shown on the board: top-level tasks in a project view (subtasks stay
     /// nested in the list); the flat set in a smart view. The board honors the same
@@ -961,9 +1138,9 @@ struct BoardView: View {
                     Divider()
                     ScrollView(.horizontal, showsIndicators: true) {
                         HStack(alignment: .top, spacing: 14) {
-                            ForEach(TaskStatus.allCases, id: \.self) { status in
+                            ForEach(Self.columns, id: \.self) { status in
                                 BoardColumn(status: status,
-                                            tasks: boardTasks.filter { $0.status == status })
+                                            tasks: boardTasks.filter { $0.status.boardColumn == status })
                             }
                         }
                         .padding(16)
@@ -984,6 +1161,11 @@ struct BoardView: View {
     }
 }
 
+private extension TaskStatus {
+    /// The board column a card with this status sits in (see `BoardView`).
+    var boardColumn: TaskStatus { self == .dropped ? .done : self }
+}
+
 /// One board column: a status header + a scrollable stack of cards. Accepts a
 /// dropped card and re-files it to this column's status.
 struct BoardColumn: View {
@@ -995,7 +1177,7 @@ struct BoardColumn: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
-                Image(systemName: icon).foregroundStyle(qbStatusColor(status))
+                Image(systemName: qbStatusIcon(status)).foregroundStyle(qbStatusColor(status))
                 Text(status.display).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
                 Text("\(tasks.count)")
                     .font(Theme.Fonts.micro.monospacedDigit())
@@ -1047,22 +1229,16 @@ struct BoardColumn: View {
         provider.loadObject(ofClass: NSString.self) { obj, _ in
             guard let str = obj as? String, let id = Int64(str) else { return }
             Task { @MainActor in
-                if let task = model.task(byId: id), task.status != status {
+                // Compare columns, so a dropped card let go back in Done stays dropped.
+                if let task = model.task(byId: id), task.status.boardColumn != status {
                     // Route through the shared blocked guard so a drag onto In Progress
-                    // gets the same confirmation as the list/bulk/menu paths.
+                    // gets the same confirmation as the list/bulk/menu paths. A drop on
+                    // Waiting keeps the card's waiting-on, else waits on the user.
                     model.setStatus(task, to: status)
                 }
             }
         }
         return true
-    }
-
-    private var icon: String {
-        switch status {
-        case .todo: return "circle"
-        case .inProgress: return "circle.lefthalf.filled"
-        case .done: return "checkmark.circle.fill"
-        }
     }
 }
 
@@ -1084,8 +1260,18 @@ struct BoardCard: View {
             Text(task.title)
                 .font(Theme.Fonts.bodySm)
                 .lineLimit(3)
-                .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
-                .strikethrough(task.status == .done)
+                .foregroundStyle(qbTitleColor(task.status))
+                .strikethrough(task.status.isClosed)
+            if task.status == .waiting {
+                HStack(spacing: 6) {
+                    WaitingChip(task: task)
+                    if let reason = task.waitingReason, !reason.isEmpty {
+                        Text(reason)
+                            .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+                            .lineLimit(2)
+                    }
+                }
+            }
             HStack(spacing: 8) {
                 if task.priority != .none {
                     let chip = qbPriorityChipColors(task.priority)
@@ -1143,12 +1329,23 @@ struct TaskDetailView: View {
     @State private var detail = ""
     @State private var link = ""
     @State private var status: TaskStatus = .todo
+    @State private var waitingOn: WaitingOn = .user   // used only while status is Waiting
+    @State private var waitingReason = ""
     @State private var priority: Priority = .none
     @State private var hasDue = false
     @State private var dueDate = Date()
     @State private var tagsText = ""
     @State private var recurrence = "none"   // "none" | "daily" | "weekly" | "monthly"
     @State private var estimateMinutes = 0   // 0 = no estimate
+    /// The stored task the editor fields were last synced from. A field is the user's
+    /// edit only while it differs from this snapshot; autosave sends just those fields,
+    /// and a store change (e.g. an MCP write) refreshes the fields the user hasn't touched.
+    @State private var base: TodoTask?
+    // Draft note (not a task field: autosave ignores it). Kept while the same task is
+    // shown, cleared only when a different task is loaded.
+    @State private var noteText = ""
+    @State private var noteKind: NoteKind = .note
+    @State private var noteDraftTaskId: Int64?
 
     // Blocked-task guard: confirm before moving a blocked task to In Progress.
     @State private var showBlockedAlert = false
@@ -1159,7 +1356,8 @@ struct TaskDetailView: View {
             if let task = currentTask {
                 sectionsScroll(task)
                 .onAppear { load(task) }
-                .onChange(of: model.selectedTaskId) { _, _ in if let t = currentTask { load(t) } }
+                // Selection change or a store write (app or MCP): resync the editor.
+                .onChange(of: currentTask) { _, new in if let new { sync(new) } }
                 // Auto-save: any field change persists immediately (no Save button).
                 .onChange(of: title) { _, _ in autosave() }
                 .onChange(of: detail) { _, _ in autosave() }
@@ -1168,13 +1366,18 @@ struct TaskDetailView: View {
                     // Moving a blocked task to In Progress requires confirmation. Uses the
                     // shared guard decision; keeps a local alert so the picker can revert
                     // on cancel (the segmented control's binding is view-local state).
-                    if let t = currentTask, model.blockedConfirmNeeded(forIds: [t.id], to: new) {
+                    // Only a user edit (status off the snapshot) is checked: a load or
+                    // resync never raises the alert or queries the store.
+                    if let t = currentTask, new != base?.status,
+                       model.blockedConfirmNeeded(forIds: [t.id], to: new) {
                         statusBeforeBlock = old
                         showBlockedAlert = true
                     } else {
                         autosave()
                     }
                 }
+                .onChange(of: waitingOn) { _, _ in autosave() }
+                .onChange(of: waitingReason) { _, _ in autosave() }
                 .onChange(of: priority) { _, _ in autosave() }
                 .onChange(of: hasDue) { _, _ in autosave() }
                 .onChange(of: dueDate) { _, _ in autosave() }
@@ -1226,6 +1429,7 @@ struct TaskDetailView: View {
                 blockedSection(task)
                 linkSection
                 detailSection
+                notesSection(task)
                 estimateSection(task)
                 timingSection(task)
                 historySection(task)
@@ -1253,6 +1457,17 @@ struct TaskDetailView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            if status == .waiting {
+                labeledRow("Waiting on") {
+                    Picker("", selection: $waitingOn) {
+                        ForEach(WaitingOn.allCases, id: \.self) { Text(qbWaitingOnLabel($0)).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                TextField("Reason (optional)", text: $waitingReason).qbField()
+            }
             labeledRow("Priority") {
                 Picker("", selection: $priority) {
                     ForEach(Priority.allCases, id: \.self) { Text($0.display).tag($0) }
@@ -1307,8 +1522,9 @@ struct TaskDetailView: View {
                 ForEach(deps, id: \.self) { depId in
                     if let dep = model.task(byId: depId) {
                         HStack(spacing: 8) {
-                            Image(systemName: dep.status == .done ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(dep.status == .done ? Theme.Colors.successAccent : Theme.Colors.brandYellowDeep)
+                            // A closed (done or dropped) dependency no longer blocks.
+                            Image(systemName: dep.status.isClosed ? qbStatusIcon(dep.status) : "circle")
+                                .foregroundStyle(dep.status.isClosed ? qbStatusColor(dep.status) : Theme.Colors.brandYellowDeep)
                             CodeBadge(code: dep.code)
                             Text(dep.title).font(Theme.Fonts.bodySm).lineLimit(1)
                             Spacer()
@@ -1363,6 +1579,47 @@ struct TaskDetailView: View {
         }
     }
 
+    /// The task's append-only log: an input to add a note (with its kind), then the
+    /// notes newest first, a page at a time (`AppModel.selectedTaskNotes`, which also
+    /// picks up notes added over MCP on the next poll).
+    private func notesSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Notes") {
+            HStack(alignment: .top, spacing: 8) {
+                TextField("Add a note…", text: $noteText, axis: .vertical)
+                    .lineLimit(1...5)
+                    .qbField()
+                    .onSubmit { commitNote(task) }
+                Picker("", selection: $noteKind) {
+                    ForEach(NoteKind.allCases, id: \.self) { Text($0.display).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+                Button("Add") { commitNote(task) }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                    .disabled(noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            if model.selectedTaskNotes.isEmpty {
+                Text("No notes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
+            } else {
+                LazyVStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
+                    ForEach(model.selectedTaskNotes) { NoteRow(note: $0) }
+                }
+                if model.hasOlderNotes {
+                    Button("Show older notes") { model.showOlderNotes() }
+                        .buttonStyle(QBLinkButtonStyle())
+                }
+            }
+        }
+    }
+
+    private func commitNote(_ task: TodoTask) {
+        guard !noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if model.addNote(task, text: noteText, kind: noteKind) {
+            noteText = ""
+            noteKind = .note
+        }
+    }
+
     private func estimateSection(_ task: TodoTask) -> some View {
         QBDetailSection("Estimate") {
             Stepper(value: $estimateMinutes, in: 0...6000, step: 5) {
@@ -1414,18 +1671,22 @@ struct TaskDetailView: View {
         return model.allTasks().filter { $0.id != task.id && !existing.contains($0.id) }
     }
 
-    /// True when the editor fields differ from the stored task.
-    private func isDirty(_ t: TodoTask) -> Bool {
-        title != t.title
-            || detail != t.detail
-            || link != (t.link ?? "")
-            || status != t.status
-            || priority != t.priority
-            || hasDue != (t.dueDate != nil)
-            || (hasDue && !sameDay(dueDate, t.dueDate))
-            || parsedTags != t.tags
-            || recurrence != (t.recurrence ?? "none")
-            || estimateMinutes * 60 != t.estimateSeconds
+    // Per-field edits: the editor value differs from `t` (the snapshot, see `base`).
+    private func titleEdited(_ t: TodoTask) -> Bool { title != t.title }
+    private func detailEdited(_ t: TodoTask) -> Bool { detail != t.detail }
+    private func linkEdited(_ t: TodoTask) -> Bool { link != (t.link ?? "") }
+    private func statusEdited(_ t: TodoTask) -> Bool { status != t.status }
+    private func priorityEdited(_ t: TodoTask) -> Bool { priority != t.priority }
+    private func dueEdited(_ t: TodoTask) -> Bool {
+        hasDue != (t.dueDate != nil) || (hasDue && !sameDay(dueDate, t.dueDate))
+    }
+    private func tagsEdited(_ t: TodoTask) -> Bool { parsedTags != t.tags }
+    private func recurrenceEdited(_ t: TodoTask) -> Bool { recurrence != (t.recurrence ?? "none") }
+    private func estimateEdited(_ t: TodoTask) -> Bool { estimateMinutes * 60 != t.estimateSeconds }
+    // The waiting fields count only while the editor is on Waiting (they show only then).
+    private func waitingOnEdited(_ t: TodoTask) -> Bool { status == .waiting && waitingOn != t.waitingOn }
+    private func waitingReasonEdited(_ t: TodoTask) -> Bool {
+        status == .waiting && waitingReason != (t.waitingReason ?? "")
     }
 
     private func sameDay(_ a: Date, _ b: Date?) -> Bool {
@@ -1437,8 +1698,12 @@ struct TaskDetailView: View {
         model.tasks.first(where: { $0.id == model.selectedTaskId })
     }
 
+    /// Fill every editor field from `t` and make it the snapshot.
     private func load(_ t: TodoTask) {
+        base = t
+        if noteDraftTaskId != t.id { noteText = ""; noteKind = .note; noteDraftTaskId = t.id }
         title = t.title; detail = t.detail; link = t.link ?? ""; status = t.status
+        waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
         priority = t.priority
         hasDue = t.dueDate != nil
         dueDate = t.dueDate ?? Date()
@@ -1447,21 +1712,53 @@ struct TaskDetailView: View {
         estimateMinutes = t.estimateSeconds / 60
     }
 
-    /// Persist current editor state if it differs from the stored task.
-    /// No-op right after load() (fields equal the task), so it won't loop.
+    /// The stored task changed: a new selection loads outright; for the same task each
+    /// field the user has not edited (still equal to the snapshot) takes the stored
+    /// value, and an edited field keeps the user's value. Then `t` is the snapshot.
+    /// The field onChange handlers that follow see no edits, so nothing is written back.
+    private func sync(_ t: TodoTask) {
+        guard let b = base, b.id == t.id else { return load(t) }
+        if !titleEdited(b) { title = t.title }
+        if !detailEdited(b) { detail = t.detail }
+        if !linkEdited(b) { link = t.link ?? "" }
+        if !waitingOnEdited(b) { waitingOn = t.waitingOn ?? .user }   // before status: reads it
+        if !waitingReasonEdited(b) { waitingReason = t.waitingReason ?? "" }
+        if !statusEdited(b) { status = t.status }
+        if !priorityEdited(b) { priority = t.priority }
+        // Due date and tags refresh only when the stored value moved, so an unchanged
+        // field keeps the user's in-progress text (e.g. a trailing ", ") and time of day.
+        if !dueEdited(b), t.dueDate != b.dueDate { hasDue = t.dueDate != nil; dueDate = t.dueDate ?? Date() }
+        if !tagsEdited(b), t.tags != b.tags { tagsText = t.tags.joined(separator: ", ") }
+        if !recurrenceEdited(b) { recurrence = t.recurrence ?? "none" }
+        if !estimateEdited(b) { estimateMinutes = t.estimateSeconds / 60 }
+        base = t
+    }
+
+    /// Persist the user's edits: only the fields that differ from the snapshot, so a
+    /// field the store changed underneath (an MCP write) is never overwritten with a
+    /// stale value. No-op right after load()/sync() (nothing edited), so it won't loop.
+    /// The store write reloads the tasks, and the resulting sync() moves the snapshot.
     private func autosave() {
-        guard let t = currentTask, isDirty(t) else { return }
+        guard let b = base, let t = currentTask, b.id == t.id else { return }
+        let edits = [titleEdited(b), detailEdited(b), linkEdited(b), statusEdited(b), priorityEdited(b),
+                     dueEdited(b), tagsEdited(b), recurrenceEdited(b), estimateEdited(b),
+                     waitingOnEdited(b), waitingReasonEdited(b)]
+        guard edits.contains(true) else { return }
         model.updateTask(
             t,
-            title: title,
-            detail: detail,
-            link: .some(link.isEmpty ? nil : link),
-            status: status,
-            priority: priority,
-            dueDate: .some(hasDue ? dueDate : nil),
-            tags: parsedTags,
-            recurrence: .some(recurrence == "none" ? nil : recurrence),
-            estimateSeconds: estimateMinutes * 60
+            title: titleEdited(b) ? title : nil,
+            detail: detailEdited(b) ? detail : nil,
+            link: linkEdited(b) ? .some(link.isEmpty ? nil : link) : nil,
+            // Status and waiting fields go only when edited, so ordinary edits on a
+            // waiting task skip the store's waiting check. Any other status clears them.
+            status: statusEdited(b) ? status : nil,
+            priority: priorityEdited(b) ? priority : nil,
+            dueDate: dueEdited(b) ? .some(hasDue ? dueDate : nil) : nil,
+            tags: tagsEdited(b) ? parsedTags : nil,
+            recurrence: recurrenceEdited(b) ? .some(recurrence == "none" ? nil : recurrence) : nil,
+            estimateSeconds: estimateEdited(b) ? estimateMinutes * 60 : nil,
+            waitingOn: waitingOnEdited(b) ? waitingOn : nil,
+            waitingReason: waitingReasonEdited(b) ? .some(waitingReason) : nil
         )
     }
 }
@@ -1477,17 +1774,25 @@ struct HistoryRow: View {
                 Text(fmtDateTime(event.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
             if event.field != "created" {
-                Text(event.oldValue.isEmpty ? "→ \(event.newValue)" : "\(event.oldValue) → \(event.newValue)")
+                let old = value(event.oldValue), new = value(event.newValue)
+                Text(old.isEmpty ? "→ \(new)" : "\(old) → \(new)")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
         }
         .padding(.vertical, 1)
     }
 
+    /// History stores waiting-on by raw value (user / external); show the app's labels.
+    private func value(_ v: String) -> String {
+        guard event.field == "waiting on", let on = WaitingOn(rawValue: v) else { return v }
+        return qbWaitingOnLabel(on)
+    }
+
     private var label: String {
         switch event.field {
         case "created": return "Created"
         case "status": return "Status"
+        case "waiting on": return "Waiting on"
         case "priority": return "Priority"
         case "due date": return "Due date"
         case "tags": return "Tags"
@@ -1495,6 +1800,46 @@ struct HistoryRow: View {
         case "estimate": return "Estimate"
         case "project": return "Moved project"
         default: return event.field.capitalized
+        }
+    }
+}
+
+/// One entry in a task's notes: kind chip and time, then the (selectable) text.
+struct NoteRow: View {
+    let note: TaskNote
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                NoteKindChip(kind: note.kind)
+                Spacer()
+                Text(fmtDateTime(note.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+            Text(note.text)
+                .font(Theme.Fonts.bodySm)
+                .foregroundStyle(Theme.Colors.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// Note kind pill: parchment for a note, gold for a decision, herb green for a review.
+struct NoteKindChip: View {
+    let kind: NoteKind
+    var body: some View {
+        Text(kind.display.lowercased())
+            .font(Theme.Fonts.micro)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(colors.fill, in: Capsule())
+            .foregroundStyle(colors.text)
+    }
+
+    private var colors: (fill: Color, text: Color) {
+        switch kind {
+        case .note: return (Theme.Colors.surface, Theme.Colors.slate)
+        case .decision: return (Theme.Colors.yellowLight, Theme.Colors.yellowDark)
+        case .review: return (Theme.Colors.tealLight, Theme.Colors.mossDark)
         }
     }
 }
@@ -1595,6 +1940,22 @@ struct TagChip: View {
             .padding(.horizontal, 8).padding(.vertical, 2)
             .background(Theme.Colors.surfacePricingFeatured, in: Capsule())
             .foregroundStyle(Theme.Colors.brandBlue)
+    }
+}
+
+/// Who a waiting task waits on (clay fill, ember text); the reason shows on hover.
+/// Renders nothing for a task that is not waiting.
+struct WaitingChip: View {
+    let task: TodoTask
+    var body: some View {
+        if task.status == .waiting, let on = task.waitingOn {
+            Text("⏸ waiting on \(qbWaitingOnLabel(on).lowercased())")
+                .font(Theme.Fonts.micro)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(Theme.Colors.coralLight, in: Capsule())
+                .foregroundStyle(Theme.Colors.bluePressed)
+                .help(task.waitingReason.flatMap { $0.isEmpty ? nil : $0 } ?? "Waiting on \(qbWaitingOnLabel(on))")
+        }
     }
 }
 

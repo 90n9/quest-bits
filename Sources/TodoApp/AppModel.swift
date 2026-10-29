@@ -13,7 +13,7 @@ enum SmartView: String, CaseIterable {
     var icon: String { self == .allTasks ? "tray.full" : "circle.lefthalf.filled" }
 
     /// True when the view pre-filters tasks to a single status. The kanban board
-    /// is meaningless here (only one of its three columns can ever populate), so
+    /// is meaningless here (only one of its columns can ever populate), so
     /// the board toggle is suppressed for these views.
     var isSingleStatus: Bool { self == .inProgress }
 }
@@ -34,7 +34,9 @@ final class AppModel: ObservableObject {
     @Published var projects: [Project] = []
     @Published var tasks: [TodoTask] = []          // tasks for the selected project
     @Published var selectedProjectId: Int64?
-    @Published var selectedTaskIds: Set<Int64> = []
+    @Published var selectedTaskIds: Set<Int64> = [] {
+        didSet { if selectedTaskId != notesTaskId { reloadNotes() } }
+    }
     @Published var smartView: SmartView?      // when set, tasks span all projects
     @Published var searchQuery: String = ""   // live filter over the displayed task list
 
@@ -49,6 +51,10 @@ final class AppModel: ObservableObject {
     // Ids of tasks currently blocked by an unfinished dependency (for the 🔒 badge).
     // Recomputed alongside the displayed task list.
     @Published var blockedTaskIds: Set<Int64> = []
+
+    /// Per-project task counts for the sidebar rows, refreshed with the tasks (and so
+    /// with every poll). A project with no tasks has no entry.
+    @Published private(set) var projectCounts: [Int64: ProjectCounts] = [:]
 
     // Non-nil while an app-level blocked-task confirmation is on screen. Set by any
     // path that tries to move a blocked task to In Progress; presented once by the root.
@@ -66,7 +72,7 @@ final class AppModel: ObservableObject {
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
 
     /// Whether the kanban board is offered for the current view. The board needs all
-    /// three status columns to be meaningful, so it is suppressed in single-status
+    /// its status columns to be meaningful, so it is suppressed in single-status
     /// smart views (which pre-filter tasks to one status). Available in project views
     /// and multi-status smart views (e.g. All Tasks).
     var boardAvailable: Bool {
@@ -79,6 +85,17 @@ final class AppModel: ObservableObject {
     // Set by menu commands; views observe these to open their create sheets.
     @Published var pendingNewProject = false
     @Published var pendingNewTask = false
+
+    // Notes of the single selected task, newest first: the latest `notesLimit` of them.
+    // Loaded on selection change, after addNote and when the poll sees an external write
+    // (not on every task reload); republished only when they changed.
+    @Published private(set) var selectedTaskNotes: [TaskNote] = []
+    @Published private(set) var hasOlderNotes = false
+    private var notesTaskId: Int64?
+    private var notesLimit = AppModel.notesPage
+    static let notesPage = 20
+    // The last notes read error toasted, so a lasting failure toasts once, not on every reload.
+    private var notesErrorShown: (taskId: Int64, error: String)?
 
     // Transient confirmation toast (e.g. after copying a code).
     @Published var toast: String?
@@ -100,7 +117,7 @@ final class AppModel: ObservableObject {
         self.settings = loaded
         self.pomodoro = PomodoroEngine(store: store, settings: loaded)
         reloadAll()
-        if selectedProjectId == nil { selectedProjectId = projects.first?.id }
+        if selectedProjectId == nil { selectedProjectId = (activeProjects.first ?? projects.first)?.id }
         reloadTasks()
         startWatching()
 
@@ -134,7 +151,7 @@ final class AppModel: ObservableObject {
         projects = (try? store.listProjects()) ?? []
         templates = (try? store.listTemplates()) ?? []
         if let sel = selectedProjectId, !projects.contains(where: { $0.id == sel }) {
-            selectedProjectId = projects.first?.id
+            selectedProjectId = (activeProjects.first ?? projects.first)?.id
         }
         reloadTasks()
         reloadStats()
@@ -148,15 +165,26 @@ final class AppModel: ObservableObject {
 
     func reloadTasks() {
         let all = (try? store.listTasks(projectId: nil)) ?? []
+        // Cross-project views (smart views, menu bar) leave out archived projects; a
+        // selected project shows in full, archived or not. Due-date reminders still cover
+        // every task. Filtered here from `all` so the task table is read once per reload;
+        // the rule is `Project.isArchived`, the one Store.activeProjectSQL /
+        // activeProjectJoinSQL apply in SQL for MCP — change them together.
+        let archived = Set(archivedProjects.map(\.id))
+        let active = archived.isEmpty ? all : all.filter { !archived.contains($0.projectId) }
         if let sv = smartView {
-            tasks = sv == .inProgress ? all.filter { $0.status == .inProgress } : all
+            tasks = sv == .inProgress ? active.filter { $0.status == .inProgress } : active
         } else if let pid = selectedProjectId {
             tasks = all.filter { $0.projectId == pid }
         } else {
             tasks = []
         }
-        inProgressTasks = all.filter { $0.status == .inProgress }
+        inProgressTasks = active.filter { $0.status == .inProgress }
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
+        // Publish only on a change: most polls and effort flushes leave the counts as
+        // they were, and the sidebar needn't redraw.
+        let counts = ProjectCounts.byProject(all)
+        if counts != projectCounts { projectCounts = counts }
         syncDueReminders(all)
     }
 
@@ -213,6 +241,23 @@ final class AppModel: ObservableObject {
         return false
     }
 
+    /// Projects not archived, in sidebar order (also the move/copy targets).
+    var activeProjects: [Project] { projects.filter { !$0.isArchived } }
+
+    /// Archived projects, in sidebar order (the collapsed "Archived" group).
+    var archivedProjects: [Project] { projects.filter(\.isArchived) }
+
+    /// A project is on screen and takes new tasks (an archived one doesn't).
+    var canAddTask: Bool {
+        guard let pid = selectedProjectId else { return false }
+        return canAddTask(to: pid)
+    }
+
+    /// The project takes new tasks and subtasks: it is not archived (the store refuses those).
+    func canAddTask(to projectId: Int64) -> Bool {
+        !archivedProjects.contains { $0.id == projectId }
+    }
+
     /// Project code for a task id (used by smart views to label rows).
     func projectCode(for projectId: Int64) -> String {
         projects.first(where: { $0.id == projectId })?.code ?? ""
@@ -220,6 +265,57 @@ final class AppModel: ObservableObject {
 
     func history(forTask id: Int64) -> [TaskEvent] {
         (try? store.taskHistory(taskId: id)) ?? []
+    }
+
+    /// Refresh `selectedTaskNotes` for the selected task. A different task starts again
+    /// from the first page. One extra row tells whether older notes exist. On a read
+    /// error a toast says so, once per task and error; the shown notes are kept only when
+    /// they belong to the same task.
+    private func reloadNotes() {
+        let id = selectedTaskId
+        let switched = id != notesTaskId
+        if switched { notesTaskId = id; notesLimit = Self.notesPage }
+        guard let id else {
+            if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
+            if hasOlderNotes { hasOlderNotes = false }
+            return
+        }
+        do {
+            let rows = try store.notes(taskId: id, limit: notesLimit + 1)
+            let page = Array(rows.prefix(notesLimit)), older = rows.count > notesLimit
+            if page != selectedTaskNotes { selectedTaskNotes = page }
+            if older != hasOlderNotes { hasOlderNotes = older }
+            notesErrorShown = nil
+        } catch {
+            if switched {
+                if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
+                if hasOlderNotes { hasOlderNotes = false }
+            }
+            let message = "\(error)"
+            guard notesErrorShown?.taskId != id || notesErrorShown?.error != message else { return }
+            notesErrorShown = (id, message)
+            flashToast("Couldn't load notes: \(message)")
+        }
+    }
+
+    /// Show the next page of older notes for the selected task.
+    func showOlderNotes() {
+        notesLimit += Self.notesPage
+        reloadNotes()
+    }
+
+    /// Append a note to a task. Returns false (with a toast) if the store rejected it.
+    @discardableResult
+    func addNote(_ task: TodoTask, text: String, kind: NoteKind) -> Bool {
+        do {
+            try store.addNote(taskId: task.id, text: text, kind: kind)
+        } catch {
+            flashToast("Couldn't add a note to \(task.code): \(error)")
+            return false
+        }
+        reloadTasks()   // the note bumped updated_at
+        reloadNotes()
+        return true
     }
 
     // MARK: - Project CRUD
@@ -240,6 +336,34 @@ final class AppModel: ObservableObject {
         reloadAll()
     }
 
+    /// Archive or unarchive a project. It stays selected (an archived project is still
+    /// viewable); a failed write surfaces as a toast.
+    func setArchived(_ id: Int64, _ archived: Bool) {
+        do {
+            try store.setProjectArchived(id: id, archived: archived)
+        } catch {
+            flashToast("Couldn't \(archived ? "archive" : "unarchive") project: \(error)")
+        }
+        reloadAll()
+    }
+
+    /// Reorder the active projects after a sidebar drag (offsets index `activeProjects`).
+    /// The order is written synchronously on the drop and read back in the same call, so
+    /// no poll can reload the old order in between; on a failed write the reload shows
+    /// the stored order. The poll stamp is taken before the reload: this write doesn't
+    /// trigger a second one, and a write by an agent after it still does.
+    func moveProjects(from offsets: IndexSet, to destination: Int) {
+        var ordered = activeProjects
+        ordered.move(fromOffsets: offsets, toOffset: destination)
+        do {
+            try store.reorderProjects(ids: ordered.map(\.id))
+        } catch {
+            flashToast("Couldn't reorder projects: \(error)")
+        }
+        lastDBStamp = currentDBStamp()
+        reloadAll()
+    }
+
     func deleteProject(_ id: Int64) {
         try? store.deleteProject(id: id)
         if selectedProjectId == id { selectedProjectId = nil }
@@ -248,29 +372,47 @@ final class AppModel: ObservableObject {
 
     // MARK: - Task CRUD
 
+    /// A failed create (e.g. into an archived project) surfaces as a toast.
     func addTask(title: String) {
         guard let pid = selectedProjectId else { return }
-        _ = try? store.createTask(projectId: pid, title: title)
+        do {
+            try store.createTask(projectId: pid, title: title)
+        } catch {
+            flashToast("Couldn't add the task: \(error)")
+        }
         reloadTasks()
     }
 
     /// Add a subtask (one level of nesting) under a parent task.
     func addSubtask(title: String, parent: TodoTask) {
-        _ = try? store.createTask(projectId: parent.projectId, title: title, parentId: parent.id)
+        do {
+            try store.createTask(projectId: parent.projectId, title: title, parentId: parent.id)
+        } catch {
+            flashToast("Couldn't add a subtask to \(parent.code): \(error)")
+        }
         reloadTasks()
     }
 
-    /// Toggle a subtask between done and todo (checkbox behavior).
+    /// Toggle a subtask between done and todo (checkbox behavior). A dropped subtask
+    /// reopens to todo, like a done one.
     func toggleSubtaskDone(_ sub: TodoTask) {
-        updateTask(sub, status: sub.status == .done ? .todo : .done)
+        updateTask(sub, status: sub.status.isClosed ? .todo : .done)
     }
 
+    /// Moving to Waiting without saying on whom keeps the task's current `waitingOn`,
+    /// else defaults to the user — the store rejects a waiting task with neither.
     func updateTask(_ task: TodoTask, title: String? = nil, detail: String? = nil, link: String?? = nil,
                     status: TaskStatus? = nil, priority: Priority? = nil, dueDate: Date?? = nil, tags: [String]? = nil,
-                    recurrence: String?? = nil, estimateSeconds: Int? = nil) {
-        try? store.updateTask(id: task.id, title: title, detail: detail, link: link, status: status,
-                              priority: priority, dueDate: dueDate, tags: tags, recurrence: recurrence,
-                              estimateSeconds: estimateSeconds)
+                    recurrence: String?? = nil, estimateSeconds: Int? = nil,
+                    waitingOn: WaitingOn? = nil, waitingReason: String?? = nil) {
+        let on = status == .waiting ? (waitingOn ?? task.waitingOn ?? .user) : waitingOn
+        do {
+            try store.updateTask(id: task.id, title: title, detail: detail, link: link, status: status,
+                                 priority: priority, dueDate: dueDate, tags: tags, recurrence: recurrence,
+                                 estimateSeconds: estimateSeconds, waitingOn: on, waitingReason: waitingReason)
+        } catch {
+            flashToast("Couldn't save \(task.code): \(error)")
+        }
         reloadTasks()
     }
 
@@ -279,17 +421,30 @@ final class AppModel: ObservableObject {
         switch task.status {
         case .todo: next = .inProgress
         case .inProgress: next = .done
-        case .done: next = .todo
+        case .waiting: next = .inProgress   // the wait is over: resume work
+        case .done, .dropped: next = .todo   // reopen
         }
         setStatus(task, to: next)
     }
 
     /// Shared blocked-guard decision: true iff moving these tasks to `status` should
     /// prompt for confirmation — i.e. the target is In Progress and at least one task
-    /// is currently blocked by an unfinished dependency. Marking Done is never guarded.
+    /// has an unfinished dependency. Marking Done is never guarded.
     func blockedConfirmNeeded(forIds ids: [Int64], to status: TaskStatus) -> Bool {
-        guard status == .inProgress else { return false }
-        return ids.contains { blockedTaskIds.contains($0) }
+        !blockedForConfirm(ids, to: status).isEmpty
+    }
+
+    /// The ids behind `blockedConfirmNeeded`: those with an open dependency when the
+    /// target is In Progress, else none. Callers that also need the count use this.
+    private func blockedForConfirm(_ ids: [Int64], to status: TaskStatus) -> Set<Int64> {
+        status == .inProgress ? idsWithOpenDependency(ids) : []
+    }
+
+    /// Which of `ids` have an unfinished dependency, whatever their own status. Not
+    /// `blockedTaskIds`: a done task is never reported blocked, but reopening it into
+    /// In Progress while a dependency is open should still prompt.
+    private func idsWithOpenDependency(_ ids: [Int64]) -> Set<Int64> {
+        (try? store.idsWithOpenDependency(ids)) ?? []
     }
 
     /// Move a single task to `status`, routing through the blocked guard. If the task
@@ -310,21 +465,33 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
-    /// Clone a task within its current project.
+    /// Clone a task within its current project (a fresh todo).
     func duplicateTask(_ id: Int64) {
-        _ = try? store.duplicateTask(id: id)
+        do {
+            _ = try store.duplicateTask(id: id)
+        } catch {
+            flashToast("Couldn't duplicate: \(error)")
+        }
         reloadTasks()
     }
 
-    /// Copy a task into another project (original kept).
+    /// Copy a task into another project (original kept), status and times included.
     func copyTask(_ id: Int64, toProject pid: Int64) {
-        _ = try? store.duplicateTask(id: id, toProjectId: pid)
+        do {
+            _ = try store.duplicateTask(id: id, toProjectId: pid)
+        } catch {
+            flashToast("Couldn't copy: \(error)")
+        }
         reloadTasks()
     }
 
     /// Move a task to another project (transfer).
     func moveTask(_ id: Int64, toProject pid: Int64) {
-        try? store.moveTask(id: id, toProjectId: pid)
+        do {
+            try store.moveTask(id: id, toProjectId: pid)
+        } catch {
+            flashToast("Couldn't move: \(error)")
+        }
         reloadTasks()
     }
 
@@ -359,7 +526,13 @@ final class AppModel: ObservableObject {
     /// Instantiate a template into a project. Selects the new task when its project
     /// is the one on screen, and flashes a confirmation toast.
     func newTaskFromTemplate(_ templateId: Int64, intoProject pid: Int64) {
-        guard let task = try? store.instantiateTemplate(id: templateId, intoProjectId: pid) else { return }
+        let task: TodoTask
+        do {
+            task = try store.instantiateTemplate(id: templateId, intoProjectId: pid)
+        } catch {
+            flashToast("Couldn't add the task: \(error)")
+            return
+        }
         reloadTasks()
         if smartView == nil && selectedProjectId == pid { selectedTaskIds = [task.id] }
         flashToast("Added \(task.code)")
@@ -423,7 +596,9 @@ final class AppModel: ObservableObject {
     }
 
     // Commands act on the whole selection (1 or many).
-    func setStatusOnSelected(_ status: TaskStatus) { bulkSetStatus(status) }
+    func setStatusOnSelected(_ status: TaskStatus, waitingOn: WaitingOn? = nil) {
+        bulkSetStatus(status, waitingOn: waitingOn)
+    }
 
     func duplicateSelected() {
         for id in selectedTaskIds { _ = try? store.duplicateTask(id: id) }
@@ -436,23 +611,35 @@ final class AppModel: ObservableObject {
 
     private var selectionCount: Int { selectedTaskIds.count }
 
-    func bulkSetStatus(_ status: TaskStatus) {
+    /// `waitingOn` applies only to Waiting; without it each task keeps whom it waits on,
+    /// and a task waiting on no one waits on the user.
+    func bulkSetStatus(_ status: TaskStatus, waitingOn: WaitingOn? = nil) {
         let ids = Array(selectedTaskIds)
-        if blockedConfirmNeeded(forIds: ids, to: status) {
-            let blocked = ids.filter { blockedTaskIds.contains($0) }.count
+        let blockedIds = blockedForConfirm(ids, to: status)
+        if !blockedIds.isEmpty {
+            let blocked = blockedIds.count
             let noun = blocked == 1 ? "task is" : "tasks are"
             blockedConfirm = BlockedConfirm(
                 message: "\(blocked) selected \(noun) blocked by an unfinished dependency. Move to In Progress anyway?",
-                onConfirm: { [weak self] in self?.performBulkSetStatus(status, ids: ids) })
+                onConfirm: { [weak self] in self?.performBulkSetStatus(status, waitingOn: waitingOn, ids: ids) })
         } else {
-            performBulkSetStatus(status, ids: Array(selectedTaskIds))
+            performBulkSetStatus(status, waitingOn: waitingOn, ids: Array(selectedTaskIds))
         }
     }
 
-    private func performBulkSetStatus(_ status: TaskStatus, ids: [Int64]) {
-        for id in ids { try? store.updateTask(id: id, status: status) }
+    /// One all-or-nothing store write: on failure no task changes and the toast says why.
+    private func performBulkSetStatus(_ status: TaskStatus, waitingOn: WaitingOn?, ids: [Int64]) {
+        // Like the single-task path: without a who, each task keeps its own, and one
+        // waiting on no one waits on the user.
+        let on = status == .waiting ? waitingOn : nil
+        do {
+            try store.bulkUpdateTasks(ids: ids, status: status, waitingOn: on, waitingOnDefault: .user)
+            let label = on.map { "Waiting on \(qbWaitingOnLabel($0))" } ?? status.display
+            flashToast("Set \(ids.count) to \(label)")
+        } catch {
+            flashToast("Couldn't set status: \(error)")
+        }
         reloadTasks()
-        flashToast("Set \(ids.count) to \(status.display)")
     }
 
     func bulkSetPriority(_ priority: Priority) {
@@ -463,24 +650,37 @@ final class AppModel: ObservableObject {
 
     func bulkAddTags(_ tags: [String]) {
         guard !tags.isEmpty else { return }
-        for id in selectedTaskIds { try? store.addTags(toTaskId: id, tags: tags) }
+        do {
+            try store.bulkUpdateTasks(ids: Array(selectedTaskIds), addTags: tags)
+            flashToast("Tagged \(selectionCount) tasks")
+        } catch {
+            flashToast("Couldn't tag: \(error)")
+        }
         reloadTasks()
-        flashToast("Tagged \(selectionCount) tasks")
     }
 
+    /// One all-or-nothing store write: on failure no task moves and the toast says why
+    /// (the selection is kept, so the user can pick another project).
     func bulkMove(toProject pid: Int64) {
-        let n = selectionCount
-        for id in selectedTaskIds { try? store.moveTask(id: id, toProjectId: pid) }
-        selectedTaskIds = []
+        do {
+            try store.bulkMoveTasks(ids: Array(selectedTaskIds), toProjectId: pid, copy: false)
+            flashToast("Moved \(selectionCount) tasks")
+            selectedTaskIds = []
+        } catch {
+            flashToast("Couldn't move: \(error)")
+        }
         reloadTasks()
-        flashToast("Moved \(n) tasks")
     }
 
+    /// One all-or-nothing store write, like bulkMove.
     func bulkCopy(toProject pid: Int64) {
-        let n = selectionCount
-        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id, toProjectId: pid) }
+        do {
+            try store.bulkMoveTasks(ids: Array(selectedTaskIds), toProjectId: pid, copy: true)
+            flashToast("Copied \(selectionCount) tasks")
+        } catch {
+            flashToast("Couldn't copy: \(error)")
+        }
         reloadTasks()
-        flashToast("Copied \(n) tasks")
     }
 
     func bulkDelete() {
@@ -532,6 +732,7 @@ final class AppModel: ObservableObject {
         if stamp > lastDBStamp {
             lastDBStamp = stamp
             reloadAll()
+            reloadNotes()   // an agent may have added a note
         }
     }
 }

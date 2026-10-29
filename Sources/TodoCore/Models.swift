@@ -4,15 +4,60 @@ import Foundation
 public enum TaskStatus: String, Codable, CaseIterable, Sendable {
     case todo
     case inProgress = "in_progress"
+    case waiting     // parked on someone — see `WaitingOn`; still open
     case done
+    case dropped     // abandoned: closed like done, but not a completion (history kept)
 
     public var display: String {
         switch self {
         case .todo: return "Todo"
         case .inProgress: return "In Progress"
+        case .waiting: return "Waiting"
         case .done: return "Done"
+        case .dropped: return "Dropped"
         }
     }
+
+    /// A closed task is finished with: it is never reported blocked, and as a
+    /// dependency it no longer blocks anything. Only `done` is a completion
+    /// (`completed_at`, stats, recurrence); `dropped` closes without completing.
+    public var isClosed: Bool {
+        switch self {
+        case .todo, .inProgress, .waiting: return false
+        case .done, .dropped: return true
+        }
+    }
+
+    /// Entering this status means work has begun, so `started_at` is stamped
+    /// (once) if it is still empty. Waiting and dropped do not stamp (a task can wait,
+    /// or be dropped, before anyone starts it), but like every status they never clear
+    /// an existing start.
+    public var impliesStarted: Bool {
+        switch self {
+        case .todo, .waiting, .dropped: return false
+        case .inProgress, .done: return true
+        }
+    }
+
+    /// Sort position in filtered task lists (`Store.listTasks(matching:)`): active work
+    /// first, then the backlog, then closed. Separate from `allCases`, whose order drives
+    /// board columns and pickers.
+    public var listRank: Int {
+        switch self {
+        case .inProgress: return 0
+        case .waiting: return 1
+        case .todo: return 2
+        case .done: return 3
+        case .dropped: return 4
+        }
+    }
+}
+
+/// Who a `waiting` task is waiting on. Persisted as the raw string value; set only
+/// while the task is waiting (see `Store.waitingViolation`).
+public enum WaitingOn: String, Codable, CaseIterable, Sendable {
+    case user       // the human has to decide or act
+    case external   // a third party: a reply, a review, a deploy
 }
 
 /// Task priority. `none` = unset.
@@ -40,18 +85,24 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
     public var detail: String        // description — context for humans + AI
     public var createdAt: Date
     public var sortOrder: Int
+    public var archivedAt: Date?     // nil = active; archived projects keep their code reserved
 
-    public init(id: Int64, code: String, name: String, detail: String, createdAt: Date, sortOrder: Int) {
+    public var isArchived: Bool { archivedAt != nil }
+
+    public init(id: Int64, code: String, name: String, detail: String, createdAt: Date, sortOrder: Int,
+                archivedAt: Date? = nil) {
         self.id = id
         self.code = code
         self.name = name
         self.detail = detail
         self.createdAt = createdAt
         self.sortOrder = sortOrder
+        self.archivedAt = archivedAt
     }
 }
 
-/// A task belongs to a project. `detail` holds free-form notes; `link` an optional URL.
+/// A task belongs to a project. `detail` holds the task's spec (progress goes in
+/// `TaskNote`s, appended without rewriting the task); `link` an optional URL.
 public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64
     public var code: String          // short human handle, e.g. "GEN-3"
@@ -60,12 +111,15 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var detail: String
     public var link: String?
     public var status: TaskStatus
+    public var waitingOn: WaitingOn?   // set iff status == .waiting
+    public var waitingReason: String?  // optional note while waiting
+    public var waitingSince: Date?     // when it last entered waiting; set iff status == .waiting
     public var priority: Priority
     public var dueDate: Date?
     public var tags: [String]
     public var recurrence: String?   // nil = non-recurring; "daily" | "weekly" | "monthly"
-    public var startedAt: Date?      // first time it went In Progress
-    public var completedAt: Date?    // when it went Done
+    public var startedAt: Date?      // first time it went In Progress (or straight to Done)
+    public var completedAt: Date?    // when it went Done; cleared on reopen
     public var effortSeconds: Int    // focused time accrued while In Progress + timer running
     public var estimateSeconds: Int  // planned effort; 0 = unset (compared to effortSeconds)
     public var parentId: Int64?      // nil = top-level; else the parent task (one level of nesting)
@@ -81,6 +135,9 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         detail: String,
         link: String?,
         status: TaskStatus,
+        waitingOn: WaitingOn? = nil,
+        waitingReason: String? = nil,
+        waitingSince: Date? = nil,
         priority: Priority = .none,
         dueDate: Date? = nil,
         tags: [String] = [],
@@ -101,6 +158,9 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.detail = detail
         self.link = link
         self.status = status
+        self.waitingOn = waitingOn
+        self.waitingReason = waitingReason
+        self.waitingSince = waitingSince
         self.priority = priority
         self.dueDate = dueDate
         self.tags = tags
@@ -113,6 +173,38 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.sortOrder = sortOrder
+    }
+}
+
+/// Cross-task references for a batch of tasks, resolved to codes in bulk
+/// (see `Store.taskRelations(for:)`) so serializers avoid per-task lookups.
+public struct TaskRelations: Sendable {
+    public var dependsOnCodes: [Int64: [String]] = [:]  // task id → codes it depends on
+    public var parentCodes: [Int64: String] = [:]       // parent task id → its code
+    public var blockedIds: Set<Int64> = []              // open tasks with >=1 open dependency (closed tasks never)
+    public var blockedBy: [Int64: [(id: Int64, code: String)]] = [:]  // task id → the open dependencies blocking it
+
+    public init() {}
+}
+
+/// Which tasks `Store.listTasks(matching:)` returns. Every set field narrows the list;
+/// nil means no constraint on that field. Without a `projectId` or `parentId`, tasks of
+/// archived projects are left out unless `includeArchived`; naming a project or parent
+/// lists it whether archived or not.
+public struct TaskFilter: Sendable {
+    public var projectId: Int64?
+    public var statuses: [TaskStatus]?   // any of these; nil = every status
+    public var tag: String?              // has this tag (whole tag, case-insensitive)
+    public var parentId: Int64?          // direct subtasks of this task
+    public var includeArchived: Bool     // cross-project lists: also tasks of archived projects
+
+    public init(projectId: Int64? = nil, statuses: [TaskStatus]? = nil, tag: String? = nil, parentId: Int64? = nil,
+                includeArchived: Bool = false) {
+        self.projectId = projectId
+        self.statuses = statuses
+        self.tag = tag
+        self.parentId = parentId
+        self.includeArchived = includeArchived
     }
 }
 
@@ -157,6 +249,40 @@ public struct TaskEvent: Identifiable, Codable, Hashable, Sendable {
         self.field = field
         self.oldValue = oldValue
         self.newValue = newValue
+    }
+}
+
+/// What a task note records. Persisted as the raw string value (the `task_notes.kind`
+/// CHECK constraint lists the same values).
+public enum NoteKind: String, Codable, CaseIterable, Sendable {
+    case note       // progress, findings — the default
+    case decision   // a choice made, and why
+    case review     // review feedback or a verification result
+
+    public var display: String {
+        switch self {
+        case .note: return "Note"
+        case .decision: return "Decision"
+        case .review: return "Review"
+        }
+    }
+}
+
+/// A timestamped entry in a task's append-only log. Notes are only ever inserted,
+/// so concurrent writers never overwrite each other (unlike appending to `detail`).
+public struct TaskNote: Identifiable, Codable, Hashable, Sendable {
+    public var id: Int64
+    public var taskId: Int64
+    public var timestamp: Date
+    public var kind: NoteKind
+    public var text: String
+
+    public init(id: Int64, taskId: Int64, timestamp: Date, kind: NoteKind, text: String) {
+        self.id = id
+        self.taskId = taskId
+        self.timestamp = timestamp
+        self.kind = kind
+        self.text = text
     }
 }
 
@@ -219,6 +345,32 @@ public struct ProjectEffort: Identifiable, Codable, Hashable, Sendable {
         self.code = code
         self.name = name
         self.effortSeconds = effortSeconds
+    }
+}
+
+/// Task counts of one project (subtasks included), for the sidebar's open count and
+/// progress bar. Dropped tasks are neither left to do nor done (`progressTotal`).
+public struct ProjectCounts: Hashable, Sendable {
+    public var open = 0             // todo, in progress, waiting (not `isClosed`)
+    public var done = 0
+    public var waitingOnUser = 0    // waiting tasks that wait on the user
+
+    /// The work still counted toward progress: `done` out of this.
+    public var progressTotal: Int { open + done }
+
+    public init() {}
+
+    /// Counts per project id for `tasks`, in one pass. A project with no tasks has no entry.
+    public static func byProject(_ tasks: [TodoTask]) -> [Int64: ProjectCounts] {
+        var out: [Int64: ProjectCounts] = [:]
+        for t in tasks {
+            if !t.status.isClosed { out[t.projectId, default: ProjectCounts()].open += 1 }
+            if t.status == .done { out[t.projectId, default: ProjectCounts()].done += 1 }
+            if t.status == .waiting && t.waitingOn == .user {
+                out[t.projectId, default: ProjectCounts()].waitingOnUser += 1
+            }
+        }
+        return out
     }
 }
 

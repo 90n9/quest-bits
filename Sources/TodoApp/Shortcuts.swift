@@ -51,7 +51,7 @@ struct Shortcut: Codable, Hashable {
 /// Every rebindable command in the app.
 enum ShortcutAction: String, CaseIterable, Identifiable {
     case newTask, newProject, duplicate, delete
-    case statusTodo, statusInProgress, statusDone
+    case statusTodo, statusInProgress, statusWaitingUser, statusWaitingExternal, statusDone, statusDropped
     case timerToggle, timerSkip, timerStop
 
     var id: String { rawValue }
@@ -64,7 +64,10 @@ enum ShortcutAction: String, CaseIterable, Identifiable {
         case .delete: return "Delete Task"
         case .statusTodo: return "Mark Todo"
         case .statusInProgress: return "Mark In Progress"
+        case .statusWaitingUser: return "Mark Waiting on Me"
+        case .statusWaitingExternal: return "Mark Waiting on External"
         case .statusDone: return "Mark Done"
+        case .statusDropped: return "Mark Dropped"
         case .timerToggle: return "Start / Pause Timer"
         case .timerSkip: return "Skip Phase"
         case .timerStop: return "Stop Timer"
@@ -80,6 +83,9 @@ enum ShortcutAction: String, CaseIterable, Identifiable {
         case .statusTodo:      return Shortcut(key: "1", cmd: true, shift: false, opt: false, ctrl: false)
         case .statusInProgress:return Shortcut(key: "2", cmd: true, shift: false, opt: false, ctrl: false)
         case .statusDone:      return Shortcut(key: "3", cmd: true, shift: false, opt: false, ctrl: false)
+        case .statusWaitingUser:     return Shortcut(key: "4", cmd: true, shift: false, opt: false, ctrl: false)
+        case .statusWaitingExternal: return Shortcut(key: "5", cmd: true, shift: false, opt: false, ctrl: false)
+        case .statusDropped:         return Shortcut(key: "6", cmd: true, shift: false, opt: false, ctrl: false)
         case .timerToggle:     return Shortcut(key: "return", cmd: true, shift: false, opt: false, ctrl: false)
         case .timerSkip:       return Shortcut(key: "k", cmd: true, shift: false, opt: false, ctrl: false)
         case .timerStop:       return Shortcut(key: ".", cmd: true, shift: false, opt: false, ctrl: false)

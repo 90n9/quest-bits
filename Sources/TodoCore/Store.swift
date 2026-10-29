@@ -9,6 +9,7 @@ public enum StoreError: Error, CustomStringConvertible {
     case prepare(String)
     case step(String)
     case notFound(String)
+    case invalid(String)
 
     public var description: String {
         switch self {
@@ -16,6 +17,7 @@ public enum StoreError: Error, CustomStringConvertible {
         case .prepare(let m): return "sqlite prepare failed: \(m)"
         case .step(let m): return "sqlite step failed: \(m)"
         case .notFound(let m): return "not found: \(m)"
+        case .invalid(let m): return "invalid: \(m)"
         }
     }
 }
@@ -98,6 +100,7 @@ public final class Store: @unchecked Sendable {
             let idx = Int32(i + 1)
             switch v {
             case .int(let n): sqlite3_bind_int64(stmt, idx, n)
+            case .double(let d): sqlite3_bind_double(stmt, idx, d)
             case .text(let s): sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT)
             case .null: sqlite3_bind_null(stmt, idx)
             }
@@ -232,6 +235,102 @@ public final class Store: @unchecked Sendable {
             created_at       REAL NOT NULL
         );
         """)
+
+        // --- Additive migration: waiting status (who it waits on + why) ---
+        if !columnExists("tasks", "waiting_on") { exec("ALTER TABLE tasks ADD COLUMN waiting_on TEXT;") }
+        if !columnExists("tasks", "waiting_reason") { exec("ALTER TABLE tasks ADD COLUMN waiting_reason TEXT;") }
+        // When the task last entered waiting (the inbox's "waiting since"); NULL unless waiting.
+        if !columnExists("tasks", "waiting_since") { exec("ALTER TABLE tasks ADD COLUMN waiting_since REAL;") }
+
+        // --- Additive migration: task notes (append-only log; detail stays the spec) ---
+        // The kind list is fixed in the table's CHECK: a new NoteKind needs a table rebuild.
+        exec("""
+        CREATE TABLE IF NOT EXISTS task_notes (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            ts      REAL NOT NULL,
+            kind    TEXT NOT NULL DEFAULT 'note' CHECK(kind IN ('note','decision','review')),
+            text    TEXT NOT NULL
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_notes_task_ts ON task_notes(task_id, ts);")
+
+        // --- Additive migration: archived projects (NULL = active) ---
+        if !columnExists("projects", "archived_at") { exec("ALTER TABLE projects ADD COLUMN archived_at REAL;") }
+
+        // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
+        repairStatusFields()
+    }
+
+    /// Repair the fields that follow a task's status, on every open: rows written before
+    /// every status path went through `statusTimestampExprs`, and rows an older binary
+    /// still writes to the same file (an MCP server or app from before 1.3.0):
+    /// - done with no `completed_at`: the last status change into done, else `updated_at`;
+    /// - started (in progress or done) with no `started_at`: the first status change into
+    ///   one, capped at `completed_at`, else `completed_at`, else `updated_at`;
+    /// - not done but `completed_at` set: cleared (a reopened or dropped task);
+    /// - waiting with no `waiting_since`: the last status change into waiting, else `updated_at`;
+    /// - not waiting but `waiting_on` / `waiting_reason` / `waiting_since` set: cleared.
+    /// Each UPDATE is guarded by its own WHERE, so a healthy database is only read: one
+    /// EXISTS scan, and no write transaction unless it finds a row to fix. The fixes run
+    /// in one BEGIN IMMEDIATE (the app and MCP server can open together); on failure it
+    /// rolls back and logs, and the next open retries. Not tied to `PRAGMA user_version`
+    /// (pre-release 1.3.0 builds left it at 1 or 2; a future one-off step should use 3+).
+    private func repairStatusFields() {
+        let done = TaskStatus.done.rawValue, waiting = TaskStatus.waiting.rawValue
+        // History rows carry the raw value (create) or the display name (update).
+        let names: (TaskStatus) -> [String] = { [$0.rawValue, $0.display] }
+        let doneNames = Self.sqlList(names(.done))
+        let waitingNames = Self.sqlList(names(.waiting))
+        let startedNames = Self.sqlList(TaskStatus.allCases.filter(\.impliesStarted).flatMap(names))
+        let startedStatuses = Self.sqlList(TaskStatus.allCases.filter(\.impliesStarted).map(\.rawValue))
+        let needsDone = "status = '\(done)' AND completed_at IS NULL"
+        let needsStart = "status IN \(startedStatuses) AND started_at IS NULL"
+        let staleDone = "status != '\(done)' AND completed_at IS NOT NULL"
+        let needsWaiting = "status = '\(waiting)' AND waiting_since IS NULL"
+        let staleWaiting = "status != '\(waiting)' AND (waiting_on IS NOT NULL OR waiting_reason IS NOT NULL OR waiting_since IS NOT NULL)"
+        let any = [needsDone, needsStart, staleDone, needsWaiting, staleWaiting].map { "(\($0))" }.joined(separator: " OR ")
+        guard queryInt("SELECT EXISTS(SELECT 1 FROM tasks WHERE \(any));", []) == 1 else { return }
+        do {
+            try beginImmediate()
+            let before = sqlite3_total_changes(db)
+            // completed_at first: the started_at fill below caps at it.
+            try runWrite(
+                """
+                UPDATE tasks SET completed_at = COALESCE(
+                    (SELECT MAX(h.ts) FROM task_history h
+                     WHERE h.task_id = tasks.id AND h.field = 'status' AND h.new_value IN \(doneNames)),
+                    updated_at)
+                WHERE \(needsDone);
+                """, [])
+            // First start from history, capped at completed_at (min() is NULL if either is).
+            try runWrite(
+                """
+                UPDATE tasks SET started_at = COALESCE(min(s.ts, completed_at), s.ts, completed_at, updated_at)
+                FROM (SELECT t.id AS tid,
+                             (SELECT MIN(h.ts) FROM task_history h
+                              WHERE h.task_id = t.id AND h.field = 'status' AND h.new_value IN \(startedNames)) AS ts
+                      FROM tasks t WHERE \(needsStart)) AS s
+                WHERE s.tid = tasks.id AND \(needsStart);
+                """, [])
+            try runWrite("UPDATE tasks SET completed_at = NULL WHERE \(staleDone);", [])
+            try runWrite(
+                """
+                UPDATE tasks SET waiting_since = COALESCE(
+                    (SELECT MAX(h.ts) FROM task_history h
+                     WHERE h.task_id = tasks.id AND h.field = 'status' AND h.new_value IN \(waitingNames)),
+                    updated_at)
+                WHERE \(needsWaiting);
+                """, [])
+            try runWrite(
+                "UPDATE tasks SET waiting_on = NULL, waiting_reason = NULL, waiting_since = NULL WHERE \(staleWaiting);", [])
+            let fixed = sqlite3_total_changes(db) - before
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            NSLog("QuestBits: repaired status fields (\(fixed) row updates)")
+        } catch {
+            exec("ROLLBACK;")
+            NSLog("QuestBits: status-field repair failed, will retry on next open: \(error)")
+        }
     }
 
     /// Assign codes to any pre-existing rows that lack them.
@@ -294,7 +393,8 @@ public final class Store: @unchecked Sendable {
         return base
     }
 
-    /// A project code unique among existing projects (appends 2, 3, … on clash).
+    /// A project code unique among existing projects, archived ones included so their
+    /// codes stay reserved (appends 2, 3, … on clash).
     private func uniqueProjectCode(from name: String) -> String {
         let base = baseProjectCode(from: name)
         var candidate = base
@@ -311,32 +411,163 @@ public final class Store: @unchecked Sendable {
     @discardableResult
     public func createProject(name: String, detail: String = "") throws -> Project {
         lock.lock(); defer { lock.unlock() }
-        let now = Date()
-        let code = uniqueProjectCode(from: name)
-        try runWrite(
-            "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order) VALUES (?, ?, ?, 0, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM projects));",
-            [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970))]
-        )
-        let id = lastInsertId()
-        return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: 0)
+        // The code pick, the end-of-list sort_order and the INSERT are one read-modify-write
+        // the app and MCP server can race on (both picking the same code).
+        do {
+            try beginImmediate()
+            let now = Date()
+            let code = uniqueProjectCode(from: name)
+            guard let sortOrder = queryInt("SELECT \(Self.nextProjectSortOrderSQL);", []) else { throw StoreError.step(errmsg()) }
+            try runWrite(
+                "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order) VALUES (?, ?, ?, 0, ?, ?);",
+                [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970)), .int(sortOrder)]
+            )
+            let id = lastInsertId()
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: Int(sortOrder))
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
     }
 
-    public func listProjects() throws -> [Project] {
+    /// The sort_order after every project (archived ones too): new and unarchived projects go last.
+    private static let nextProjectSortOrderSQL = "(SELECT COALESCE(MAX(sort_order)+1,0) FROM projects)"
+
+    /// Persist a new sidebar order for the active projects (`ids` in desired order).
+    /// Inside one BEGIN IMMEDIATE it re-reads the active projects and writes a dense
+    /// sort_order 0, 1, … over them in one UPDATE: ids deleted or archived meanwhile are
+    /// skipped, and active projects missing from `ids` (e.g. just created by an agent)
+    /// keep their relative order after the given ones. Archived projects keep their
+    /// sort_order (they list after the active ones, and unarchiving puts one last).
+    public func reorderProjects(ids: [Int64]) throws {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT id, code, name, detail, created_at, sort_order FROM projects ORDER BY sort_order, id;", [])
+        do {
+            try beginImmediate()
+            var current: [Int64] = []
+            var stored: [Int64: Int64] = [:]
+            let stmt = try prepare("SELECT id, sort_order FROM projects WHERE archived_at IS NULL ORDER BY sort_order, id;", [])
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                let id = sqlite3_column_int64(stmt, 0)
+                current.append(id)
+                stored[id] = sqlite3_column_int64(stmt, 1)
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+            let active = Set(current)
+            var seen = Set<Int64>()
+            let given = ids.filter { active.contains($0) && seen.insert($0).inserted }
+            // Only rows whose position changed: an unchanged order writes nothing (no poll reload).
+            let moved = (given + current.filter { !seen.contains($0) }).enumerated()
+                .map { (id: $0.element, order: Int64($0.offset)) }
+                .filter { stored[$0.id] != $0.order }
+            if !moved.isEmpty {
+                let cases = Array(repeating: "WHEN ? THEN ?", count: moved.count).joined(separator: " ")
+                let marks = Array(repeating: "?", count: moved.count).joined(separator: ", ")
+                let binds = moved.flatMap { [SQLValue.int($0.id), .int($0.order)] } + moved.map { SQLValue.int($0.id) }
+                try runWrite("UPDATE projects SET sort_order = CASE id \(cases) END WHERE id IN (\(marks));", binds)
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Canonical project column list (order must match `projectFromRow`).
+    private static let projectCols = "id, code, name, detail, created_at, sort_order, archived_at"
+
+    /// Projects in sidebar order: active ones by sort_order (new projects go last), then
+    /// archived ones by sort_order; id breaks ties. `includeArchived: false` leaves out
+    /// archived ones.
+    public func listProjects(includeArchived: Bool = true) throws -> [Project] {
+        lock.lock(); defer { lock.unlock() }
+        let whereSQL = includeArchived ? "" : "WHERE archived_at IS NULL "
+        let stmt = try prepare(
+            "SELECT \(Self.projectCols) FROM projects \(whereSQL)ORDER BY archived_at IS NOT NULL, sort_order, id;", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Project] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            out.append(Project(
-                id: sqlite3_column_int64(stmt, 0),
-                code: colText(stmt, 1),
-                name: colText(stmt, 2),
-                detail: colText(stmt, 3),
-                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)),
-                sortOrder: Int(sqlite3_column_int64(stmt, 5))
-            ))
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(projectFromRow(stmt))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
+    }
+
+    private func projectFromRow(_ stmt: OpaquePointer?) -> Project {
+        Project(
+            id: sqlite3_column_int64(stmt, 0),
+            code: colText(stmt, 1),
+            name: colText(stmt, 2),
+            detail: colText(stmt, 3),
+            createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)),
+            sortOrder: Int(sqlite3_column_int64(stmt, 5)),
+            archivedAt: sqlite3_column_type(stmt, 6) == SQLITE_NULL
+                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
+        )
+    }
+
+    /// Archive (`archived: true`) or unarchive a project; returns it with its count of
+    /// open tasks (read in the same transaction). Idempotent: archiving an archived
+    /// project keeps its original `archived_at`, and unarchiving moves a project to the
+    /// end of the active list only when it was archived. Its tasks stay as they are, and
+    /// its code stays taken (`uniqueProjectCode` checks every project).
+    @discardableResult
+    public func setProjectArchived(id: Int64, archived: Bool) throws -> (project: Project, openTasks: Int) {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            if archived {
+                try runWrite("UPDATE projects SET archived_at = COALESCE(archived_at, ?) WHERE id=?;",
+                             [.double(Date().timeIntervalSince1970), .int(id)])
+            } else {
+                // Back at the end of the active list; an active project keeps its place.
+                try runWrite(
+                    """
+                    UPDATE projects SET archived_at = NULL, sort_order = CASE WHEN archived_at IS NULL THEN sort_order
+                        ELSE \(Self.nextProjectSortOrderSQL) END WHERE id=?;
+                    """, [.int(id)])
+            }
+            guard sqlite3_changes(db) == 1 else { throw StoreError.notFound("project \(id)") }
+            let stmt = try prepare("SELECT \(Self.projectCols) FROM projects WHERE id=?;", [.int(id)])
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.notFound("project \(id)") }
+            let project = projectFromRow(stmt)
+            let open = openTaskCountUnlocked(id)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return (project, open)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// New or moved tasks go to active projects only (the app's move/copy menus list no
+    /// archived ones), so new work never lands out of cross-project lists. Reading and
+    /// updating tasks already in an archived project stays allowed, and so does a
+    /// recurring task's next occurrence or a duplicate within its own project.
+    /// App and MCP share this one rule; callers hold the lock (and, for a write that
+    /// follows, BEGIN IMMEDIATE so an archive can't land in between).
+    private func requireActiveProjectUnlocked(_ projectId: Int64) throws {
+        guard let archived = queryInt("SELECT archived_at IS NOT NULL FROM projects WHERE id=?;",
+                                      [.int(projectId)]) else {
+            throw StoreError.notFound("project \(projectId)")
+        }
+        if archived != 0 {
+            let code = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "\(projectId)"
+            throw StoreError.invalid("project \(code) is archived; unarchive it first")
+        }
+    }
+
+    /// How many of a project's tasks (subtasks included) are still open (not `isClosed`);
+    /// the same rule as `ProjectCounts.open`.
+    private func openTaskCountUnlocked(_ projectId: Int64) -> Int {
+        Int(queryInt("SELECT COUNT(*) FROM tasks WHERE project_id=? AND status NOT IN \(Self.closedStatusSQL);",
+                     [.int(projectId)]) ?? 0)
     }
 
     /// Update a project's name and/or description (only provided fields change).
@@ -369,28 +600,56 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since"
+    /// `taskCols` qualified with `tasks.`, for queries that join another table.
+    private static let qualifiedTaskCols = taskCols.components(separatedBy: ", ").map { "tasks.\($0)" }.joined(separator: ", ")
+    /// How many columns `taskCols` selects: the index of a column a query adds after them.
+    private static let taskColCount = Int32(taskCols.components(separatedBy: ", ").count)
 
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
-                           status: TaskStatus = .todo, priority: Priority = .none,
+                           status: TaskStatus = .todo, waitingOn: WaitingOn? = nil, waitingReason: String? = nil,
+                           priority: Priority = .none,
                            dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                            parentId: Int64? = nil, estimateSeconds: Int = 0) throws -> TodoTask {
         lock.lock(); defer { lock.unlock() }
-        return try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
-                                      status: status, priority: priority, dueDate: dueDate, tags: tags,
-                                      recurrence: recurrence, parentId: parentId, estimateSeconds: estimateSeconds)
+        // The task_seq bump, its read-back and the INSERT are one read-modify-write the
+        // app and MCP server can race on (both reading the same seq → duplicate codes).
+        do {
+            try beginImmediate()
+            try requireActiveProjectUnlocked(projectId)
+            let task = try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
+                                              status: status, waitingOn: waitingOn, waitingReason: waitingReason,
+                                              priority: priority, dueDate: dueDate, tags: tags,
+                                              recurrence: recurrence, parentId: parentId, estimateSeconds: estimateSeconds)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return task
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
     }
 
-    /// Insert a task without taking the lock — for use inside already-locked methods
-    /// (e.g. spawning the next occurrence of a recurring task from updateTask).
+    /// Insert a task without taking the lock or opening a transaction — for use inside
+    /// already-locked methods (e.g. spawning the next occurrence of a recurring task from
+    /// updateTask, which already holds BEGIN IMMEDIATE).
+    /// `source` (duplicates) seeds the status timestamps: the rule runs as if moving the
+    /// source's row to `status`, so a copy of a done task keeps its original times rather
+    /// than counting as a new completion. Without it the task starts from an empty todo.
     @discardableResult
     private func createTaskUnlocked(projectId: Int64, title: String, detail: String = "", link: String? = nil,
-                                    status: TaskStatus = .todo, priority: Priority = .none,
+                                    status: TaskStatus = .todo, waitingOn: WaitingOn? = nil, waitingReason: String? = nil,
+                                    priority: Priority = .none,
                                     dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                                     parentId: Int64? = nil, estimateSeconds: Int = 0,
+                                    timestampsFrom source: TodoTask? = nil,
                                     enforceNesting: Bool = true) throws -> TodoTask {
         let now = Date()
+        let reason = waitingReason.flatMap { $0.isEmpty ? nil : $0 }
+        if let msg = Self.waitingViolation(status: status, waitingOn: waitingOn,
+                                           settingWaitingFields: Self.setsWaitingFields(waitingOn, reason)) {
+            throw StoreError.invalid(msg)
+        }
         // Enforce the one-level nesting invariant at the data layer so EVERY caller
         // (MCP, UI, recurrence spawn) is covered: a parent must itself be top-level.
         // moveTask's cascade and the recurrence subtask-clone only walk direct children,
@@ -412,43 +671,116 @@ public final class Store: @unchecked Sendable {
         let pcode = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "PRJ"
         let code = "\(pcode)-\(seq)"
         let due: SQLValue = dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null
+        let nowSecs = Int64(now.timeIntervalSince1970)
+        let secs: (Date?) -> SQLValue = { $0.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null }
+        // started_at/completed_at/waiting_since come from the shared status rule, evaluated
+        // over a one-row "prior" table (the source's status + timestamps, or an empty todo).
+        // The prior waiting_since is always NULL: a waiting copy is a new ask, waiting from now.
+        let ts = Self.statusTimestampExprs(status, now: nowSecs)
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, link, status, priority, due_date, tags, recurrence, parent_id, estimate_seconds, created_at, updated_at, sort_order)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?));
+            INSERT INTO tasks (project_id, code, title, detail, link, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, started_at, completed_at, waiting_since, created_at, updated_at, sort_order)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(ts.startedAt), \(ts.completedAt), \(ts.waitingSince), ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)
+            FROM (SELECT ? AS status, ? AS started_at, ? AS completed_at, NULL AS waiting_since);
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
-             .text(status.rawValue), .text(priority.rawValue), due, .text(encodeTags(tags)),
+             .text(status.rawValue), waitingOn.map { .text($0.rawValue) } ?? .null, reason.map(SQLValue.text) ?? .null,
+             .text(priority.rawValue), due, .text(encodeTags(tags)),
              effectiveRecurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
-             .int(Int64(max(0, estimateSeconds))),
-             .int(Int64(now.timeIntervalSince1970)), .int(Int64(now.timeIntervalSince1970)), .int(projectId)]
+             .int(Int64(max(0, estimateSeconds)))]
+            + ts.binds
+            + [.int(nowSecs), .int(nowSecs), .int(projectId),
+               .text((source?.status ?? .todo).rawValue), secs(source?.startedAt), secs(source?.completedAt)]
         )
         let id = lastInsertId()
         logEvent(id, "created", "", title)
-        if status != .todo { logEvent(id, "status", "todo", status.rawValue) }
-        return TodoTask(id: id, code: code, projectId: projectId, title: title, detail: detail, link: link,
-                        status: status, priority: priority, dueDate: dueDate, tags: tags,
-                        recurrence: effectiveRecurrence, effortSeconds: 0, estimateSeconds: max(0, estimateSeconds),
-                        parentId: parentId, createdAt: now, updatedAt: now, sortOrder: 0)
+        if status != .todo { logEvent(id, "status", TaskStatus.todo.display, status.display) }
+        if let waitingOn { logEvent(id, "waiting on", "", waitingOn.rawValue) }
+        guard let task = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        return task
     }
 
+    /// One project's tasks, or every task (archived projects too) when `projectId` is nil,
+    /// in board order (`boardOrderSQL`).
     public func listTasks(projectId: Int64? = nil) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
-        let sql: String
-        let binds: [SQLValue]
         if let pid = projectId {
-            sql = "SELECT \(Self.taskCols) FROM tasks WHERE project_id=? ORDER BY sort_order, id;"
-            binds = [.int(pid)]
-        } else {
-            sql = "SELECT \(Self.taskCols) FROM tasks ORDER BY project_id, sort_order, id;"
-            binds = []
+            return try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE project_id=? ORDER BY sort_order, id;", [.int(pid)])
         }
+        return try readTasks(
+            "SELECT \(Self.qualifiedTaskCols) FROM tasks \(Self.projectJoinSQL) ORDER BY \(Self.boardOrderSQL);", [])
+    }
+
+    /// Tasks matching `filter`, filtered in SQL and ordered by status (`TaskStatus.listRank`:
+    /// in progress, waiting, todo, done, dropped), then board order (`boardOrderSQL`).
+    /// Values are bound, never interpolated.
+    public func listTasks(matching filter: TaskFilter) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        var conds: [String] = []
+        var binds: [SQLValue] = []
+        if let pid = filter.projectId {
+            conds.append("project_id=?"); binds.append(.int(pid))
+        }
+        if let statuses = filter.statuses {
+            // An empty set matches nothing rather than everything.
+            conds.append(statuses.isEmpty ? "0" : "status IN (\(Self.placeholders(statuses.count)))")
+            binds += statuses.map { .text($0.rawValue) }
+        }
+        if let tag = filter.tag {
+            // Tags are stored comma-joined (encodeTags trims them; spaces around commas are
+            // also dropped here in case an older row kept them). Wrap both sides in commas
+            // so only a whole tag matches; instr, not LIKE, so % and _ are literal.
+            // lower() folds ASCII letters only.
+            conds.append("instr(',' || lower(REPLACE(REPLACE(trim(tags), ', ', ','), ' ,', ',')) || ',', "
+                         + "',' || lower(?) || ',') > 0")
+            binds.append(.text(tag))
+        }
+        if let parentId = filter.parentId {
+            conds.append("parent_id=?"); binds.append(.int(parentId))
+        }
+        if filter.projectId == nil && filter.parentId == nil && !filter.includeArchived {
+            conds.append(Self.activeProjectSQL)
+        }
+        let whereSQL = conds.isEmpty ? "" : "WHERE " + conds.joined(separator: " AND ")
+        return try readTasks(
+            "SELECT \(Self.qualifiedTaskCols) FROM tasks \(Self.projectJoinSQL) \(whereSQL) "
+            + "ORDER BY \(Self.statusRankSQL), \(Self.boardOrderSQL);", binds)
+    }
+
+    /// Run a `taskCols` SELECT and read every row; a step error throws instead of
+    /// returning a partial list. Caller holds the lock.
+    private func readTasks(_ sql: String, _ binds: [SQLValue]) throws -> [TodoTask] {
         let stmt = try prepare(sql, binds)
         defer { sqlite3_finalize(stmt) }
         var out: [TodoTask] = []
-        while sqlite3_step(stmt) == SQLITE_ROW { out.append(taskFromRow(stmt)) }
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(taskFromRow(stmt))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
     }
+
+    /// The task's project is not archived — for cross-project task lists (a WHERE
+    /// condition over the `tasks` table's `project_id`).
+    static let activeProjectSQL = "project_id NOT IN (SELECT id FROM projects WHERE archived_at IS NOT NULL)"
+    /// The same rule as `activeProjectSQL`, as a join that also brings the project in as
+    /// `p` (for its code). Change the two together.
+    static let activeProjectJoinSQL = "JOIN projects p ON p.id = tasks.project_id AND p.archived_at IS NULL"
+
+    /// Brings each task's project in as `p`, for `boardOrderSQL`. Task columns in WHERE
+    /// clauses stay unqualified: none of them is also a `projects` column.
+    private static let projectJoinSQL = "JOIN projects p ON p.id = tasks.project_id"
+    /// Cross-project task order: projects in sidebar order (`listProjects`: active ones by
+    /// sort_order, then archived ones), then each project's own task order.
+    private static let boardOrderSQL =
+        "p.archived_at IS NOT NULL, p.sort_order, p.id, tasks.sort_order, tasks.id"
+
+    /// `TaskStatus.listRank` as a SQL expression over the `status` column.
+    private static let statusRankSQL = "CASE status "
+        + TaskStatus.allCases.map { "WHEN '\($0.rawValue)' THEN \($0.listRank) " }.joined()
+        + "ELSE \(TaskStatus.allCases.count) END"
 
     /// Subtasks of a parent task, ordered like the main list.
     public func subtasks(parentId: Int64) throws -> [TodoTask] {
@@ -466,11 +798,13 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Completion progress of a parent's subtasks: (done, total).
+    /// Completion progress of a parent's subtasks: (done, total). Dropped subtasks are
+    /// left out of both — they are no longer part of the work.
     public func subtaskProgress(parentId: Int64) throws -> (done: Int, total: Int) {
         lock.lock(); defer { lock.unlock() }
         let stmt = try prepare(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),0) FROM tasks WHERE parent_id=?;",
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='\(TaskStatus.done.rawValue)' THEN 1 ELSE 0 END),0) "
+            + "FROM tasks WHERE parent_id=? AND status != '\(TaskStatus.dropped.rawValue)';",
             [.int(parentId)]
         )
         defer { sqlite3_finalize(stmt) }
@@ -517,13 +851,37 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Ids of all tasks currently In Progress (across projects) — for effort accrual.
+    /// Ids of tasks currently In Progress in projects not archived — for effort accrual
+    /// (only the tasks the In Progress view and menu bar show earn focus time).
     public func inProgressTaskIds() throws -> [Int64] {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT id FROM tasks WHERE status='in_progress';", [])
+        let stmt = try prepare("SELECT id FROM tasks WHERE status='in_progress' AND \(Self.activeProjectSQL);", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Int64] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }
+        return out
+    }
+
+    /// The inbox: waiting tasks that wait on the user — plus those waiting on a third party
+    /// with `includeExternal` — across every project not archived, each with its project's
+    /// code. Longest waiting first: `waiting_since` (falling back to `updated_at` for a row
+    /// an older build set waiting without it), then id. Filtered and sorted in SQL.
+    public func inbox(includeExternal: Bool = false) throws -> [(task: TodoTask, projectCode: String)] {
+        lock.lock(); defer { lock.unlock() }
+        let who: [WaitingOn] = includeExternal ? [.user, .external] : [.user]
+        let stmt = try prepare(
+            "SELECT \(Self.qualifiedTaskCols), p.code FROM tasks \(Self.activeProjectJoinSQL) "
+            + "WHERE tasks.status=? AND tasks.waiting_on IN (\(Self.placeholders(who.count))) "
+            + "ORDER BY COALESCE(tasks.waiting_since, tasks.updated_at), tasks.id;",
+            [.text(TaskStatus.waiting.rawValue)] + who.map { .text($0.rawValue) })
+        defer { sqlite3_finalize(stmt) }
+        var out: [(task: TodoTask, projectCode: String)] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append((taskFromRow(stmt), colText(stmt, Self.taskColCount)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
     }
 
@@ -539,12 +897,161 @@ public final class Store: @unchecked Sendable {
         return queryInt("SELECT id FROM tasks WHERE code=? COLLATE NOCASE;", [.text(code)])
     }
 
+    /// The one timestamp rule for a status write: SQL expressions for the new
+    /// `started_at` / `completed_at` / `waiting_since`, evaluated against the prior row's
+    /// `status` and those columns (an UPDATE's SET sees the pre-update row; createTask
+    /// supplies a one-row prior table). `binds` follow the started, completed, waiting order.
+    /// Every path that writes a status uses it — updateTask, and createTask for the initial
+    /// status, so duplicates, templates and recurrence spawns too:
+    /// - started_at: stamped once on entering a status that `impliesStarted`; never cleared.
+    /// - completed_at: stamped on entering done (kept if already done); cleared otherwise —
+    ///   dropped included, since abandoning a task is not a completion.
+    /// - waiting_since: stamped on entering waiting (kept while it stays waiting, also when
+    ///   who it waits on changes); cleared on any other status.
+    private static func statusTimestampExprs(_ status: TaskStatus, now: Int64)
+        -> (startedAt: String, completedAt: String, waitingSince: String, binds: [SQLValue]) {
+        var binds: [SQLValue] = []
+        var started = "started_at"
+        if status.impliesStarted { started = "COALESCE(started_at, ?)"; binds.append(.int(now)) }
+        var completed = "NULL"
+        if status == .done {
+            completed = "CASE WHEN status='\(TaskStatus.done.rawValue)' AND completed_at IS NOT NULL THEN completed_at ELSE ? END"
+            binds.append(.int(now))
+        }
+        var waiting = "NULL"
+        if status == .waiting {
+            waiting = "CASE WHEN status='\(TaskStatus.waiting.rawValue)' AND waiting_since IS NOT NULL THEN waiting_since ELSE ? END"
+            binds.append(.int(now))
+        }
+        return (started, completed, waiting, binds)
+    }
+
+    /// The waiting rule, shared by createTask and every update path: a `waiting` task
+    /// must say who it waits on, and only a waiting task may carry waiting_on /
+    /// waiting_reason. `status` and `waitingOn` are the values the row would end up with.
+    /// Returns the violation, or nil when the combination is valid.
+    private static func waitingViolation(status: TaskStatus, waitingOn: WaitingOn?,
+                                         settingWaitingFields: Bool) -> String? {
+        if status == .waiting {
+            return waitingOn == nil ? "status waiting needs waiting_on (user or external)" : nil
+        }
+        return settingWaitingFields
+            ? "waiting_on / waiting_reason only apply to a waiting task (set status: waiting)" : nil
+    }
+
+    /// Does a write set waiting fields? A who, or a non-empty reason — clearing a
+    /// reason is harmless on any task.
+    private static func setsWaitingFields(_ waitingOn: WaitingOn?, _ waitingReason: String??) -> Bool {
+        waitingOn != nil || !((waitingReason ?? nil) ?? "").isEmpty
+    }
+
+    /// `waitingOn` nil leaves it alone (it cannot be cleared while waiting);
+    /// `waitingReason` .some(nil) or .some("") clears the reason. Any status other than
+    /// waiting clears both, and setting either on a task that will not be waiting is an error.
     public func updateTask(id: Int64, title: String? = nil, detail: String? = nil, link: String?? = nil,
                            status: TaskStatus? = nil, priority: Priority? = nil,
                            dueDate: Date?? = nil, tags: [String]? = nil, recurrence: String?? = nil,
-                           estimateSeconds: Int? = nil) throws {
+                           estimateSeconds: Int? = nil,
+                           waitingOn: WaitingOn? = nil, waitingReason: String?? = nil) throws {
         lock.lock(); defer { lock.unlock() }
-        let old = getTaskUnlocked(id)
+        let apply = { [self] (spawnRecurrence: Bool) in
+            try applyTaskUpdateUnlocked(
+                id: id, title: title, detail: detail, link: link, status: status, priority: priority,
+                dueDate: dueDate, tags: tags, recurrence: recurrence, estimateSeconds: estimateSeconds,
+                waitingOn: waitingOn, waitingReason: waitingReason, spawnRecurrence: spawnRecurrence)
+        }
+        // Writes that depend on the stored row run inside BEGIN IMMEDIATE, re-read there:
+        // any status write (its history row names the status it replaced, a move to done
+        // may spawn the next occurrence — two processes could each spawn one), and the
+        // waiting rule depends on whether the task is already waiting.
+        let needsTransaction = status != nil || Self.setsWaitingFields(waitingOn, waitingReason)
+        guard needsTransaction else { return try apply(true) }
+        do {
+            try beginImmediate()
+            try apply(true)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            // Clear any transaction left open (a failed COMMIT, or a BEGIN that hit an
+            // already-open connection) so the shared connection is never poisoned for
+            // later writes. ROLLBACK is a harmless no-op when no transaction is active.
+            exec("ROLLBACK;")
+            // Degrade gracefully: still mark the task done even if the atomic spawn could
+            // not run under write contention. A missed occurrence beats a failed mark-done
+            // or a stuck connection; nothing is orphaned (rolled back above). Only for a
+            // write failure — a rejected or missing task is reported as is.
+            guard status == .done, let e = error as? StoreError, case .step = e else { throw error }
+            try apply(false)
+        }
+    }
+
+    /// Apply one update to many tasks in a single BEGIN IMMEDIATE, all or nothing:
+    /// every task is checked (waiting rule, existence) and written inside the
+    /// transaction, so one bad task leaves the whole batch unchanged. `addTags` merges
+    /// into each task's tags (keeps existing). Same field semantics as `updateTask`.
+    /// `waitingOnDefault`: a move to waiting without `waitingOn` keeps each task's own
+    /// who, and a task waiting on no one takes this one (nil = such a task is an error).
+    public func bulkUpdateTasks(ids: [Int64], status: TaskStatus? = nil, priority: Priority? = nil,
+                                dueDate: Date?? = nil, addTags: [String]? = nil,
+                                waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
+                                waitingReason: String?? = nil) throws {
+        lock.lock(); defer { lock.unlock() }
+        let apply = { [self] (spawnRecurrence: Bool) in
+            try beginImmediate()
+            for id in ids {
+                do {
+                    try applyTaskUpdateUnlocked(id: id, status: status, priority: priority, dueDate: dueDate,
+                                                addTags: addTags, waitingOn: waitingOn, waitingOnDefault: waitingOnDefault,
+                                                waitingReason: waitingReason, spawnRecurrence: spawnRecurrence)
+                } catch StoreError.invalid(let msg) {
+                    // Name the task that failed the batch.
+                    let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(id)]) ?? "task \(id)"
+                    throw StoreError.invalid("\(code): \(msg)")
+                }
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        }
+        do {
+            try apply(true)
+        } catch {
+            exec("ROLLBACK;")
+            // Degrade as updateTask does: on a write failure in a move to done, retry the
+            // whole batch without spawning recurrences — still one transaction, so the
+            // batch stays all or nothing. A rejected or missing task is reported as is.
+            guard status == .done, let e = error as? StoreError, case .step = e else { throw error }
+            do {
+                try apply(false)
+            } catch {
+                exec("ROLLBACK;")
+                throw error
+            }
+        }
+    }
+
+    /// The one task-update path, without taking the lock or opening a transaction: the
+    /// callers above decide that. Reads the row, checks the waiting rule against it,
+    /// writes, spawns the next occurrence on a recurring task's move into done (when
+    /// `spawnRecurrence`), and logs history — all against the same read, so inside a
+    /// caller's transaction the check, write and log see one consistent row.
+    private func applyTaskUpdateUnlocked(id: Int64, title: String? = nil, detail: String? = nil, link: String?? = nil,
+                                         status: TaskStatus? = nil, priority: Priority? = nil,
+                                         dueDate: Date?? = nil, tags: [String]? = nil, addTags: [String]? = nil,
+                                         recurrence: String?? = nil, estimateSeconds: Int? = nil,
+                                         waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
+                                         waitingReason: String?? = nil, spawnRecurrence: Bool) throws {
+        guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        // A move to waiting with no who keeps the task's own, else takes the default.
+        let waitingOn = waitingOn ?? (status == .waiting && old.waitingOn == nil ? waitingOnDefault : nil)
+        if let msg = Self.waitingViolation(status: status ?? old.status, waitingOn: waitingOn ?? old.waitingOn,
+                                           settingWaitingFields: Self.setsWaitingFields(waitingOn, waitingReason)) {
+            throw StoreError.invalid(msg)
+        }
+        var tags = tags
+        if let addTags {
+            // Only a merge that adds something writes (and bumps updated_at).
+            let current = tags ?? old.tags
+            let merged = Self.mergeTags(current, addTags)
+            if merged != current { tags = merged }
+        }
         let now = Int64(Date().timeIntervalSince1970)
         var sets: [String] = []
         var binds: [SQLValue] = []
@@ -553,9 +1060,16 @@ public final class Store: @unchecked Sendable {
         if let link { sets.append("link=?"); binds.append(link.map(SQLValue.text) ?? .null) }
         if let status {
             sets.append("status=?"); binds.append(.text(status.rawValue))
-            // Auto timestamps on transition.
-            if status == .inProgress { sets.append("started_at=COALESCE(started_at, ?)"); binds.append(.int(now)) }
-            if status == .done { sets.append("completed_at=?"); binds.append(.int(now)) }
+            let ts = Self.statusTimestampExprs(status, now: now)
+            sets += ["started_at=\(ts.startedAt)", "completed_at=\(ts.completedAt)", "waiting_since=\(ts.waitingSince)"]
+            binds += ts.binds
+            // Leaving waiting (or any non-waiting status write) clears what it waited on.
+            if status != .waiting { sets += ["waiting_on=NULL", "waiting_reason=NULL"] }
+        }
+        if let waitingOn { sets.append("waiting_on=?"); binds.append(.text(waitingOn.rawValue)) }
+        if let waitingReason {
+            sets.append("waiting_reason=?")
+            binds.append(waitingReason.flatMap { $0.isEmpty ? nil : .text($0) } ?? .null)
         }
         if let priority { sets.append("priority=?"); binds.append(.text(priority.rawValue)) }
         if let dueDate { sets.append("due_date=?"); binds.append(dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null) }
@@ -563,7 +1077,7 @@ public final class Store: @unchecked Sendable {
         if let recurrence {
             // Ignore a non-nil recurrence on a subtask (subtasks must not recur —
             // it would spawn a detached top-level dupe). Clearing (nil) is allowed.
-            if !((old?.parentId != nil) && recurrence != nil) {
+            if !(old.parentId != nil && recurrence != nil) {
                 sets.append("recurrence=?"); binds.append(recurrence.map(SQLValue.text) ?? .null)
             }
         }
@@ -571,81 +1085,63 @@ public final class Store: @unchecked Sendable {
         guard !sets.isEmpty else { return }
         sets.append("updated_at=?"); binds.append(.int(now))
         binds.append(.int(id))
-        let updateSQL = "UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?;"
+        try runWrite("UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
 
         // Recurrence: when a recurring, top-level task transitions INTO done, spawn the
         // next occurrence (fresh todo) with its due date advanced by the interval.
         // Effective recurrence: a value set in this same update wins, else the stored one.
+        // `old` was read before the write, so only a genuine todo/in_progress/waiting/dropped
+        // -> done transition spawns (the caller's BEGIN IMMEDIATE keeps that read current).
+        // Dropping a recurring task ends the series: no next occurrence.
         let effectiveRecurrence: String?
-        if let recurrence { effectiveRecurrence = recurrence } else { effectiveRecurrence = old?.recurrence }
-        let mayRecur = status == .done && old != nil && (old?.parentId == nil)
-            && (effectiveRecurrence.map { !$0.isEmpty } ?? false)
-
-        if mayRecur, let old {
-            // The done-transition write + occurrence spawn is a read-modify-write that
-            // two processes (app + MCP) can race on, each spawning an occurrence. Wrap
-            // both in a single BEGIN IMMEDIATE and re-check inside that the task was not
-            // already done, so only a genuine todo/in_progress -> done transition spawns.
-            do {
-                try beginImmediate()
-                let currentStatus = queryString("SELECT status FROM tasks WHERE id=?;", [.int(id)])
-                try runWrite(updateSQL, binds)
-                if currentStatus != TaskStatus.done.rawValue,
-                   let rule = effectiveRecurrence, !rule.isEmpty,
-                   let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
-                    let spawned = try createTaskUnlocked(
-                        projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
-                        status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
-                        estimateSeconds: old.estimateSeconds
-                    )
-                    logEvent(spawned.id, "recurrence", "", rule)
-                    // Carry the completed task's checklist: clone each direct subtask as a
-                    // fresh todo under the new occurrence (title/detail/priority/tags/estimate).
-                    // spawned is known top-level, so skip the redundant per-subtask nesting check.
-                    for sub in subtasksUnlocked(old.id) {
-                        _ = try createTaskUnlocked(
-                            projectId: spawned.projectId, title: sub.title, detail: sub.detail, link: nil,
-                            status: .todo, priority: sub.priority, dueDate: nil, tags: sub.tags,
-                            recurrence: nil, parentId: spawned.id, estimateSeconds: sub.estimateSeconds,
-                            enforceNesting: false
-                        )
-                    }
-                }
-                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            } catch {
-                // Clear any transaction left open (a failed COMMIT, or a BEGIN that hit an
-                // already-open connection) so the shared connection is never poisoned for
-                // later writes. ROLLBACK is a harmless no-op when no transaction is active.
-                exec("ROLLBACK;")
-                // Degrade gracefully: still mark the task done even if the atomic spawn
-                // could not run under write contention. A missed occurrence beats a failed
-                // mark-done or a stuck connection; nothing is orphaned (rolled back above).
-                try runWrite(updateSQL, binds)
+        if let recurrence { effectiveRecurrence = recurrence } else { effectiveRecurrence = old.recurrence }
+        if spawnRecurrence, status == .done, old.status != .done, old.parentId == nil,
+           let rule = effectiveRecurrence, !rule.isEmpty,
+           let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
+            let spawned = try createTaskUnlocked(
+                projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
+                status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
+                estimateSeconds: old.estimateSeconds
+            )
+            logEvent(spawned.id, "recurrence", "", rule)
+            // Carry the completed task's checklist: clone each direct subtask as a
+            // fresh todo under the new occurrence (title/detail/priority/tags/estimate).
+            // spawned is known top-level, so skip the redundant per-subtask nesting check.
+            for sub in subtasksUnlocked(old.id) {
+                _ = try createTaskUnlocked(
+                    projectId: spawned.projectId, title: sub.title, detail: sub.detail, link: nil,
+                    status: .todo, priority: sub.priority, dueDate: nil, tags: sub.tags,
+                    recurrence: nil, parentId: spawned.id, estimateSeconds: sub.estimateSeconds,
+                    enforceNesting: false
+                )
             }
-        } else {
-            try runWrite(updateSQL, binds)
         }
 
         // History: log discrete-field changes (skip free-text title/detail — autosave makes them noisy).
-        if let old {
-            if let status, status != old.status { logEvent(id, "status", old.status.display, status.display) }
-            if let priority, priority != old.priority { logEvent(id, "priority", old.priority.display, priority.display) }
-            if let link {
-                let nv = link ?? ""
-                if nv != (old.link ?? "") { logEvent(id, "link", old.link ?? "", nv) }
-            }
-            if let dueDate {
-                let nv = dueDate.map(Self.shortDate) ?? ""
-                let ov = old.dueDate.map(Self.shortDate) ?? ""
-                if nv != ov { logEvent(id, "due date", ov, nv) }
-            }
-            if let tags, tags != old.tags {
-                logEvent(id, "tags", old.tags.joined(separator: ", "), tags.joined(separator: ", "))
-            }
-            if let estimateSeconds, max(0, estimateSeconds) != old.estimateSeconds {
-                let fmt: (Int) -> String = { $0 == 0 ? "none" : "\($0 / 60)m" }
-                logEvent(id, "estimate", fmt(old.estimateSeconds), fmt(max(0, estimateSeconds)))
-            }
+        if let status, status != old.status { logEvent(id, "status", old.status.display, status.display) }
+        // waiting_on is logged by raw value (user / external); waiting_reason is free text
+        // (like title/detail) and is not logged.
+        // Leaving waiting clears it, but the status row already says so: log only a new who.
+        let newWaitingOn = (status.map { $0 != .waiting } ?? false) ? nil : (waitingOn ?? old.waitingOn)
+        if let newWaitingOn, newWaitingOn != old.waitingOn {
+            logEvent(id, "waiting on", old.waitingOn?.rawValue ?? "", newWaitingOn.rawValue)
+        }
+        if let priority, priority != old.priority { logEvent(id, "priority", old.priority.display, priority.display) }
+        if let link {
+            let nv = link ?? ""
+            if nv != (old.link ?? "") { logEvent(id, "link", old.link ?? "", nv) }
+        }
+        if let dueDate {
+            let nv = dueDate.map(Self.shortDate) ?? ""
+            let ov = old.dueDate.map(Self.shortDate) ?? ""
+            if nv != ov { logEvent(id, "due date", ov, nv) }
+        }
+        if let tags, tags != old.tags {
+            logEvent(id, "tags", old.tags.joined(separator: ", "), tags.joined(separator: ", "))
+        }
+        if let estimateSeconds, max(0, estimateSeconds) != old.estimateSeconds {
+            let fmt: (Int) -> String = { $0 == 0 ? "none" : "\($0 / 60)m" }
+            logEvent(id, "estimate", fmt(old.estimateSeconds), fmt(max(0, estimateSeconds)))
         }
     }
 
@@ -664,37 +1160,99 @@ public final class Store: @unchecked Sendable {
 
     /// Duplicate a task. With no target it clones into the same project; with a
     /// target project id it copies there (original kept). The copy gets a fresh code.
-    /// Composes getTask/createTask (each takes the lock) — must NOT hold the lock here.
+    /// A duplicate within the same project is for reuse: a fresh todo with no
+    /// start/completion times or waiting fields, so it never counts as another completion.
+    /// A copy to another project carries the record over as is: status, waiting fields
+    /// and started/completed times; a waiting copy is a new ask, so its waiting_since is
+    /// now. App and MCP share this one rule. Copying into an archived project is refused;
+    /// a duplicate within its own (even archived) project is not.
     @discardableResult
     public func duplicateTask(id: Int64, toProjectId: Int64? = nil) throws -> TodoTask {
-        let t = try getTask(id: id)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let copy = try duplicateTaskUnlocked(id: id, toProjectId: toProjectId)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return copy
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// `duplicateTask` without taking the lock or opening a transaction: the source is
+    /// read, the target checked and the copy inserted against the caller's BEGIN IMMEDIATE.
+    private func duplicateTaskUnlocked(id: Int64, toProjectId: Int64?) throws -> TodoTask {
+        guard let t = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
         let targetProject = toProjectId ?? t.projectId
+        let keepStatus = targetProject != t.projectId
+        if keepStatus { try requireActiveProjectUnlocked(targetProject) }
         // Within the same project a copy stays a subtask of the same parent; copying
         // to a different project would leave the child dangling (parent isn't moving),
         // so it becomes a top-level task instead.
         let newParentId: Int64? = (targetProject == t.projectId) ? t.parentId : nil
-        // Clone all planning fields; effort/started/completed reset to zero (createTask
-        // treats every new task as fresh work — it never carries effort or timestamps).
-        return try createTask(
+        // Clone all planning fields; effort resets to zero. With keepStatus, started/completed
+        // follow the status rule seeded from the source (timestampsFrom), so the copy keeps
+        // the original's times rather than being stamped today.
+        return try createTaskUnlocked(
             projectId: targetProject,
             title: t.title,
             detail: t.detail,
             link: t.link,
-            status: t.status,
+            status: keepStatus ? t.status : .todo,
+            waitingOn: keepStatus ? t.waitingOn : nil,
+            waitingReason: keepStatus ? t.waitingReason : nil,
             priority: t.priority,
             dueDate: t.dueDate,
             tags: t.tags,
             recurrence: t.recurrence,
             parentId: newParentId,
-            estimateSeconds: t.estimateSeconds
+            estimateSeconds: t.estimateSeconds,
+            timestampsFrom: keepStatus ? t : nil
         )
     }
 
     /// Move a task to another project, placing it at the end of that project's list.
-    /// The code is left unchanged so existing references stay valid.
+    /// The code is left unchanged so existing references stay valid. The target must not
+    /// be archived (unless the task is already in it); checked inside BEGIN IMMEDIATE.
     public func moveTask(id: Int64, toProjectId: Int64) throws {
         lock.lock(); defer { lock.unlock() }
-        let oldCode = getTaskUnlocked(id).flatMap { queryString("SELECT code FROM projects WHERE id=?;", [.int($0.projectId)]) } ?? ""
+        do {
+            try beginImmediate()
+            try moveTaskUnlocked(id: id, toProjectId: toProjectId)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Move or copy many tasks to one project in a single BEGIN IMMEDIATE, all or
+    /// nothing: each task goes through `moveTaskUnlocked` or `duplicateTaskUnlocked`, so
+    /// a missing task or an archived target leaves every task as it was. `copy` follows
+    /// `duplicateTask`'s rule; the copies are returned in `ids` order (none for a move).
+    @discardableResult
+    public func bulkMoveTasks(ids: [Int64], toProjectId: Int64, copy: Bool) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            var copies: [TodoTask] = []
+            for id in ids {
+                if copy { copies.append(try duplicateTaskUnlocked(id: id, toProjectId: toProjectId)) }
+                else { try moveTaskUnlocked(id: id, toProjectId: toProjectId) }
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return copies
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func moveTaskUnlocked(id: Int64, toProjectId: Int64) throws {
+        guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        if old.projectId != toProjectId { try requireActiveProjectUnlocked(toProjectId) }
+        let oldCode = queryString("SELECT code FROM projects WHERE id=?;", [.int(old.projectId)]) ?? ""
         let newCode = queryString("SELECT code FROM projects WHERE id=?;", [.int(toProjectId)]) ?? ""
         let now = Int64(Date().timeIntervalSince1970)
         try runWrite(
@@ -724,14 +1282,70 @@ public final class Store: @unchecked Sendable {
         }
     }
 
-    /// Merge tags into a task (keeps existing, adds new uniquely). Composes get/update.
-    public func addTags(toTaskId id: Int64, tags: [String]) throws {
-        let t = try getTask(id: id)
-        var merged = t.tags
-        for tag in tags.map({ $0.trimmingCharacters(in: .whitespaces) }) where !tag.isEmpty && !merged.contains(tag) {
+    /// The one tag-merge rule: `existing` plus each trimmed, non-empty tag of `add`
+    /// not already present, in order.
+    private static func mergeTags(_ existing: [String], _ add: [String]) -> [String] {
+        var merged = existing
+        for tag in add.map({ $0.trimmingCharacters(in: .whitespaces) }) where !tag.isEmpty && !merged.contains(tag) {
             merged.append(tag)
         }
-        try updateTask(id: id, tags: merged)
+        return merged
+    }
+
+    // MARK: - Notes
+
+    /// Append a note to a task: a single INSERT, never a read-modify-write of the task,
+    /// so concurrent writers cannot lose each other's notes. The same transaction bumps
+    /// the task's `updated_at` (a note is activity on the task), which doubles as the
+    /// existence check. Not logged to task_history. Text is trimmed and must not be empty.
+    /// Returns the note and the task's code.
+    @discardableResult
+    public func addNote(taskId: Int64, text: String, kind: NoteKind = .note) throws -> (note: TaskNote, taskCode: String) {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { throw StoreError.invalid("note text is empty") }
+        lock.lock(); defer { lock.unlock() }
+        // Full precision (REAL), so notes from one second still order by time; updated_at
+        // keeps whole seconds like every other write of it.
+        let now = Date()
+        do {
+            try beginImmediate()
+            try runWrite("UPDATE tasks SET updated_at=? WHERE id=?;",
+                         [.int(Int64(now.timeIntervalSince1970)), .int(taskId)])
+            guard sqlite3_changes(db) == 1 else { throw StoreError.notFound("task \(taskId)") }
+            try runWrite("INSERT INTO task_notes (task_id, ts, kind, text) VALUES (?, ?, ?, ?);",
+                         [.int(taskId), .double(now.timeIntervalSince1970), .text(kind.rawValue), .text(body)])
+            let note = TaskNote(id: lastInsertId(), taskId: taskId, timestamp: now, kind: kind, text: body)
+            let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(taskId)]) ?? ""
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return (note, code)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// A task's notes, newest first; `limit` nil = all of them.
+    public func notes(taskId: Int64, limit: Int? = nil) throws -> [TaskNote] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            "SELECT id, task_id, ts, kind, text FROM task_notes WHERE task_id=? ORDER BY ts DESC, id DESC LIMIT ?;",
+            [.int(taskId), .int(Int64(limit.map { max(0, $0) } ?? -1))]   // LIMIT -1 = no limit
+        )
+        defer { sqlite3_finalize(stmt) }
+        var out: [TaskNote] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(TaskNote(
+                id: sqlite3_column_int64(stmt, 0),
+                taskId: sqlite3_column_int64(stmt, 1),
+                timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                kind: NoteKind(rawValue: colText(stmt, 3)) ?? .note,
+                text: colText(stmt, 4)
+            ))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
     }
 
     // MARK: - Dependencies (blocked-by)
@@ -785,7 +1399,23 @@ public final class Store: @unchecked Sendable {
         try runWrite("DELETE FROM task_deps WHERE task_id=? AND depends_on_id=?;", [.int(taskId), .int(dependsOnId)])
     }
 
-    /// True if any of `taskId`'s dependencies is not yet done.
+    /// SQL list of the closed status values (`TaskStatus.isClosed`), e.g. `('done','dropped')`.
+    private static let closedStatusSQL = sqlList(TaskStatus.allCases.filter(\.isClosed).map(\.rawValue))
+
+    /// Every dependency edge `d`, joined to its task `a` and the task it depends on `b`.
+    /// The blocked predicates below are written against these aliases.
+    private static let depEdgesSQL =
+        "task_deps d JOIN tasks a ON a.id = d.task_id JOIN tasks b ON b.id = d.depends_on_id"
+
+    /// The dependency `b` is still open.
+    private static let openDependencySQL = "b.status NOT IN \(closedStatusSQL)"
+
+    /// The one blocked rule: an edge blocks only while both the task `a` and its
+    /// dependency `b` are still open. A task is blocked iff it has at least one such
+    /// edge. Every blocked computation (isBlocked, blockedTaskIds, taskRelations) uses this.
+    private static let blockingEdgeSQL = "(a.status NOT IN \(closedStatusSQL) AND \(openDependencySQL))"
+
+    /// True if `taskId` is open and at least one of its dependencies is still open.
     public func isBlocked(taskId: Int64) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return isBlockedUnlocked(taskId)
@@ -793,19 +1423,97 @@ public final class Store: @unchecked Sendable {
 
     private func isBlockedUnlocked(_ taskId: Int64) -> Bool {
         (queryInt(
-            "SELECT COUNT(*) FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id WHERE d.task_id=? AND t.status != 'done';",
+            "SELECT EXISTS(SELECT 1 FROM \(Self.depEdgesSQL) WHERE d.task_id=? AND \(Self.blockingEdgeSQL));",
             [.int(taskId)]) ?? 0) > 0
     }
 
-    /// Ids of all tasks currently blocked (>=1 not-done dependency) — one query for the UI.
+    /// Ids of all tasks currently blocked (see `blockingEdgeSQL`) — one query for the UI.
     public func blockedTaskIds() throws -> [Int64] {
         lock.lock(); defer { lock.unlock() }
         let stmt = try prepare(
-            "SELECT DISTINCT d.task_id FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id WHERE t.status != 'done';", [])
+            "SELECT DISTINCT d.task_id FROM \(Self.depEdgesSQL) WHERE \(Self.blockingEdgeSQL);", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Int64] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }
         return out
+    }
+
+    /// Which of `ids` have at least one dependency still open, whatever their own
+    /// status — unlike `blockedTaskIds`, a closed task counts too. For guarding a move
+    /// back to an active status (e.g. reopening a done task into In Progress).
+    public func idsWithOpenDependency(_ ids: [Int64]) throws -> Set<Int64> {
+        lock.lock(); defer { lock.unlock() }
+        var out: Set<Int64> = []
+        for chunk in Self.chunked(Array(Set(ids))) {
+            let stmt = try prepare(
+                "SELECT DISTINCT d.task_id FROM \(Self.depEdgesSQL) "
+                + "WHERE d.task_id IN (\(Self.placeholders(chunk.count))) AND \(Self.openDependencySQL);",
+                chunk.map { .int($0) })
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                out.insert(sqlite3_column_int64(stmt, 0))
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        }
+        return out
+    }
+
+    /// Depends-on codes, parent codes and blocked flags for a batch of tasks, read with
+    /// a couple of set queries (chunked IN lists) instead of N per-task lookups.
+    /// Throws on a read error rather than returning partial relations.
+    public func taskRelations(for tasks: [TodoTask]) throws -> TaskRelations {
+        lock.lock(); defer { lock.unlock() }
+        var rel = TaskRelations()
+        // Same blocked rule as isBlockedUnlocked (blockingEdgeSQL), evaluated per edge.
+        for chunk in Self.chunked(tasks.map(\.id)) {
+            let stmt = try prepare(
+                "SELECT d.task_id, b.code, \(Self.blockingEdgeSQL), b.id FROM \(Self.depEdgesSQL) "
+                + "WHERE d.task_id IN (\(Self.placeholders(chunk.count))) ORDER BY d.task_id, d.depends_on_id;",
+                chunk.map { .int($0) })
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                let tid = sqlite3_column_int64(stmt, 0)
+                let code = colText(stmt, 1)
+                rel.dependsOnCodes[tid, default: []].append(code)
+                if sqlite3_column_int64(stmt, 2) != 0 {
+                    rel.blockedIds.insert(tid)
+                    rel.blockedBy[tid, default: []].append((id: sqlite3_column_int64(stmt, 3), code: code))
+                }
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        }
+        for chunk in Self.chunked(Array(Set(tasks.compactMap(\.parentId)))) {
+            let stmt = try prepare(
+                "SELECT id, code FROM tasks WHERE id IN (\(Self.placeholders(chunk.count)));",
+                chunk.map { .int($0) })
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                rel.parentCodes[sqlite3_column_int64(stmt, 0)] = colText(stmt, 1)
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        }
+        return rel
+    }
+
+    /// Split ids into batches small enough for SQLite's bound-parameter limit.
+    private static func chunked(_ ids: [Int64], size: Int = 500) -> [[Int64]] {
+        stride(from: 0, to: ids.count, by: size).map { Array(ids[$0..<min($0 + size, ids.count)]) }
+    }
+
+    private static func placeholders(_ n: Int) -> String {
+        Array(repeating: "?", count: n).joined(separator: ",")
+    }
+
+    /// A parenthesised SQL list of quoted literals, e.g. `('done','Done')`. Only for
+    /// fixed internal values (status names) — never user input.
+    private static func sqlList(_ values: [String]) -> String {
+        "(" + values.map { "'\($0)'" }.joined(separator: ",") + ")"
     }
 
     /// Does `from` reach `to` by following depends-on edges transitively? (cycle guard)
@@ -822,13 +1530,15 @@ public final class Store: @unchecked Sendable {
 
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
-        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds
+        //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds,
+        //          waiting_on, waiting_reason, waiting_since
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
         func int64Opt(_ i: Int32) -> Int64? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, i)
         }
+        let status = TaskStatus(rawValue: colText(stmt, 6)) ?? .todo
         return TodoTask(
             id: sqlite3_column_int64(stmt, 0),
             code: colText(stmt, 1),
@@ -836,7 +1546,11 @@ public final class Store: @unchecked Sendable {
             title: colText(stmt, 3),
             detail: colText(stmt, 4),
             link: colTextOpt(stmt, 5),
-            status: TaskStatus(rawValue: colText(stmt, 6)) ?? .todo,
+            status: status,
+            waitingOn: colTextOpt(stmt, 19).flatMap(WaitingOn.init(rawValue:)),
+            waitingReason: colTextOpt(stmt, 20),
+            // Only a waiting task has one, even if an older build left a stale stamp.
+            waitingSince: status == .waiting ? date(21) : nil,
             priority: Priority(rawValue: colText(stmt, 7)) ?? .none,
             dueDate: date(8),
             tags: decodeTags(colText(stmt, 9)),
@@ -1101,6 +1815,7 @@ private func colTextOpt(_ stmt: OpaquePointer?, _ i: Int32) -> String? {
 
 enum SQLValue {
     case int(Int64)
+    case double(Double)
     case text(String)
     case null
 }
