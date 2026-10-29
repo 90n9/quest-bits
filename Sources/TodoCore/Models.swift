@@ -348,6 +348,32 @@ public struct ProjectEffort: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// Task counts of one project (subtasks included), for the sidebar's open count and
+/// progress bar. Dropped tasks are neither left to do nor done (`progressTotal`).
+public struct ProjectCounts: Hashable, Sendable {
+    public var open = 0             // todo, in progress, waiting (not `isClosed`)
+    public var done = 0
+    public var waitingOnUser = 0    // waiting tasks that wait on the user
+
+    /// The work still counted toward progress: `done` out of this.
+    public var progressTotal: Int { open + done }
+
+    public init() {}
+
+    /// Counts per project id for `tasks`, in one pass. A project with no tasks has no entry.
+    public static func byProject(_ tasks: [TodoTask]) -> [Int64: ProjectCounts] {
+        var out: [Int64: ProjectCounts] = [:]
+        for t in tasks {
+            if !t.status.isClosed { out[t.projectId, default: ProjectCounts()].open += 1 }
+            if t.status == .done { out[t.projectId, default: ProjectCounts()].done += 1 }
+            if t.status == .waiting && t.waitingOn == .user {
+                out[t.projectId, default: ProjectCounts()].waitingOnUser += 1
+            }
+        }
+        return out
+    }
+}
+
 /// User-configurable pomodoro durations (seconds) + behavior flags.
 public struct PomodoroSettings: Codable, Hashable, Sendable {
     public var focusSeconds: Int

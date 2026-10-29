@@ -78,7 +78,9 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   tasks can't target an archived project (`create_task`, `move_task`,
   `bulk_move_tasks`, `duplicate_task` with a target, `new_task_from_template`
   fail with "project X is archived; unarchive it first"); reading and updating
-  its tasks works as usual.
+  its tasks works as usual. The app follows the same rule: New Task and New
+  Task from Template are not offered for an archived project, and adding a
+  subtask there shows the error.
 - MCP `inbox`: the tasks an agent is waiting on you to answer — waiting tasks
   with `waiting_on: user` — across every project that is not archived,
   longest waiting first. Each item is compact: code, title, project code,
@@ -97,6 +99,16 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   archived ones after the active ones with `include_archived`).
 
 ### Changed
+
+- Sidebar project rows show how much is left instead of a bare total: the
+  number is the project's open tasks (todo, in progress, waiting), and a thin
+  bar under the name fills with done out of the tasks still counted. Dropped
+  tasks count as neither left nor done. A clay dot before the number means
+  tasks in the project are waiting on you. Hover the number, bar or dot for
+  the exact counts. A project with no tasks shows `0` and an empty bar.
+- The sidebar counts are worked out from the task list the app already loads
+  on each refresh, instead of loading every task of every project again on
+  each redraw.
 
 - MCP responses are compact JSON (no pretty-printing, unescaped `/` in links),
   cutting task output by about a fifth on a real database. Every tool that
@@ -148,7 +160,9 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   the whole batch unchanged instead of half-applied. An `add_tags` that adds
   nothing new no longer marks the task updated. The app's bulk Status and Add
   Tags actions use the same all-or-nothing write and show an error instead of
-  a success toast when it fails.
+  a success toast when it fails. Like a single task, a batch marked Done
+  still goes through when a recurring task's next occurrence can't be
+  created (the occurrence is skipped).
 - Every status change now re-reads the task inside its write transaction, so
   a status change racing another process's write logs the status it actually
   replaced. Leaving Waiting no longer adds a separate "waiting on → (empty)"

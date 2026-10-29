@@ -496,7 +496,12 @@ public final class Store: @unchecked Sendable {
             "SELECT \(Self.projectCols) FROM projects \(whereSQL)ORDER BY archived_at IS NOT NULL, sort_order, id;", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Project] = []
-        while sqlite3_step(stmt) == SQLITE_ROW { out.append(projectFromRow(stmt)) }
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(projectFromRow(stmt))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
     }
 
@@ -557,6 +562,23 @@ public final class Store: @unchecked Sendable {
         }
     }
 
+    /// New or moved tasks go to active projects only (the app's move/copy menus list no
+    /// archived ones), so new work never lands out of cross-project lists. Reading and
+    /// updating tasks already in an archived project stays allowed, and so does a
+    /// recurring task's next occurrence or a duplicate within its own project.
+    /// App and MCP share this one rule; callers hold the lock (and, for a write that
+    /// follows, BEGIN IMMEDIATE so an archive can't land in between).
+    private func requireActiveProjectUnlocked(_ projectId: Int64) throws {
+        guard let archived = queryInt("SELECT archived_at IS NOT NULL FROM projects WHERE id=?;",
+                                      [.int(projectId)]) else {
+            throw StoreError.notFound("project \(projectId)")
+        }
+        if archived != 0 {
+            let code = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "\(projectId)"
+            throw StoreError.invalid("project \(code) is archived; unarchive it first")
+        }
+    }
+
     /// How many of a project's tasks (subtasks included) are still open (not `isClosed`).
     public func openTaskCount(projectId: Int64) -> Int {
         lock.lock(); defer { lock.unlock() }
@@ -610,12 +632,14 @@ public final class Store: @unchecked Sendable {
                            priority: Priority = .none,
                            dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                            parentId: Int64? = nil, estimateSeconds: Int = 0,
-                           timestampsFrom source: TodoTask? = nil) throws -> TodoTask {
+                           timestampsFrom source: TodoTask? = nil,
+                           allowArchived: Bool = false) throws -> TodoTask {
         lock.lock(); defer { lock.unlock() }
         // The task_seq bump, its read-back and the INSERT are one read-modify-write the
         // app and MCP server can race on (both reading the same seq → duplicate codes).
         do {
             try beginImmediate()
+            if !allowArchived { try requireActiveProjectUnlocked(projectId) }
             let task = try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
                                               status: status, waitingOn: waitingOn, waitingReason: waitingReason,
                                               priority: priority, dueDate: dueDate, tags: tags,
@@ -979,17 +1003,20 @@ public final class Store: @unchecked Sendable {
     /// every task is checked (waiting rule, existence) and written inside the
     /// transaction, so one bad task leaves the whole batch unchanged. `addTags` merges
     /// into each task's tags (keeps existing). Same field semantics as `updateTask`.
+    /// `waitingOnDefault`: a move to waiting without `waitingOn` keeps each task's own
+    /// who, and a task waiting on no one takes this one (nil = such a task is an error).
     public func bulkUpdateTasks(ids: [Int64], status: TaskStatus? = nil, priority: Priority? = nil,
                                 dueDate: Date?? = nil, addTags: [String]? = nil,
-                                waitingOn: WaitingOn? = nil, waitingReason: String?? = nil) throws {
+                                waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
+                                waitingReason: String?? = nil) throws {
         lock.lock(); defer { lock.unlock() }
-        do {
+        let apply = { [self] (spawnRecurrence: Bool) in
             try beginImmediate()
             for id in ids {
                 do {
                     try applyTaskUpdateUnlocked(id: id, status: status, priority: priority, dueDate: dueDate,
-                                                addTags: addTags, waitingOn: waitingOn, waitingReason: waitingReason,
-                                                spawnRecurrence: true)
+                                                addTags: addTags, waitingOn: waitingOn, waitingOnDefault: waitingOnDefault,
+                                                waitingReason: waitingReason, spawnRecurrence: spawnRecurrence)
                 } catch StoreError.invalid(let msg) {
                     // Name the task that failed the batch.
                     let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(id)]) ?? "task \(id)"
@@ -997,9 +1024,21 @@ public final class Store: @unchecked Sendable {
                 }
             }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        }
+        do {
+            try apply(true)
         } catch {
             exec("ROLLBACK;")
-            throw error
+            // Degrade as updateTask does: on a write failure in a move to done, retry the
+            // whole batch without spawning recurrences — still one transaction, so the
+            // batch stays all or nothing. A rejected or missing task is reported as is.
+            guard status == .done, let e = error as? StoreError, case .step = e else { throw error }
+            do {
+                try apply(false)
+            } catch {
+                exec("ROLLBACK;")
+                throw error
+            }
         }
     }
 
@@ -1012,9 +1051,11 @@ public final class Store: @unchecked Sendable {
                                          status: TaskStatus? = nil, priority: Priority? = nil,
                                          dueDate: Date?? = nil, tags: [String]? = nil, addTags: [String]? = nil,
                                          recurrence: String?? = nil, estimateSeconds: Int? = nil,
-                                         waitingOn: WaitingOn? = nil, waitingReason: String?? = nil,
-                                         spawnRecurrence: Bool) throws {
+                                         waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
+                                         waitingReason: String?? = nil, spawnRecurrence: Bool) throws {
         guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        // A move to waiting with no who keeps the task's own, else takes the default.
+        let waitingOn = waitingOn ?? (status == .waiting && old.waitingOn == nil ? waitingOnDefault : nil)
         if let msg = Self.waitingViolation(status: status ?? old.status, waitingOn: waitingOn ?? old.waitingOn,
                                            settingWaitingFields: Self.setsWaitingFields(waitingOn, waitingReason)) {
             throw StoreError.invalid(msg)
@@ -1138,7 +1179,8 @@ public final class Store: @unchecked Sendable {
     /// start/completion times or waiting fields, so it never counts as another completion.
     /// A copy to another project carries the record over as is: status, waiting fields
     /// and started/completed times; a waiting copy is a new ask, so its waiting_since is
-    /// now. App and MCP share this one rule.
+    /// now. App and MCP share this one rule. Copying into an archived project is refused;
+    /// a duplicate within its own (even archived) project is not.
     /// Composes getTask/createTask (each takes the lock) — must NOT hold the lock here.
     @discardableResult
     public func duplicateTask(id: Int64, toProjectId: Int64? = nil) throws -> TodoTask {
@@ -1166,15 +1208,30 @@ public final class Store: @unchecked Sendable {
             recurrence: t.recurrence,
             parentId: newParentId,
             estimateSeconds: t.estimateSeconds,
-            timestampsFrom: keepStatus ? t : nil
+            timestampsFrom: keepStatus ? t : nil,
+            allowArchived: !keepStatus
         )
     }
 
     /// Move a task to another project, placing it at the end of that project's list.
-    /// The code is left unchanged so existing references stay valid.
+    /// The code is left unchanged so existing references stay valid. The target must not
+    /// be archived (unless the task is already in it); checked inside BEGIN IMMEDIATE.
     public func moveTask(id: Int64, toProjectId: Int64) throws {
         lock.lock(); defer { lock.unlock() }
-        let oldCode = getTaskUnlocked(id).flatMap { queryString("SELECT code FROM projects WHERE id=?;", [.int($0.projectId)]) } ?? ""
+        do {
+            try beginImmediate()
+            try moveTaskUnlocked(id: id, toProjectId: toProjectId)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func moveTaskUnlocked(id: Int64, toProjectId: Int64) throws {
+        let old = getTaskUnlocked(id)
+        if old?.projectId != toProjectId { try requireActiveProjectUnlocked(toProjectId) }
+        let oldCode = old.flatMap { queryString("SELECT code FROM projects WHERE id=?;", [.int($0.projectId)]) } ?? ""
         let newCode = queryString("SELECT code FROM projects WHERE id=?;", [.int(toProjectId)]) ?? ""
         let now = Int64(Date().timeIntervalSince1970)
         try runWrite(
@@ -1255,7 +1312,8 @@ public final class Store: @unchecked Sendable {
         )
         defer { sqlite3_finalize(stmt) }
         var out: [TaskNote] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             out.append(TaskNote(
                 id: sqlite3_column_int64(stmt, 0),
                 taskId: sqlite3_column_int64(stmt, 1),
@@ -1263,7 +1321,9 @@ public final class Store: @unchecked Sendable {
                 kind: NoteKind(rawValue: colText(stmt, 3)) ?? .note,
                 text: colText(stmt, 4)
             ))
+            rc = sqlite3_step(stmt)
         }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
     }
 

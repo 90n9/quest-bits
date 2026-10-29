@@ -196,7 +196,6 @@ final class MCPServer {
             } else {
                 projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
             }
-            try requireActiveProject(projectId)
             let task = try store.createTask(
                 projectId: projectId,
                 title: try requireString(args, "title"),
@@ -269,14 +268,12 @@ final class MCPServer {
             let toPid: Int64? = (args["to_project_id"] != nil || args["to_project_code"] != nil)
                 ? try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
                 : nil
-            if let toPid { try requireActiveProject(toPid) }
             let copy = try store.duplicateTask(id: try resolveTaskId(args), toProjectId: toPid)
             return try jsonString(taskDict(copy))
 
         case "move_task":
             let tid = try resolveTaskId(args)
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
-            try requireActiveProject(toPid)
             try store.moveTask(id: tid, toProjectId: toPid)
             return try jsonString(taskDict(store.getTask(id: tid)))
 
@@ -294,7 +291,6 @@ final class MCPServer {
         case "bulk_move_tasks":
             let ids = try resolveTaskIds(args)
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
-            try requireActiveProject(toPid)
             let copy = try boolArg(args, "copy") ?? false
             for id in ids {
                 if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid) }
@@ -343,7 +339,6 @@ final class MCPServer {
         case "new_task_from_template":
             let templateId = try requireInt(args, "template_id")
             let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
-            try requireActiveProject(pid)
             let task = try store.instantiateTemplate(id: templateId, intoProjectId: pid)
             return try jsonString(taskDict(task))
 
@@ -545,14 +540,6 @@ final class MCPServer {
             return id
         }
         throw MCPError.missingArg("\(idKey) or \(codeKey)")
-    }
-
-    /// New or moved tasks go to active projects only (the app's move/copy menus list no
-    /// archived ones), so an agent's work never lands out of cross-project lists.
-    /// Reading and updating tasks already in an archived project stays allowed.
-    private func requireActiveProject(_ id: Int64) throws {
-        let p = try store.getProject(id: id)
-        if p.isArchived { throw MCPError.invalidArg("project \(p.code) is archived; unarchive it first") }
     }
 
     /// A boolean argument: absent or null = nil. Only JSON true/false count — numbers

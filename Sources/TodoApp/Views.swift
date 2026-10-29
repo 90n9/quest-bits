@@ -246,18 +246,35 @@ struct ProjectSidebar: View {
     }
 
     /// A project row (active or archived — archived rows are dimmed) with its context menu.
+    /// The trailing number is the open tasks; the bar under the name is done out of the
+    /// tasks still counted (dropped is in neither). A clay dot marks tasks waiting on the
+    /// user. A project with no tasks shows an empty bar, so every row keeps one height.
     private func projectRow(_ p: Project) -> some View {
-        HStack(spacing: 6) {
+        let counts = model.projectCounts[p.id] ?? ProjectCounts()
+        return HStack(spacing: 6) {
             QBIcon(name: "lucide-door-open")
-            Text(p.name).font(Theme.Fonts.bodySmMedium)
-            Spacer()
-            CodeBadge(code: p.code)
-            Text("\(taskCount(p.id))")
-                .font(Theme.Fonts.micro)
-                .foregroundStyle(Theme.Colors.slate)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1)
-                .background(Theme.Colors.surface, in: Capsule())
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(p.name).font(Theme.Fonts.bodySmMedium)
+                    Spacer()
+                    CodeBadge(code: p.code)
+                    if counts.waitingOnUser > 0 {
+                        Circle()
+                            .fill(qbStatusColor(.waiting))
+                            .frame(width: 6, height: 6)
+                            .help("\(counts.waitingOnUser) waiting on you")
+                    }
+                    Text("\(counts.open)")
+                        .font(Theme.Fonts.micro)
+                        .foregroundStyle(Theme.Colors.slate)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Theme.Colors.surface, in: Capsule())
+                        .help("\(counts.open) open")
+                }
+                ProjectProgressBar(done: counts.done, total: counts.progressTotal)
+                    .help("\(counts.done) of \(counts.progressTotal) done")
+            }
         }
         .opacity(p.isArchived ? 0.6 : 1)
         .tag(p.id)
@@ -267,15 +284,18 @@ struct ProjectSidebar: View {
         .contextMenu {
             Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
             Button("Edit…") { editing = p }
-            if model.templates.isEmpty {
-                Button("New Task from Template…") { showTemplates = true }
-            } else {
-                Menu("New Task from Template") {
-                    ForEach(model.templates) { t in
-                        Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
+            // No new tasks in an archived project (the store refuses them too).
+            if !p.isArchived {
+                if model.templates.isEmpty {
+                    Button("New Task from Template…") { showTemplates = true }
+                } else {
+                    Menu("New Task from Template") {
+                        ForEach(model.templates) { t in
+                            Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
+                        }
+                        Divider()
+                        Button("Manage Templates…") { showTemplates = true }
                     }
-                    Divider()
-                    Button("Manage Templates…") { showTemplates = true }
                 }
             }
             Divider()
@@ -298,8 +318,24 @@ struct ProjectSidebar: View {
         }
     }
 
-    private func taskCount(_ pid: Int64) -> Int {
-        (try? model.store.listTasks(projectId: pid).count) ?? 0
+}
+
+/// The thin done/total bar under a sidebar project name; empty when `total` is 0.
+private struct ProjectProgressBar: View {
+    let done: Int
+    let total: Int
+
+    var body: some View {
+        let ratio = total > 0 ? min(Double(done) / Double(total), 1) : 0
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Theme.Colors.hairlineSoft)
+                Capsule()
+                    .fill(qbStatusColor(.done))
+                    .frame(width: CGFloat(ratio) * geo.size.width)
+            }
+        }
+        .frame(height: 3)
     }
 }
 
@@ -577,7 +613,7 @@ struct TaskListView: View {
                 }
                 .buttonStyle(QBPrimaryButtonStyle(compact: true))
                 .help("New Task (⌘N)")
-                .disabled(model.selectedProjectId == nil)
+                .disabled(!model.canAddTask)
             }
         }
         .sheet(isPresented: $showNew) {
@@ -589,7 +625,7 @@ struct TaskListView: View {
         }
         .onChange(of: model.pendingNewTask) { _, pending in
             if pending {
-                if model.selectedProjectId != nil { showNew = true }
+                if model.canAddTask { showNew = true }
                 model.pendingNewTask = false
             }
         }
@@ -601,7 +637,7 @@ struct TaskListView: View {
                 Text(model.smartView != nil ? "No tasks here" : "No tasks in this project")
                     .font(Theme.Fonts.subtitle)
                     .foregroundStyle(Theme.Colors.slate)
-                if model.smartView == nil {
+                if model.canAddTask {
                     Button { showNew = true } label: {
                         Label("New Task", systemImage: "plus")
                     }
