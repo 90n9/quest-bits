@@ -292,10 +292,9 @@ final class MCPServer {
             let ids = try resolveTaskIds(args)
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
             let copy = try boolArg(args, "copy") ?? false
-            for id in ids {
-                if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid) }
-                else { try store.moveTask(id: id, toProjectId: toPid) }
-            }
+            // One transaction for the whole batch: a missing task or an archived target
+            // leaves every task where it was.
+            try store.bulkMoveTasks(ids: ids, toProjectId: toPid, copy: copy)
             return "\(copy ? "copied" : "moved") \(ids.count) tasks"
 
         case "bulk_delete_tasks":
@@ -500,16 +499,23 @@ final class MCPServer {
     }
 
     /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).
+    /// Like `resolveTaskId`, an unknown code (or an id that is not a number) is an error
+    /// naming it, never skipped, so the bulk tools stay all or nothing. An unknown numeric
+    /// id is left to the store, which reports it inside the batch.
     private func resolveTaskIds(_ args: [String: Any]) throws -> [Int64] {
         var ids: [Int64] = []
         if let arr = args["ids"] as? [Any] {
             for v in arr {
                 if let n = v as? NSNumber { ids.append(n.int64Value) }
                 else if let s = v as? String, let n = Int64(s) { ids.append(n) }
+                else { throw MCPError.invalidArg("ids: \(v) is not a task id") }
             }
         }
         if let arr = args["codes"] as? [String] {
-            for c in arr { if let id = store.taskId(forCode: c) { ids.append(id) } }
+            for c in arr {
+                guard let id = store.taskId(forCode: c) else { throw StoreError.notFound("task \(c)") }
+                ids.append(id)
+            }
         }
         guard !ids.isEmpty else { throw MCPError.missingArg("ids or codes") }
         return ids

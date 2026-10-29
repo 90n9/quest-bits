@@ -47,7 +47,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "list_tasks",
-             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Without `project_id`/`project_code` or `parent_id`/`parent_code`, tasks of archived projects are left out unless `include_archived` is true. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
+             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Without `project_id`/`project_code` or `parent_id`/`parent_code`, tasks of archived projects are left out unless `include_archived` is true. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order (projects in sidebar order, then each project's own task order). The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str,
                 "status": ["anyOf": [
@@ -105,7 +105,7 @@ extension MCPServer {
              ])],
 
             ["name": "bulk_move_tasks",
-             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy to another project keeps each task's status, started/completed times and waiting fields (same rule as duplicate_task). The target project must not be archived.",
+             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy to another project keeps each task's status, started/completed times and waiting fields (same rule as duplicate_task). The target project must not be archived. All or nothing: if any task is unknown or the target is archived, no task moves or is copied.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
                 "to_project_id": int, "to_project_code": str, "copy": ["type": "boolean"]

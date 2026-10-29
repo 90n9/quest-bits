@@ -310,7 +310,7 @@ struct ProjectSidebar: View {
 
     /// Archive straight away when nothing is open; otherwise confirm with the open count.
     private func requestArchive(_ p: Project) {
-        let open = model.openTaskCount(p.id)
+        let open = model.projectCounts[p.id]?.open ?? 0
         if open == 0 {
             model.setArchived(p.id, true)
         } else {
@@ -1002,28 +1002,31 @@ struct TaskRow: View {
                 ForEach(subtasks) { sub in
                     SubtaskRow(sub: sub)
                 }
-                if addingSubtask {
-                    HStack(spacing: 8) {
-                        Image(systemName: "square").foregroundStyle(Theme.Colors.steel)
-                        TextField("Subtask title", text: $newSubtaskTitle)
-                            .textFieldStyle(.roundedBorder)
-                            .font(Theme.Fonts.bodySm)
-                            .onSubmit { commitSubtask() }
-                        Button("Add") { commitSubtask() }
-                            .buttonStyle(QBPrimaryButtonStyle(compact: true))
-                            .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
-                        Button("Cancel") { addingSubtask = false; newSubtaskTitle = "" }
-                            .buttonStyle(QBGhostButtonStyle())
+                // An archived project takes no new subtasks (the store refuses them).
+                if model.canAddTask(to: task.projectId) {
+                    if addingSubtask {
+                        HStack(spacing: 8) {
+                            Image(systemName: "square").foregroundStyle(Theme.Colors.steel)
+                            TextField("Subtask title", text: $newSubtaskTitle)
+                                .textFieldStyle(.roundedBorder)
+                                .font(Theme.Fonts.bodySm)
+                                .onSubmit { commitSubtask() }
+                            Button("Add") { commitSubtask() }
+                                .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                                .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+                            Button("Cancel") { addingSubtask = false; newSubtaskTitle = "" }
+                                .buttonStyle(QBGhostButtonStyle())
+                        }
+                        .padding(.leading, 26)
+                    } else {
+                        Button {
+                            addingSubtask = true
+                        } label: {
+                            Label("subtask", systemImage: "plus")
+                        }
+                        .buttonStyle(QBLinkButtonStyle())
+                        .padding(.leading, 26)
                     }
-                    .padding(.leading, 26)
-                } else {
-                    Button {
-                        addingSubtask = true
-                    } label: {
-                        Label("subtask", systemImage: "plus")
-                    }
-                    .buttonStyle(QBLinkButtonStyle())
-                    .padding(.leading, 26)
                 }
             }
         }

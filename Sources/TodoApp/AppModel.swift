@@ -87,8 +87,8 @@ final class AppModel: ObservableObject {
     @Published var pendingNewTask = false
 
     // Notes of the single selected task, newest first: the latest `notesLimit` of them.
-    // Loaded on selection change and on every task reload (app writes and MCP polls),
-    // republished only when they changed.
+    // Loaded on selection change, after addNote and when the poll sees an external write
+    // (not on every task reload); republished only when they changed.
     @Published private(set) var selectedTaskNotes: [TaskNote] = []
     @Published private(set) var hasOlderNotes = false
     private var notesTaskId: Int64?
@@ -165,10 +165,11 @@ final class AppModel: ObservableObject {
 
     func reloadTasks() {
         let all = (try? store.listTasks(projectId: nil)) ?? []
-        // Cross-project views (smart views, menu bar) leave out archived projects, the
-        // rule MCP list_tasks applies in SQL; a selected project shows in full, archived
-        // or not. Due-date reminders still cover every task. Derived from `all` so the
-        // task table is read once per reload.
+        // Cross-project views (smart views, menu bar) leave out archived projects; a
+        // selected project shows in full, archived or not. Due-date reminders still cover
+        // every task. Filtered here from `all` so the task table is read once per reload;
+        // the rule is `Project.isArchived`, the one Store.activeProjectSQL /
+        // activeProjectJoinSQL apply in SQL for MCP — change them together.
         let archived = Set(archivedProjects.map(\.id))
         let active = archived.isEmpty ? all : all.filter { !archived.contains($0.projectId) }
         if let sv = smartView {
@@ -185,7 +186,6 @@ final class AppModel: ObservableObject {
         let counts = ProjectCounts.byProject(all)
         if counts != projectCounts { projectCounts = counts }
         syncDueReminders(all)
-        reloadNotes()
     }
 
     /// Keep local due-date notifications in sync with the current task set.
@@ -250,7 +250,12 @@ final class AppModel: ObservableObject {
     /// A project is on screen and takes new tasks (an archived one doesn't).
     var canAddTask: Bool {
         guard let pid = selectedProjectId else { return false }
-        return !archivedProjects.contains { $0.id == pid }
+        return canAddTask(to: pid)
+    }
+
+    /// The project takes new tasks and subtasks: it is not archived (the store refuses those).
+    func canAddTask(to projectId: Int64) -> Bool {
+        !archivedProjects.contains { $0.id == projectId }
     }
 
     /// Project code for a task id (used by smart views to label rows).
@@ -264,10 +269,12 @@ final class AppModel: ObservableObject {
 
     /// Refresh `selectedTaskNotes` for the selected task. A different task starts again
     /// from the first page. One extra row tells whether older notes exist. On a read
-    /// error the shown notes are kept and a toast says so, once per task and error.
+    /// error a toast says so, once per task and error; the shown notes are kept only when
+    /// they belong to the same task.
     private func reloadNotes() {
         let id = selectedTaskId
-        if id != notesTaskId { notesTaskId = id; notesLimit = Self.notesPage }
+        let switched = id != notesTaskId
+        if switched { notesTaskId = id; notesLimit = Self.notesPage }
         guard let id else {
             if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
             if hasOlderNotes { hasOlderNotes = false }
@@ -280,6 +287,10 @@ final class AppModel: ObservableObject {
             if older != hasOlderNotes { hasOlderNotes = older }
             notesErrorShown = nil
         } catch {
+            if switched {
+                if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
+                if hasOlderNotes { hasOlderNotes = false }
+            }
             let message = "\(error)"
             guard notesErrorShown?.taskId != id || notesErrorShown?.error != message else { return }
             notesErrorShown = (id, message)
@@ -302,7 +313,8 @@ final class AppModel: ObservableObject {
             flashToast("Couldn't add a note to \(task.code): \(error)")
             return false
         }
-        reloadTasks()   // the note bumped updated_at; reloads the notes too
+        reloadTasks()   // the note bumped updated_at
+        reloadNotes()
         return true
     }
 
@@ -322,11 +334,6 @@ final class AppModel: ObservableObject {
     func updateProject(_ id: Int64, name: String? = nil, detail: String? = nil) {
         try? store.updateProject(id: id, name: name, detail: detail)
         reloadAll()
-    }
-
-    /// Tasks of a project still open — the count the archive confirmation shows.
-    func openTaskCount(_ projectId: Int64) -> Int {
-        store.openTaskCount(projectId: projectId)
     }
 
     /// Archive or unarchive a project. It stays selected (an archived project is still
@@ -460,19 +467,31 @@ final class AppModel: ObservableObject {
 
     /// Clone a task within its current project (a fresh todo).
     func duplicateTask(_ id: Int64) {
-        _ = try? store.duplicateTask(id: id)
+        do {
+            _ = try store.duplicateTask(id: id)
+        } catch {
+            flashToast("Couldn't duplicate: \(error)")
+        }
         reloadTasks()
     }
 
     /// Copy a task into another project (original kept), status and times included.
     func copyTask(_ id: Int64, toProject pid: Int64) {
-        _ = try? store.duplicateTask(id: id, toProjectId: pid)
+        do {
+            _ = try store.duplicateTask(id: id, toProjectId: pid)
+        } catch {
+            flashToast("Couldn't copy: \(error)")
+        }
         reloadTasks()
     }
 
     /// Move a task to another project (transfer).
     func moveTask(_ id: Int64, toProject pid: Int64) {
-        try? store.moveTask(id: id, toProjectId: pid)
+        do {
+            try store.moveTask(id: id, toProjectId: pid)
+        } catch {
+            flashToast("Couldn't move: \(error)")
+        }
         reloadTasks()
     }
 
@@ -640,19 +659,28 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
+    /// One all-or-nothing store write: on failure no task moves and the toast says why
+    /// (the selection is kept, so the user can pick another project).
     func bulkMove(toProject pid: Int64) {
-        let n = selectionCount
-        for id in selectedTaskIds { try? store.moveTask(id: id, toProjectId: pid) }
-        selectedTaskIds = []
+        do {
+            try store.bulkMoveTasks(ids: Array(selectedTaskIds), toProjectId: pid, copy: false)
+            flashToast("Moved \(selectionCount) tasks")
+            selectedTaskIds = []
+        } catch {
+            flashToast("Couldn't move: \(error)")
+        }
         reloadTasks()
-        flashToast("Moved \(n) tasks")
     }
 
+    /// One all-or-nothing store write, like bulkMove.
     func bulkCopy(toProject pid: Int64) {
-        let n = selectionCount
-        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id, toProjectId: pid) }
+        do {
+            try store.bulkMoveTasks(ids: Array(selectedTaskIds), toProjectId: pid, copy: true)
+            flashToast("Copied \(selectionCount) tasks")
+        } catch {
+            flashToast("Couldn't copy: \(error)")
+        }
         reloadTasks()
-        flashToast("Copied \(n) tasks")
     }
 
     func bulkDelete() {
@@ -704,6 +732,7 @@ final class AppModel: ObservableObject {
         if stamp > lastDBStamp {
             lastDBStamp = stamp
             reloadAll()
+            reloadNotes()   // an agent may have added a note
         }
     }
 }
