@@ -59,6 +59,26 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 - In the app, the task detail has a Notes section: notes newest first with a
   coloured kind chip, and a field with a kind picker to add your own. Notes
   an agent adds appear within the usual refresh.
+- Archive finished projects to free up the sidebar. Right-click a project for
+  Archive / Unarchive; archived projects move to an "Archived" group at the
+  bottom of the sidebar, collapsed by default, and still open and work as
+  usual. Archiving a project with open tasks asks first and says how many are
+  left; the tasks stay as they are. Archived projects are left out of All
+  Tasks, In Progress, the menu bar and the Move/Copy to menus, and their
+  in-progress tasks earn no focus time; due-date reminders still fire.
+  Archiving the selected project opens the Archived group so it stays in
+  view. An archived project's code stays taken, so a new project never
+  reuses it.
+- MCP `archive_project` and `unarchive_project` (by `id` or `code`).
+  `archive_project` returns the project with `open_tasks` when some are still
+  open. `list_projects` leaves archived projects out unless
+  `include_archived: true`, and marks them with `archived_at`. `list_tasks`
+  without a project or parent leaves out tasks of archived projects unless
+  `include_archived: true`; naming the project still lists them. New or moved
+  tasks can't target an archived project (`create_task`, `move_task`,
+  `bulk_move_tasks`, `duplicate_task` with a target, `new_task_from_template`
+  fail with "project X is archived; unarchive it first"); reading and updating
+  its tasks works as usual.
 
 ### Changed
 
@@ -82,12 +102,17 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   Marking an already-done task done again keeps the original `completed_at`.
 - MCP `update_task` now tells agents to log progress with `add_note` instead
   of appending to the task's detail.
+- MCP boolean arguments (`copy`, `include_archived`) accept only `true` or
+  `false`; a number such as `1` is now an error instead of being read as true.
 
 ### Fixed
 
 - An MCP `*_code` argument that matches no task or project (e.g.
   `parent_code: "ZZZ-9"`) now fails with "not found: task ZZZ-9" instead of
   "missing or invalid argument".
+- MCP `create_task`, `update_task` and `bulk_update_tasks` reject an unknown
+  `status` (e.g. `"waitng"`) instead of silently creating a todo or leaving
+  the status unchanged.
 - A task that is itself done is no longer reported as `blocked`, even when one
   of its dependencies is still open.
 - `started_at` and `completed_at` are now set on every path that changes a

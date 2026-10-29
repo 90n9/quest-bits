@@ -85,14 +85,19 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
     public var detail: String        // description — context for humans + AI
     public var createdAt: Date
     public var sortOrder: Int
+    public var archivedAt: Date?     // nil = active; archived projects keep their code reserved
 
-    public init(id: Int64, code: String, name: String, detail: String, createdAt: Date, sortOrder: Int) {
+    public var isArchived: Bool { archivedAt != nil }
+
+    public init(id: Int64, code: String, name: String, detail: String, createdAt: Date, sortOrder: Int,
+                archivedAt: Date? = nil) {
         self.id = id
         self.code = code
         self.name = name
         self.detail = detail
         self.createdAt = createdAt
         self.sortOrder = sortOrder
+        self.archivedAt = archivedAt
     }
 }
 
@@ -180,18 +185,23 @@ public struct TaskRelations: Sendable {
 }
 
 /// Which tasks `Store.listTasks(matching:)` returns. Every set field narrows the list;
-/// nil means no constraint on that field.
+/// nil means no constraint on that field. Without a `projectId` or `parentId`, tasks of
+/// archived projects are left out unless `includeArchived`; naming a project or parent
+/// lists it whether archived or not.
 public struct TaskFilter: Sendable {
     public var projectId: Int64?
     public var statuses: [TaskStatus]?   // any of these; nil = every status
     public var tag: String?              // has this tag (whole tag, case-insensitive)
     public var parentId: Int64?          // direct subtasks of this task
+    public var includeArchived: Bool     // cross-project lists: also tasks of archived projects
 
-    public init(projectId: Int64? = nil, statuses: [TaskStatus]? = nil, tag: String? = nil, parentId: Int64? = nil) {
+    public init(projectId: Int64? = nil, statuses: [TaskStatus]? = nil, tag: String? = nil, parentId: Int64? = nil,
+                includeArchived: Bool = false) {
         self.projectId = projectId
         self.statuses = statuses
         self.tag = tag
         self.parentId = parentId
+        self.includeArchived = includeArchived
     }
 }
 

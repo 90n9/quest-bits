@@ -253,6 +253,9 @@ public final class Store: @unchecked Sendable {
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_notes_task_ts ON task_notes(task_id, ts);")
 
+        // --- Additive migration: archived projects (NULL = active) ---
+        if !columnExists("projects", "archived_at") { exec("ALTER TABLE projects ADD COLUMN archived_at REAL;") }
+
         // --- One-time data repair: status timestamps (schema user_version 1) ---
         backfillStatusTimestamps()
     }
@@ -364,7 +367,8 @@ public final class Store: @unchecked Sendable {
         return base
     }
 
-    /// A project code unique among existing projects (appends 2, 3, … on clash).
+    /// A project code unique among existing projects, archived ones included so their
+    /// codes stay reserved (appends 2, 3, … on clash).
     private func uniqueProjectCode(from name: String) -> String {
         let base = baseProjectCode(from: name)
         var candidate = base
@@ -391,22 +395,80 @@ public final class Store: @unchecked Sendable {
         return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: 0)
     }
 
-    public func listProjects() throws -> [Project] {
+    /// Canonical project column list (order must match `projectFromRow`).
+    private static let projectCols = "id, code, name, detail, created_at, sort_order, archived_at"
+
+    /// Projects in sidebar order. `includeArchived: false` leaves out archived ones.
+    public func listProjects(includeArchived: Bool = true) throws -> [Project] {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT id, code, name, detail, created_at, sort_order FROM projects ORDER BY sort_order, id;", [])
+        let whereSQL = includeArchived ? "" : "WHERE archived_at IS NULL "
+        let stmt = try prepare("SELECT \(Self.projectCols) FROM projects \(whereSQL)ORDER BY sort_order, id;", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Project] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            out.append(Project(
-                id: sqlite3_column_int64(stmt, 0),
-                code: colText(stmt, 1),
-                name: colText(stmt, 2),
-                detail: colText(stmt, 3),
-                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)),
-                sortOrder: Int(sqlite3_column_int64(stmt, 5))
-            ))
-        }
+        while sqlite3_step(stmt) == SQLITE_ROW { out.append(projectFromRow(stmt)) }
         return out
+    }
+
+    private func projectFromRow(_ stmt: OpaquePointer?) -> Project {
+        Project(
+            id: sqlite3_column_int64(stmt, 0),
+            code: colText(stmt, 1),
+            name: colText(stmt, 2),
+            detail: colText(stmt, 3),
+            createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)),
+            sortOrder: Int(sqlite3_column_int64(stmt, 5)),
+            archivedAt: sqlite3_column_type(stmt, 6) == SQLITE_NULL
+                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
+        )
+    }
+
+    /// One project by id, archived or not.
+    public func getProject(id: Int64) throws -> Project {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare("SELECT \(Self.projectCols) FROM projects WHERE id=?;", [.int(id)])
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.notFound("project \(id)") }
+        return projectFromRow(stmt)
+    }
+
+    /// Archive (`archived: true`) or unarchive a project; returns it with its count of
+    /// open tasks (read in the same transaction). Idempotent: archiving an archived
+    /// project keeps its original `archived_at`. Its tasks stay as they are, and its code
+    /// stays taken (`uniqueProjectCode` checks every project).
+    @discardableResult
+    public func setProjectArchived(id: Int64, archived: Bool) throws -> (project: Project, openTasks: Int) {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            if archived {
+                try runWrite("UPDATE projects SET archived_at = COALESCE(archived_at, ?) WHERE id=?;",
+                             [.double(Date().timeIntervalSince1970), .int(id)])
+            } else {
+                try runWrite("UPDATE projects SET archived_at = NULL WHERE id=?;", [.int(id)])
+            }
+            guard sqlite3_changes(db) == 1 else { throw StoreError.notFound("project \(id)") }
+            let stmt = try prepare("SELECT \(Self.projectCols) FROM projects WHERE id=?;", [.int(id)])
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.notFound("project \(id)") }
+            let project = projectFromRow(stmt)
+            let open = openTaskCountUnlocked(id)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return (project, open)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// How many of a project's tasks (subtasks included) are still open (not `isClosed`).
+    public func openTaskCount(projectId: Int64) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return openTaskCountUnlocked(projectId)
+    }
+
+    private func openTaskCountUnlocked(_ projectId: Int64) -> Int {
+        Int(queryInt("SELECT COUNT(*) FROM tasks WHERE project_id=? AND status NOT IN \(Self.closedStatusSQL);",
+                     [.int(projectId)]) ?? 0)
     }
 
     /// Update a project's name and/or description (only provided fields change).
@@ -535,12 +597,15 @@ public final class Store: @unchecked Sendable {
         return task
     }
 
-    public func listTasks(projectId: Int64? = nil) throws -> [TodoTask] {
+    /// One project's tasks, or every task when `projectId` is nil; `includeArchived: false`
+    /// leaves out tasks of archived projects (`activeProjectSQL`, the rule list_tasks uses).
+    public func listTasks(projectId: Int64? = nil, includeArchived: Bool = true) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
         if let pid = projectId {
             return try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE project_id=? ORDER BY sort_order, id;", [.int(pid)])
         }
-        return try readTasks("SELECT \(Self.taskCols) FROM tasks ORDER BY project_id, sort_order, id;", [])
+        let whereSQL = includeArchived ? "" : "WHERE \(Self.activeProjectSQL) "
+        return try readTasks("SELECT \(Self.taskCols) FROM tasks \(whereSQL)ORDER BY project_id, sort_order, id;", [])
     }
 
     /// Tasks matching `filter`, filtered in SQL and ordered by status (`TaskStatus.listRank`:
@@ -570,6 +635,9 @@ public final class Store: @unchecked Sendable {
         if let parentId = filter.parentId {
             conds.append("parent_id=?"); binds.append(.int(parentId))
         }
+        if filter.projectId == nil && filter.parentId == nil && !filter.includeArchived {
+            conds.append(Self.activeProjectSQL)
+        }
         let whereSQL = conds.isEmpty ? "" : "WHERE " + conds.joined(separator: " AND ")
         return try readTasks(
             "SELECT \(Self.taskCols) FROM tasks \(whereSQL) "
@@ -590,6 +658,10 @@ public final class Store: @unchecked Sendable {
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
     }
+
+    /// The task's project is not archived — for cross-project task lists (a WHERE
+    /// condition over the `tasks` table's `project_id`).
+    static let activeProjectSQL = "project_id NOT IN (SELECT id FROM projects WHERE archived_at IS NOT NULL)"
 
     /// `TaskStatus.listRank` as a SQL expression over the `status` column.
     private static let statusRankSQL = "CASE status "
@@ -665,10 +737,11 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Ids of all tasks currently In Progress (across projects) — for effort accrual.
+    /// Ids of tasks currently In Progress in projects not archived — for effort accrual
+    /// (only the tasks the In Progress view and menu bar show earn focus time).
     public func inProgressTaskIds() throws -> [Int64] {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT id FROM tasks WHERE status='in_progress';", [])
+        let stmt = try prepare("SELECT id FROM tasks WHERE status='in_progress' AND \(Self.activeProjectSQL);", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Int64] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }

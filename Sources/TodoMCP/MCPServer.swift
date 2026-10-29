@@ -78,7 +78,8 @@ final class MCPServer {
     private func invoke(tool: String, args: [String: Any]) throws -> String {
         switch tool {
         case "list_projects":
-            return try jsonString(store.listProjects().map(projectDict))
+            let includeArchived = try boolArg(args, "include_archived") ?? false
+            return try jsonString(store.listProjects(includeArchived: includeArchived).map(projectDict))
 
         case "create_project":
             let name = try requireString(args, "name")
@@ -97,6 +98,15 @@ final class MCPServer {
             )
             return "updated"
 
+        case "archive_project", "unarchive_project":
+            let archive = tool == "archive_project"
+            let result = try store.setProjectArchived(id: try resolveProjectId(args, idKey: "id", codeKey: "code"),
+                                                      archived: archive)
+            var dict = projectDict(result.project)
+            // Archiving keeps open tasks open; say how many, as the app's confirmation does.
+            if archive && result.openTasks > 0 { dict["open_tasks"] = result.openTasks }
+            return try jsonString(dict)
+
         case "delete_project":
             try store.deleteProject(id: try resolveProjectId(args, idKey: "id", codeKey: "code"))
             return "deleted"
@@ -109,7 +119,8 @@ final class MCPServer {
             case let v as String where v == "compact" || v == "full": compact = v == "compact"
             default: throw MCPError.invalidArg("view must be \"compact\" or \"full\"")
             }
-            var filter = TaskFilter(statuses: try parseStatusFilter(args["status"]))
+            var filter = TaskFilter(statuses: try parseStatusFilter(args["status"]),
+                                    includeArchived: try boolArg(args, "include_archived") ?? false)
             if given(args, "project_id", "project_code") {
                 filter.projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
             }
@@ -171,12 +182,13 @@ final class MCPServer {
             } else {
                 projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
             }
+            try requireActiveProject(projectId)
             let task = try store.createTask(
                 projectId: projectId,
                 title: try requireString(args, "title"),
                 detail: args["detail"] as? String ?? "",
                 link: args["link"] as? String,
-                status: parseStatus(args["status"]) ?? .todo,
+                status: try statusArg(args) ?? .todo,
                 waitingOn: try parseWaitingOn(args["waiting_on"]),
                 waitingReason: try waitingReasonArg(args) ?? nil,
                 priority: parsePriority(args["priority"]) ?? .none,
@@ -222,7 +234,7 @@ final class MCPServer {
                 title: args["title"] as? String,
                 detail: args["detail"] as? String,
                 link: linkArg,
-                status: parseStatus(args["status"]),
+                status: try statusArg(args),
                 priority: parsePriority(args["priority"]),
                 dueDate: dueArg,
                 tags: parseTags(args["tags"]),
@@ -243,12 +255,15 @@ final class MCPServer {
             let toPid: Int64? = (args["to_project_id"] != nil || args["to_project_code"] != nil)
                 ? try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
                 : nil
+            if let toPid { try requireActiveProject(toPid) }
             let copy = try store.duplicateTask(id: try resolveTaskId(args), toProjectId: toPid)
             return try jsonString(taskDict(copy))
 
         case "move_task":
             let tid = try resolveTaskId(args)
-            try store.moveTask(id: tid, toProjectId: try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code"))
+            let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
+            try requireActiveProject(toPid)
+            try store.moveTask(id: tid, toProjectId: toPid)
             return try jsonString(taskDict(store.getTask(id: tid)))
 
         case "bulk_update_tasks":
@@ -257,7 +272,7 @@ final class MCPServer {
             if args.keys.contains("due_date") { dueArg = .some(parseDate(args["due_date"])) } else { dueArg = .none }
             // One transaction for the whole batch: any bad task leaves every task unchanged.
             try store.bulkUpdateTasks(
-                ids: ids, status: parseStatus(args["status"]), priority: parsePriority(args["priority"]),
+                ids: ids, status: try statusArg(args), priority: parsePriority(args["priority"]),
                 dueDate: dueArg, addTags: parseTags(args["add_tags"]),
                 waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args))
             return "updated \(ids.count) tasks"
@@ -265,7 +280,8 @@ final class MCPServer {
         case "bulk_move_tasks":
             let ids = try resolveTaskIds(args)
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
-            let copy = (args["copy"] as? Bool) ?? false
+            try requireActiveProject(toPid)
+            let copy = try boolArg(args, "copy") ?? false
             for id in ids {
                 if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid) }
                 else { try store.moveTask(id: id, toProjectId: toPid) }
@@ -313,6 +329,7 @@ final class MCPServer {
         case "new_task_from_template":
             let templateId = try requireInt(args, "template_id")
             let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            try requireActiveProject(pid)
             let task = try store.instantiateTemplate(id: templateId, intoProjectId: pid)
             return try jsonString(taskDict(task))
 
@@ -332,7 +349,10 @@ final class MCPServer {
     // MARK: - Serialization helpers
 
     private func projectDict(_ p: Project) -> [String: Any] {
-        ["id": p.id, "code": p.code, "name": p.name, "description": p.detail, "created_at": iso(p.createdAt)]
+        var d: [String: Any] = ["id": p.id, "code": p.code, "name": p.name, "description": p.detail,
+                                "created_at": iso(p.createdAt)]
+        if let a = p.archivedAt { d["archived_at"] = iso(a) }
+        return d
     }
 
     /// The shared task serializer behind every tool that returns tasks. Other tasks are
@@ -512,6 +532,34 @@ final class MCPServer {
         throw MCPError.missingArg("\(idKey) or \(codeKey)")
     }
 
+    /// New or moved tasks go to active projects only (the app's move/copy menus list no
+    /// archived ones), so an agent's work never lands out of cross-project lists.
+    /// Reading and updating tasks already in an archived project stays allowed.
+    private func requireActiveProject(_ id: Int64) throws {
+        let p = try store.getProject(id: id)
+        if p.isArchived { throw MCPError.invalidArg("project \(p.code) is archived; unarchive it first") }
+    }
+
+    /// A boolean argument: absent or null = nil. Only JSON true/false count — numbers
+    /// such as 0 or 1 are rejected, not read as a boolean.
+    private func boolArg(_ args: [String: Any], _ key: String) throws -> Bool? {
+        guard let v = args[key], !(v is NSNull) else { return nil }
+        guard let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else {
+            throw MCPError.invalidArg("\(key) must be true or false")
+        }
+        return n.boolValue
+    }
+
+    /// `status` for create/update: absent or null = not given; otherwise a known status
+    /// (a typo is an error, not a silent todo or no-op).
+    private func statusArg(_ args: [String: Any]) throws -> TaskStatus? {
+        guard let v = args["status"], !(v is NSNull) else { return nil }
+        guard let s = v as? String, let st = TaskStatus(rawValue: s) else {
+            throw MCPError.invalidArg("status must be one of: \(TaskStatus.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return st
+    }
+
     /// True if any of `keys` is present with a non-null value.
     private func given(_ args: [String: Any], _ keys: String...) -> Bool {
         keys.contains { k in args[k].map { !($0 is NSNull) } ?? false }
@@ -521,11 +569,6 @@ final class MCPServer {
 
     private func iso(_ d: Date) -> String {
         Self.isoFormatter.string(from: d)
-    }
-
-    private func parseStatus(_ v: Any?) -> TaskStatus? {
-        guard let s = v as? String else { return nil }
-        return TaskStatus(rawValue: s)
     }
 
     /// list_tasks `status`: a status or an array of them; "all" means every status.

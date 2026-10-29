@@ -115,6 +115,8 @@ struct ProjectSidebar: View {
     @State private var showNew = false
     @State private var editing: Project?      // non-nil → edit sheet open
     @State private var showTemplates = false
+    @State private var archiving: ArchiveRequest?   // non-nil → archive confirm sheet open
+    @AppStorage("qbArchivedExpanded") private var archivedExpanded = false
 
     /// Cozy-RPG sidebar icons (bundled Lucide set) for the smart views.
     private func qbSidebarIcon(_ v: SmartView) -> String {
@@ -174,43 +176,16 @@ struct ProjectSidebar: View {
                 sidebarHeader("Quests")
             }
             Section {
-                ForEach(model.projects) { p in
-                    HStack(spacing: 6) {
-                        QBIcon(name: "lucide-door-open")
-                        Text(p.name).font(Theme.Fonts.bodySmMedium)
-                        Spacer()
-                        CodeBadge(code: p.code)
-                        Text("\(taskCount(p.id))")
-                            .font(Theme.Fonts.micro)
-                            .foregroundStyle(Theme.Colors.slate)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Theme.Colors.surface, in: Capsule())
-                    }
-                    .tag(p.id)
-                    .listRowBackground(sidebarRowCard(
-                        model.smartView == nil && !model.showDashboard && model.selectedProjectId == p.id))
-                    .help(p.detail.isEmpty ? p.name : p.detail)
-                    .contextMenu {
-                        Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
-                        Button("Edit…") { editing = p }
-                        if model.templates.isEmpty {
-                            Button("New Task from Template…") { showTemplates = true }
-                        } else {
-                            Menu("New Task from Template") {
-                                ForEach(model.templates) { t in
-                                    Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
-                                }
-                                Divider()
-                                Button("Manage Templates…") { showTemplates = true }
-                            }
-                        }
-                        Divider()
-                        Button("Delete", role: .destructive) { model.deleteProject(p.id) }
-                    }
-                }
+                ForEach(model.activeProjects) { p in projectRow(p) }
             } header: {
                 sidebarHeader("Quest Logs")
+            }
+            if !model.archivedProjects.isEmpty {
+                Section(isExpanded: $archivedExpanded) {
+                    ForEach(model.archivedProjects) { p in projectRow(p) }
+                } header: {
+                    sidebarHeader("Archived")
+                }
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -247,13 +222,124 @@ struct ProjectSidebar: View {
             }
         }
         .sheet(isPresented: $showTemplates) { TemplatesSheet() }
+        // The selected project just got archived (here or by an agent): open the Archived
+        // group so its row, and the selection, stay visible.
+        .onChange(of: selectedIsArchived) { _, archived in
+            if archived { archivedExpanded = true }
+        }
+        .sheet(item: $archiving) { req in
+            ArchiveProjectSheet(project: req.project, openCount: req.openCount) {
+                model.setArchived(req.project.id, true)
+            }
+        }
         .onChange(of: model.pendingNewProject) { _, pending in
             if pending { showNew = true; model.pendingNewProject = false }
         }
     }
 
+    /// True while the selected sidebar item is an archived project.
+    private var selectedIsArchived: Bool {
+        guard model.smartView == nil, !model.showDashboard, let sel = model.selectedProjectId else { return false }
+        return model.archivedProjects.contains { $0.id == sel }
+    }
+
+    /// A project row (active or archived — archived rows are dimmed) with its context menu.
+    private func projectRow(_ p: Project) -> some View {
+        HStack(spacing: 6) {
+            QBIcon(name: "lucide-door-open")
+            Text(p.name).font(Theme.Fonts.bodySmMedium)
+            Spacer()
+            CodeBadge(code: p.code)
+            Text("\(taskCount(p.id))")
+                .font(Theme.Fonts.micro)
+                .foregroundStyle(Theme.Colors.slate)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Theme.Colors.surface, in: Capsule())
+        }
+        .opacity(p.isArchived ? 0.6 : 1)
+        .tag(p.id)
+        .listRowBackground(sidebarRowCard(
+            model.smartView == nil && !model.showDashboard && model.selectedProjectId == p.id))
+        .help(p.detail.isEmpty ? p.name : p.detail)
+        .contextMenu {
+            Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
+            Button("Edit…") { editing = p }
+            if model.templates.isEmpty {
+                Button("New Task from Template…") { showTemplates = true }
+            } else {
+                Menu("New Task from Template") {
+                    ForEach(model.templates) { t in
+                        Button(t.name) { model.newTaskFromTemplate(t.id, intoProject: p.id) }
+                    }
+                    Divider()
+                    Button("Manage Templates…") { showTemplates = true }
+                }
+            }
+            Divider()
+            if p.isArchived {
+                Button("Unarchive") { model.setArchived(p.id, false) }
+            } else {
+                Button("Archive") { requestArchive(p) }
+            }
+            Button("Delete", role: .destructive) { model.deleteProject(p.id) }
+        }
+    }
+
+    /// Archive straight away when nothing is open; otherwise confirm with the open count.
+    private func requestArchive(_ p: Project) {
+        let open = model.openTaskCount(p.id)
+        if open == 0 {
+            model.setArchived(p.id, true)
+        } else {
+            archiving = ArchiveRequest(project: p, openCount: open)
+        }
+    }
+
     private func taskCount(_ pid: Int64) -> Int {
         (try? model.store.listTasks(projectId: pid).count) ?? 0
+    }
+}
+
+/// A pending archive of a project that still has open tasks (drives the confirm sheet).
+private struct ArchiveRequest: Identifiable {
+    let project: Project
+    let openCount: Int
+    var id: Int64 { project.id }
+}
+
+/// Confirms archiving a project that still has open tasks. The tasks are kept as they
+/// are; the project moves to the sidebar's Archived group.
+struct ArchiveProjectSheet: View {
+    let project: Project
+    let openCount: Int
+    let onArchive: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Archive \(project.name)?").font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
+            Text("\(openCount) open task\(openCount == 1 ? "" : "s") will stay open. "
+                 + "Archived projects leave All Tasks, In Progress and the menu bar, "
+                 + "but you can still open them from the Archived group.")
+                .font(Theme.Fonts.bodySm)
+                .foregroundStyle(Theme.Colors.slate)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                Button("Archive") {
+                    onArchive()
+                    dismiss()
+                }
+                .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: 380)
+        .qbParchment()
     }
 }
 
@@ -568,9 +654,10 @@ struct TaskListView: View {
         return model.projects.first(where: { $0.id == model.selectedProjectId })?.name ?? "Tasks"
     }
 
-    /// Projects other than the one currently selected (move/copy targets).
+    /// Active projects other than the one currently selected (move/copy targets;
+    /// archived projects are left out).
     private var otherProjects: [Project] {
-        model.projects.filter { $0.id != model.selectedProjectId }
+        model.activeProjects.filter { $0.id != model.selectedProjectId }
     }
 
     private var isSearching: Bool {

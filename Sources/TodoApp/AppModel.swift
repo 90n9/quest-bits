@@ -111,7 +111,7 @@ final class AppModel: ObservableObject {
         self.settings = loaded
         self.pomodoro = PomodoroEngine(store: store, settings: loaded)
         reloadAll()
-        if selectedProjectId == nil { selectedProjectId = projects.first?.id }
+        if selectedProjectId == nil { selectedProjectId = (activeProjects.first ?? projects.first)?.id }
         reloadTasks()
         startWatching()
 
@@ -145,7 +145,7 @@ final class AppModel: ObservableObject {
         projects = (try? store.listProjects()) ?? []
         templates = (try? store.listTemplates()) ?? []
         if let sel = selectedProjectId, !projects.contains(where: { $0.id == sel }) {
-            selectedProjectId = projects.first?.id
+            selectedProjectId = (activeProjects.first ?? projects.first)?.id
         }
         reloadTasks()
         reloadStats()
@@ -159,14 +159,18 @@ final class AppModel: ObservableObject {
 
     func reloadTasks() {
         let all = (try? store.listTasks(projectId: nil)) ?? []
+        // Cross-project views (smart views, menu bar) leave out archived projects, by the
+        // same Store rule as MCP list_tasks; a selected project shows in full, archived or
+        // not. Due-date reminders still cover every task.
+        let active = (try? store.listTasks(projectId: nil, includeArchived: false)) ?? []
         if let sv = smartView {
-            tasks = sv == .inProgress ? all.filter { $0.status == .inProgress } : all
+            tasks = sv == .inProgress ? active.filter { $0.status == .inProgress } : active
         } else if let pid = selectedProjectId {
             tasks = all.filter { $0.projectId == pid }
         } else {
             tasks = []
         }
-        inProgressTasks = all.filter { $0.status == .inProgress }
+        inProgressTasks = active.filter { $0.status == .inProgress }
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
         syncDueReminders(all)
         reloadNotes()
@@ -224,6 +228,12 @@ final class AppModel: ObservableObject {
         if task.tags.contains(where: { $0.lowercased().contains(q) }) { return true }
         return false
     }
+
+    /// Projects not archived, in sidebar order (also the move/copy targets).
+    var activeProjects: [Project] { projects.filter { !$0.isArchived } }
+
+    /// Archived projects, in sidebar order (the collapsed "Archived" group).
+    var archivedProjects: [Project] { projects.filter(\.isArchived) }
 
     /// Project code for a task id (used by smart views to label rows).
     func projectCode(for projectId: Int64) -> String {
@@ -289,6 +299,22 @@ final class AppModel: ObservableObject {
 
     func updateProject(_ id: Int64, name: String? = nil, detail: String? = nil) {
         try? store.updateProject(id: id, name: name, detail: detail)
+        reloadAll()
+    }
+
+    /// Tasks of a project still open — the count the archive confirmation shows.
+    func openTaskCount(_ projectId: Int64) -> Int {
+        store.openTaskCount(projectId: projectId)
+    }
+
+    /// Archive or unarchive a project. It stays selected (an archived project is still
+    /// viewable); a failed write surfaces as a toast.
+    func setArchived(_ id: Int64, _ archived: Bool) {
+        do {
+            try store.setProjectArchived(id: id, archived: archived)
+        } catch {
+            flashToast("Couldn't \(archived ? "archive" : "unarchive") project: \(error)")
+        }
         reloadAll()
     }
 

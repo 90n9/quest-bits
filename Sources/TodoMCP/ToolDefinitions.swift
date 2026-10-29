@@ -19,8 +19,8 @@ extension MCPServer {
 
         return [
             ["name": "list_projects",
-             "description": "List all projects. Each has a short `code` (e.g. GEN) usable as a handle.",
-             "inputSchema": obj([:])],
+             "description": "List projects. Each has a short `code` (e.g. GEN) usable as a handle. Archived projects are left out unless `include_archived` is true; they carry `archived_at`.",
+             "inputSchema": obj(["include_archived": ["type": "boolean", "description": "also list archived projects (default false)"] as [String: Any]])],
 
             ["name": "create_project",
              "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned.",
@@ -34,12 +34,20 @@ extension MCPServer {
              "description": "Update a project's `name` and/or `description` (identify by `id` or `code`).",
              "inputSchema": obj(["id": int, "code": str, "name": str, "description": str])],
 
+            ["name": "archive_project",
+             "description": "Archive a finished project (identify by `id` or `code`). Its tasks are kept, and it stays usable by id/code, but list_projects and list_tasks without a project leave it out. Its code stays reserved. Returns the project, with `open_tasks` when some are still open. Idempotent.",
+             "inputSchema": obj(["id": int, "code": str])],
+
+            ["name": "unarchive_project",
+             "description": "Unarchive a project (identify by `id` or `code`), making it active again. Returns the project. Idempotent.",
+             "inputSchema": obj(["id": int, "code": str])],
+
             ["name": "delete_project",
              "description": "Delete a project and all its tasks. Identify by `id` or `code`.",
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "list_tasks",
-             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
+             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Without `project_id`/`project_code` or `parent_id`/`parent_code`, tasks of archived projects are left out unless `include_archived` is true. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str,
                 "status": ["anyOf": [
@@ -47,6 +55,7 @@ extension MCPServer {
                     ["type": "array", "items": statusEnum, "minItems": 1]
                 ], "description": "status or statuses to include; \"all\" = every status. Default: open (todo, in_progress, waiting)."] as [String: Any],
                 "tag": str, "parent_id": int, "parent_code": str,
+                "include_archived": ["type": "boolean", "description": "with no project or parent given, also list tasks of archived projects (default false)"] as [String: Any],
                 "view": ["type": "string", "enum": ["compact", "full"], "description": "compact (default) or full (same fields as get_task, without notes)"] as [String: Any]
              ])],
 
@@ -58,7 +67,7 @@ extension MCPServer {
              ])],
 
             ["name": "create_task",
-             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). Returns the task with its new code (same shape as get_task, without notes).",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). The project (given or the parent's) must not be archived. Returns the task with its new code (same shape as get_task, without notes).",
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
@@ -80,11 +89,11 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "duplicate_task",
-             "description": "Clone a task (by `id` or `code`); the copy gets a fresh code. Without a target (or with its own project) it duplicates in the same project for reuse: the copy starts as a todo, and status, started/completed times and waiting fields are not copied. With another project as `to_project_id`/`to_project_code` it copies the task there as is (original kept): status, started/completed times and waiting fields carry over.",
+             "description": "Clone a task (by `id` or `code`); the copy gets a fresh code. Without a target (or with its own project) it duplicates in the same project for reuse: the copy starts as a todo, and status, started/completed times and waiting fields are not copied. With another project as `to_project_id`/`to_project_code` it copies the task there as is (original kept): status, started/completed times and waiting fields carry over. A target project must not be archived.",
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "move_task",
-             "description": "Move (transfer) a task (by `id` or `code`) to another project (`to_project_id` or `to_project_code`).",
+             "description": "Move (transfer) a task (by `id` or `code`) to another project (`to_project_id` or `to_project_code`), which must not be archived.",
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "bulk_update_tasks",
@@ -96,7 +105,7 @@ extension MCPServer {
              ])],
 
             ["name": "bulk_move_tasks",
-             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy to another project keeps each task's status, started/completed times and waiting fields (same rule as duplicate_task).",
+             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy to another project keeps each task's status, started/completed times and waiting fields (same rule as duplicate_task). The target project must not be archived.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
                 "to_project_id": int, "to_project_code": str, "copy": ["type": "boolean"]
@@ -139,7 +148,7 @@ extension MCPServer {
              ], required: ["name", "title"])],
 
             ["name": "new_task_from_template",
-             "description": "Create a real task from a template (`template_id`) into a project (`project_id` or `project_code`). Copies the template's title, detail, priority, tags, and estimate. Returns the new task with its code.",
+             "description": "Create a real task from a template (`template_id`) into a project (`project_id` or `project_code`, not archived). Copies the template's title, detail, priority, tags, and estimate. Returns the new task with its code.",
              "inputSchema": obj([
                 "template_id": int, "project_id": int, "project_code": str
              ], required: ["template_id"])],
