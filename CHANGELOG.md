@@ -13,15 +13,21 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.3.0] - 2026-10-30
+
 ### Added
 
 - New **Waiting** status for tasks parked on someone else. A waiting task says
   who it waits on — `user` (you have to decide or act) or `external` (a reply,
-  a review, a deploy) — plus an optional reason. MCP `create_task`,
-  `update_task` and `bulk_update_tasks` take `waiting_on` / `waiting_reason`;
-  setting `status: waiting` without `waiting_on` is an error unless the task is
-  already waiting, and moving to any other status clears both fields. Waiting
-  is still open: it can be blocked, and tasks that depend on it stay blocked.
+  a review, a deploy) — plus an optional reason, and remembers when it started
+  waiting (`waiting_since`, kept while it stays waiting, also when who it waits
+  on changes). MCP `create_task`, `update_task` and `bulk_update_tasks` take
+  `waiting_on` / `waiting_reason`; setting `status: waiting` without
+  `waiting_on` is an error unless the task is already waiting, and moving to
+  any other status clears all three fields. `get_task` shows them. Waiting is
+  still open: it can be blocked, and tasks that depend on it stay blocked.
   Changes to who a task waits on show in its history.
 - In the app, Waiting has its own clay colour, pause icon, board column and a
   "waiting on me / external" chip with the reason. Set it from the bulk Status
@@ -41,10 +47,12 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   (Mark Dropped ⌘6) or the task detail. Clicking a dropped task's status icon
   (or a dropped subtask's checkbox) reopens it as Todo, and dropped subtasks
   leave the parent's n/total subtask count.
-- MCP `list_tasks` filters: `status` (one status, an array, or `"all"`),
-  `tag` (a whole tag, case-insensitive for ASCII letters) and `parent_id` /
-  `parent_code` (subtasks of a task), alongside the existing project filter.
-  Filtering happens in the database, not after loading every task.
+- MCP `inbox`: the tasks an agent is waiting on you to answer — waiting tasks
+  with `waiting_on: user` — across every project that is not archived,
+  longest waiting first. Each item is compact: code, title, project code,
+  `waiting_since` and the waiting reason when there is one.
+  `include_external: true` adds tasks waiting on a third party (each item then
+  says `waiting_on`). An empty inbox is `[]`.
 - Task **notes**: a timestamped, append-only log on each task, so the detail
   can stay the task's spec. New MCP tool `add_note` (`id` or `code`, `text`,
   optional `kind`: `note`, `decision` or `review`) only inserts — nothing is
@@ -59,6 +67,10 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 - In the app, the task detail has a Notes section: notes newest first with a
   coloured kind chip, and a field with a kind picker to add your own. Notes
   an agent adds appear within the usual refresh.
+- MCP `list_tasks` filters: `status` (one status, an array, or `"all"`),
+  `tag` (a whole tag, case-insensitive for ASCII letters) and `parent_id` /
+  `parent_code` (subtasks of a task), alongside the existing project filter.
+  Filtering happens in the database, not after loading every task.
 - Archive finished projects to free up the sidebar. Right-click a project for
   Archive / Unarchive; archived projects move to an "Archived" group at the
   bottom of the sidebar, collapsed by default, and still open and work as
@@ -67,8 +79,9 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   Tasks, In Progress, the menu bar and the Move/Copy to menus, and their
   in-progress tasks earn no focus time; due-date reminders still fire.
   Archiving the selected project opens the Archived group so it stays in
-  view. An archived project's code stays taken, so a new project never
-  reuses it.
+  view. New Task, New Task from Template and adding a subtask are not offered
+  in an archived project. An archived project's code stays taken, so a new
+  project never reuses it.
 - MCP `archive_project` and `unarchive_project` (by `id` or `code`).
   `archive_project` returns the project with `open_tasks` when some are still
   open. `list_projects` leaves archived projects out unless
@@ -78,37 +91,15 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   tasks can't target an archived project (`create_task`, `move_task`,
   `bulk_move_tasks`, `duplicate_task` with a target, `new_task_from_template`
   fail with "project X is archived; unarchive it first"); reading and updating
-  its tasks works as usual. The app follows the same rule: New Task and New
-  Task from Template are not offered for an archived project, and adding a
-  subtask there shows the error.
-- MCP `inbox`: the tasks an agent is waiting on you to answer — waiting tasks
-  with `waiting_on: user` — across every project that is not archived,
-  longest waiting first. Each item is compact: code, title, project code,
-  `waiting_since` and the waiting reason when there is one.
-  `include_external: true` adds tasks waiting on a third party (each item then
-  says `waiting_on`). An empty inbox is `[]`.
-- Waiting tasks remember when they started waiting: `waiting_since` is set when
-  a task enters Waiting, kept while it stays waiting (also when who it waits on
-  changes), and cleared when it leaves. `get_task` shows it. A waiting task
-  copied to another project counts as a new ask and waits from the copy. Tasks
-  already waiting are filled in once from their history.
+  its tasks works as usual.
 - Drag projects in the sidebar's Quest Logs to reorder them. The new order is
   saved on drop and doesn't jump back on the next refresh; archived projects
   are not reordered, and an unarchived project goes to the end of the list.
   MCP `list_projects` returns projects in the same order (new projects last,
-  archived ones after the active ones with `include_archived`).
+  archived ones after the active ones with `include_archived`), and
+  cross-project task lists follow it too.
 
 ### Changed
-
-- Sidebar project rows show how much is left instead of a bare total: the
-  number is the project's open tasks (todo, in progress, waiting), and a thin
-  bar under the name fills with done out of the tasks still counted. Dropped
-  tasks count as neither left nor done. A clay dot before the number means
-  tasks in the project are waiting on you. Hover the number, bar or dot for
-  the exact counts. A project with no tasks shows `0` and an empty bar.
-- The sidebar counts are worked out from the task list the app already loads
-  on each refresh, instead of loading every task of every project again on
-  each redraw.
 
 - MCP responses are compact JSON (no pretty-printing, unescaped `/` in links),
   cutting task output by about a fifth on a real database. Every tool that
@@ -123,8 +114,17 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   tags, due date and `waiting_on`. Use `get_task` to read a task's detail, or
   pass `view: "full"` for the old shape and `status: "all"` to include done
   and dropped tasks. Results are sorted In Progress, Waiting, Todo, Done,
-  Dropped, then by board order. On a real database a project listing shrank
+  Dropped, then by board order: projects in sidebar order, then each
+  project's own task order. On a real database a project listing shrank
   from 35,378 to 1,500 characters and from 234,725 to 3,959.
+- Sidebar project rows show how much is left instead of a bare total: the
+  number is the project's open tasks (todo, in progress, waiting), and a thin
+  bar under the name fills with done out of the tasks still counted. Dropped
+  tasks count as neither left nor done. A clay dot before the number means
+  tasks in the project are waiting on you. Hover the number, bar or dot for
+  the exact counts. A project with no tasks shows `0` and an empty bar. The
+  counts come from the task list the app already loads on each refresh,
+  instead of loading every task of every project again on each redraw.
 - Reopening a done task (back to Todo or In Progress) now clears its
   `completed_at`, so it no longer counts as completed in the activity stats.
   Marking an already-done task done again keeps the original `completed_at`.
@@ -137,7 +137,8 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 - An MCP `*_code` argument that matches no task or project (e.g.
   `parent_code: "ZZZ-9"`) now fails with "not found: task ZZZ-9" instead of
-  "missing or invalid argument".
+  "missing or invalid argument". In the bulk tools' `codes` arrays an unknown
+  code is now the same error instead of being skipped.
 - MCP `create_task`, `update_task` and `bulk_update_tasks` reject an unknown
   `status` (e.g. `"waitng"`) instead of silently creating a todo or leaving
   the status unchanged.
@@ -155,14 +156,16 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   its status, times and waiting fields, and now means the same everywhere:
   `duplicate_task` with `to_project_*`, `bulk_move_tasks` with `copy: true`,
   and Copy to in the app (MCP `duplicate_task` used to reset the copy).
-- `bulk_update_tasks` is now all or nothing: every task is checked and written
-  in one transaction (including `add_tags`), so a bad or missing task leaves
-  the whole batch unchanged instead of half-applied. An `add_tags` that adds
-  nothing new no longer marks the task updated. The app's bulk Status and Add
-  Tags actions use the same all-or-nothing write and show an error instead of
-  a success toast when it fails. Like a single task, a batch marked Done
-  still goes through when a recurring task's next occurrence can't be
-  created (the occurrence is skipped).
+- Bulk changes are all or nothing: `bulk_update_tasks` (including `add_tags`)
+  and `bulk_move_tasks` (move or copy) check and write every task in one
+  transaction, so a bad or missing task, or an archived target, leaves the
+  whole batch unchanged instead of half-applied. An `add_tags` that adds
+  nothing new no longer marks the task updated. The app's bulk Status, Add
+  Tags, Move to and Copy to use the same writes, and its single-task Move to,
+  Copy to and Duplicate now show the error instead of a success toast when
+  the write fails. Like a single task, a batch marked Done still goes through
+  when a recurring task's next occurrence can't be created (the occurrence is
+  skipped).
 - Every status change now re-reads the task inside its write transaction, so
   a status change racing another process's write logs the status it actually
   replaced. Leaving Waiting no longer adds a separate "waiting on → (empty)"
@@ -172,10 +175,13 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   touched refresh from the database. Selecting a blocked task no longer raises
   the "Task is blocked" prompt (whose Cancel could write the previous task's
   status onto it).
-- One-time repair on first launch: done and in-progress tasks missing
+- Status data is repaired each time the app or MCP server opens the database,
+  touching only rows that need it, including rows written by an older
+  QuestBits build still running against the same file: done and in-progress tasks missing
   `completed_at` / `started_at` get them back from the task's status history,
-  falling back to its last-updated time; reopened tasks still carrying a
-  `completed_at` have it cleared.
+  falling back to its last-updated time, and waiting tasks get
+  `waiting_since` the same way; a `completed_at` left on a task that is not
+  done, and waiting fields left on a task that is not waiting, are cleared.
 - Creating projects with the same name from the app and an agent at the same
   moment can no longer give two projects the same code.
 
@@ -310,7 +316,11 @@ server for Claude Code.
 - CI (`release.yml`) builds a universal DMG on `v*` tags and publishes it to the
   public releases repo.
 
-[Unreleased]: https://github.com/90n9/quest-bits/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/90n9/quest-bits/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/90n9/quest-bits/compare/v1.2.3...v1.3.0
+[1.2.3]: https://github.com/90n9/quest-bits/compare/v1.2.2...v1.2.3
+[1.2.2]: https://github.com/90n9/quest-bits/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/90n9/quest-bits/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/90n9/quest-bits/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/90n9/quest-bits/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/90n9/quest-bits/releases/tag/v1.0.0
