@@ -90,6 +90,11 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   changes), and cleared when it leaves. `get_task` shows it. A waiting task
   copied to another project counts as a new ask and waits from the copy. Tasks
   already waiting are filled in once from their history.
+- Drag projects in the sidebar's Quest Logs to reorder them. The new order is
+  saved on drop and doesn't jump back on the next refresh; archived projects
+  are not reordered, and an unarchived project goes to the end of the list.
+  MCP `list_projects` returns projects in the same order (new projects last,
+  archived ones after the active ones with `include_archived`).
 
 ### Changed
 
@@ -157,6 +162,8 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   `completed_at` / `started_at` get them back from the task's status history,
   falling back to its last-updated time; reopened tasks still carrying a
   `completed_at` have it cleared.
+- Creating projects with the same name from the app and an agent at the same
+  moment can no longer give two projects the same code.
 
 ## [1.2.3] - 2026-07-09
 

@@ -19,7 +19,7 @@ extension MCPServer {
 
         return [
             ["name": "list_projects",
-             "description": "List projects. Each has a short `code` (e.g. GEN) usable as a handle. Archived projects are left out unless `include_archived` is true; they carry `archived_at`.",
+             "description": "List projects in the user's sidebar order (new projects last). Each has a short `code` (e.g. GEN) usable as a handle. Archived projects are left out unless `include_archived` is true; they carry `archived_at` and come after the active ones.",
              "inputSchema": obj(["include_archived": ["type": "boolean", "description": "also list archived projects (default false)"] as [String: Any]])],
 
             ["name": "create_project",

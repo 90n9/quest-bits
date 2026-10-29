@@ -318,6 +318,23 @@ final class AppModel: ObservableObject {
         reloadAll()
     }
 
+    /// Reorder the active projects after a sidebar drag (offsets index `activeProjects`).
+    /// The order is written synchronously on the drop and read back in the same call, so
+    /// no poll can reload the old order in between; on a failed write the reload shows
+    /// the stored order. The poll stamp is taken before the reload: this write doesn't
+    /// trigger a second one, and a write by an agent after it still does.
+    func moveProjects(from offsets: IndexSet, to destination: Int) {
+        var ordered = activeProjects
+        ordered.move(fromOffsets: offsets, toOffset: destination)
+        do {
+            try store.reorderProjects(ids: ordered.map(\.id))
+        } catch {
+            flashToast("Couldn't reorder projects: \(error)")
+        }
+        lastDBStamp = currentDBStamp()
+        reloadAll()
+    }
+
     func deleteProject(_ id: Int64) {
         try? store.deleteProject(id: id)
         if selectedProjectId == id { selectedProjectId = nil }

@@ -177,6 +177,8 @@ struct ProjectSidebar: View {
             }
             Section {
                 ForEach(model.activeProjects) { p in projectRow(p) }
+                    // Drag to reorder; only active projects — the Archived group has no onMove.
+                    .onMove { offsets, dest in model.moveProjects(from: offsets, to: dest) }
             } header: {
                 sidebarHeader("Quest Logs")
             }

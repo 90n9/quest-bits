@@ -418,24 +418,82 @@ public final class Store: @unchecked Sendable {
     @discardableResult
     public func createProject(name: String, detail: String = "") throws -> Project {
         lock.lock(); defer { lock.unlock() }
-        let now = Date()
-        let code = uniqueProjectCode(from: name)
-        try runWrite(
-            "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order) VALUES (?, ?, ?, 0, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM projects));",
-            [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970))]
-        )
-        let id = lastInsertId()
-        return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: 0)
+        // The code pick, the end-of-list sort_order and the INSERT are one read-modify-write
+        // the app and MCP server can race on (both picking the same code).
+        do {
+            try beginImmediate()
+            let now = Date()
+            let code = uniqueProjectCode(from: name)
+            guard let sortOrder = queryInt("SELECT \(Self.nextProjectSortOrderSQL);", []) else { throw StoreError.step(errmsg()) }
+            try runWrite(
+                "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order) VALUES (?, ?, ?, 0, ?, ?);",
+                [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970)), .int(sortOrder)]
+            )
+            let id = lastInsertId()
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: Int(sortOrder))
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// The sort_order after every project (archived ones too): new and unarchived projects go last.
+    private static let nextProjectSortOrderSQL = "(SELECT COALESCE(MAX(sort_order)+1,0) FROM projects)"
+
+    /// Persist a new sidebar order for the active projects (`ids` in desired order).
+    /// Inside one BEGIN IMMEDIATE it re-reads the active projects and writes a dense
+    /// sort_order 0, 1, … over them in one UPDATE: ids deleted or archived meanwhile are
+    /// skipped, and active projects missing from `ids` (e.g. just created by an agent)
+    /// keep their relative order after the given ones. Archived projects keep their
+    /// sort_order (they list after the active ones, and unarchiving puts one last).
+    public func reorderProjects(ids: [Int64]) throws {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            var current: [Int64] = []
+            var stored: [Int64: Int64] = [:]
+            let stmt = try prepare("SELECT id, sort_order FROM projects WHERE archived_at IS NULL ORDER BY sort_order, id;", [])
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                let id = sqlite3_column_int64(stmt, 0)
+                current.append(id)
+                stored[id] = sqlite3_column_int64(stmt, 1)
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+            let active = Set(current)
+            var seen = Set<Int64>()
+            let given = ids.filter { active.contains($0) && seen.insert($0).inserted }
+            // Only rows whose position changed: an unchanged order writes nothing (no poll reload).
+            let moved = (given + current.filter { !seen.contains($0) }).enumerated()
+                .map { (id: $0.element, order: Int64($0.offset)) }
+                .filter { stored[$0.id] != $0.order }
+            if !moved.isEmpty {
+                let cases = Array(repeating: "WHEN ? THEN ?", count: moved.count).joined(separator: " ")
+                let marks = Array(repeating: "?", count: moved.count).joined(separator: ", ")
+                let binds = moved.flatMap { [SQLValue.int($0.id), .int($0.order)] } + moved.map { SQLValue.int($0.id) }
+                try runWrite("UPDATE projects SET sort_order = CASE id \(cases) END WHERE id IN (\(marks));", binds)
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
     }
 
     /// Canonical project column list (order must match `projectFromRow`).
     private static let projectCols = "id, code, name, detail, created_at, sort_order, archived_at"
 
-    /// Projects in sidebar order. `includeArchived: false` leaves out archived ones.
+    /// Projects in sidebar order: active ones by sort_order (new projects go last), then
+    /// archived ones by sort_order; id breaks ties. `includeArchived: false` leaves out
+    /// archived ones.
     public func listProjects(includeArchived: Bool = true) throws -> [Project] {
         lock.lock(); defer { lock.unlock() }
         let whereSQL = includeArchived ? "" : "WHERE archived_at IS NULL "
-        let stmt = try prepare("SELECT \(Self.projectCols) FROM projects \(whereSQL)ORDER BY sort_order, id;", [])
+        let stmt = try prepare(
+            "SELECT \(Self.projectCols) FROM projects \(whereSQL)ORDER BY archived_at IS NOT NULL, sort_order, id;", [])
         defer { sqlite3_finalize(stmt) }
         var out: [Project] = []
         while sqlite3_step(stmt) == SQLITE_ROW { out.append(projectFromRow(stmt)) }
@@ -466,8 +524,9 @@ public final class Store: @unchecked Sendable {
 
     /// Archive (`archived: true`) or unarchive a project; returns it with its count of
     /// open tasks (read in the same transaction). Idempotent: archiving an archived
-    /// project keeps its original `archived_at`. Its tasks stay as they are, and its code
-    /// stays taken (`uniqueProjectCode` checks every project).
+    /// project keeps its original `archived_at`, and unarchiving moves a project to the
+    /// end of the active list only when it was archived. Its tasks stay as they are, and
+    /// its code stays taken (`uniqueProjectCode` checks every project).
     @discardableResult
     public func setProjectArchived(id: Int64, archived: Bool) throws -> (project: Project, openTasks: Int) {
         lock.lock(); defer { lock.unlock() }
@@ -477,7 +536,12 @@ public final class Store: @unchecked Sendable {
                 try runWrite("UPDATE projects SET archived_at = COALESCE(archived_at, ?) WHERE id=?;",
                              [.double(Date().timeIntervalSince1970), .int(id)])
             } else {
-                try runWrite("UPDATE projects SET archived_at = NULL WHERE id=?;", [.int(id)])
+                // Back at the end of the active list; an active project keeps its place.
+                try runWrite(
+                    """
+                    UPDATE projects SET archived_at = NULL, sort_order = CASE WHEN archived_at IS NULL THEN sort_order
+                        ELSE \(Self.nextProjectSortOrderSQL) END WHERE id=?;
+                    """, [.int(id)])
             }
             guard sqlite3_changes(db) == 1 else { throw StoreError.notFound("project \(id)") }
             let stmt = try prepare("SELECT \(Self.projectCols) FROM projects WHERE id=?;", [.int(id)])
