@@ -34,7 +34,9 @@ final class AppModel: ObservableObject {
     @Published var projects: [Project] = []
     @Published var tasks: [TodoTask] = []          // tasks for the selected project
     @Published var selectedProjectId: Int64?
-    @Published var selectedTaskIds: Set<Int64> = []
+    @Published var selectedTaskIds: Set<Int64> = [] {
+        didSet { if selectedTaskId != notesTaskId { reloadNotes() } }
+    }
     @Published var smartView: SmartView?      // when set, tasks span all projects
     @Published var searchQuery: String = ""   // live filter over the displayed task list
 
@@ -79,6 +81,15 @@ final class AppModel: ObservableObject {
     // Set by menu commands; views observe these to open their create sheets.
     @Published var pendingNewProject = false
     @Published var pendingNewTask = false
+
+    // Notes of the single selected task, newest first: the latest `notesLimit` of them.
+    // Loaded on selection change and on every task reload (app writes and MCP polls),
+    // republished only when they changed.
+    @Published private(set) var selectedTaskNotes: [TaskNote] = []
+    @Published private(set) var hasOlderNotes = false
+    private var notesTaskId: Int64?
+    private var notesLimit = AppModel.notesPage
+    static let notesPage = 20
 
     // Transient confirmation toast (e.g. after copying a code).
     @Published var toast: String?
@@ -158,6 +169,7 @@ final class AppModel: ObservableObject {
         inProgressTasks = all.filter { $0.status == .inProgress }
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
         syncDueReminders(all)
+        reloadNotes()
     }
 
     /// Keep local due-date notifications in sync with the current task set.
@@ -220,6 +232,46 @@ final class AppModel: ObservableObject {
 
     func history(forTask id: Int64) -> [TaskEvent] {
         (try? store.taskHistory(taskId: id)) ?? []
+    }
+
+    /// Refresh `selectedTaskNotes` for the selected task. A different task starts again
+    /// from the first page. One extra row tells whether older notes exist. On a read
+    /// error the shown notes are kept and a toast says so.
+    private func reloadNotes() {
+        let id = selectedTaskId
+        if id != notesTaskId { notesTaskId = id; notesLimit = Self.notesPage }
+        guard let id else {
+            if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
+            if hasOlderNotes { hasOlderNotes = false }
+            return
+        }
+        do {
+            let rows = try store.notes(taskId: id, limit: notesLimit + 1)
+            let page = Array(rows.prefix(notesLimit)), older = rows.count > notesLimit
+            if page != selectedTaskNotes { selectedTaskNotes = page }
+            if older != hasOlderNotes { hasOlderNotes = older }
+        } catch {
+            flashToast("Couldn't load notes: \(error)")
+        }
+    }
+
+    /// Show the next page of older notes for the selected task.
+    func showOlderNotes() {
+        notesLimit += Self.notesPage
+        reloadNotes()
+    }
+
+    /// Append a note to a task. Returns false (with a toast) if the store rejected it.
+    @discardableResult
+    func addNote(_ task: TodoTask, text: String, kind: NoteKind) -> Bool {
+        do {
+            try store.addNote(taskId: task.id, text: text, kind: kind)
+        } catch {
+            flashToast("Couldn't add a note to \(task.code): \(error)")
+            return false
+        }
+        reloadTasks()   // the note bumped updated_at; reloads the notes too
+        return true
     }
 
     // MARK: - Project CRUD

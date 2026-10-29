@@ -100,6 +100,7 @@ public final class Store: @unchecked Sendable {
             let idx = Int32(i + 1)
             switch v {
             case .int(let n): sqlite3_bind_int64(stmt, idx, n)
+            case .double(let d): sqlite3_bind_double(stmt, idx, d)
             case .text(let s): sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT)
             case .null: sqlite3_bind_null(stmt, idx)
             }
@@ -238,6 +239,19 @@ public final class Store: @unchecked Sendable {
         // --- Additive migration: waiting status (who it waits on + why) ---
         if !columnExists("tasks", "waiting_on") { exec("ALTER TABLE tasks ADD COLUMN waiting_on TEXT;") }
         if !columnExists("tasks", "waiting_reason") { exec("ALTER TABLE tasks ADD COLUMN waiting_reason TEXT;") }
+
+        // --- Additive migration: task notes (append-only log; detail stays the spec) ---
+        // The kind list is fixed in the table's CHECK: a new NoteKind needs a table rebuild.
+        exec("""
+        CREATE TABLE IF NOT EXISTS task_notes (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            ts      REAL NOT NULL,
+            kind    TEXT NOT NULL DEFAULT 'note' CHECK(kind IN ('note','decision','review')),
+            text    TEXT NOT NULL
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_notes_task_ts ON task_notes(task_id, ts);")
 
         // --- One-time data repair: status timestamps (schema user_version 1) ---
         backfillStatusTimestamps()
@@ -990,6 +1004,59 @@ public final class Store: @unchecked Sendable {
         return merged
     }
 
+    // MARK: - Notes
+
+    /// Append a note to a task: a single INSERT, never a read-modify-write of the task,
+    /// so concurrent writers cannot lose each other's notes. The same transaction bumps
+    /// the task's `updated_at` (a note is activity on the task), which doubles as the
+    /// existence check. Not logged to task_history. Text is trimmed and must not be empty.
+    /// Returns the note and the task's code.
+    @discardableResult
+    public func addNote(taskId: Int64, text: String, kind: NoteKind = .note) throws -> (note: TaskNote, taskCode: String) {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { throw StoreError.invalid("note text is empty") }
+        lock.lock(); defer { lock.unlock() }
+        // Full precision (REAL), so notes from one second still order by time; updated_at
+        // keeps whole seconds like every other write of it.
+        let now = Date()
+        do {
+            try beginImmediate()
+            try runWrite("UPDATE tasks SET updated_at=? WHERE id=?;",
+                         [.int(Int64(now.timeIntervalSince1970)), .int(taskId)])
+            guard sqlite3_changes(db) == 1 else { throw StoreError.notFound("task \(taskId)") }
+            try runWrite("INSERT INTO task_notes (task_id, ts, kind, text) VALUES (?, ?, ?, ?);",
+                         [.int(taskId), .double(now.timeIntervalSince1970), .text(kind.rawValue), .text(body)])
+            let note = TaskNote(id: lastInsertId(), taskId: taskId, timestamp: now, kind: kind, text: body)
+            let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(taskId)]) ?? ""
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return (note, code)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// A task's notes, newest first; `limit` nil = all of them.
+    public func notes(taskId: Int64, limit: Int? = nil) throws -> [TaskNote] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            "SELECT id, task_id, ts, kind, text FROM task_notes WHERE task_id=? ORDER BY ts DESC, id DESC LIMIT ?;",
+            [.int(taskId), .int(Int64(limit.map { max(0, $0) } ?? -1))]   // LIMIT -1 = no limit
+        )
+        defer { sqlite3_finalize(stmt) }
+        var out: [TaskNote] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            out.append(TaskNote(
+                id: sqlite3_column_int64(stmt, 0),
+                taskId: sqlite3_column_int64(stmt, 1),
+                timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                kind: NoteKind(rawValue: colText(stmt, 3)) ?? .note,
+                text: colText(stmt, 4)
+            ))
+        }
+        return out
+    }
+
     // MARK: - Dependencies (blocked-by)
 
     /// The ids of tasks that `taskId` is blocked by (its depends-on list).
@@ -1454,6 +1521,7 @@ private func colTextOpt(_ stmt: OpaquePointer?, _ i: Int32) -> String? {
 
 enum SQLValue {
     case int(Int64)
+    case double(Double)
     case text(String)
     case null
 }

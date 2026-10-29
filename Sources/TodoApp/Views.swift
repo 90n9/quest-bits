@@ -1213,6 +1213,11 @@ struct TaskDetailView: View {
     /// edit only while it differs from this snapshot; autosave sends just those fields,
     /// and a store change (e.g. an MCP write) refreshes the fields the user hasn't touched.
     @State private var base: TodoTask?
+    // Draft note (not a task field: autosave ignores it). Kept while the same task is
+    // shown, cleared only when a different task is loaded.
+    @State private var noteText = ""
+    @State private var noteKind: NoteKind = .note
+    @State private var noteDraftTaskId: Int64?
 
     // Blocked-task guard: confirm before moving a blocked task to In Progress.
     @State private var showBlockedAlert = false
@@ -1296,6 +1301,7 @@ struct TaskDetailView: View {
                 blockedSection(task)
                 linkSection
                 detailSection
+                notesSection(task)
                 estimateSection(task)
                 timingSection(task)
                 historySection(task)
@@ -1445,6 +1451,47 @@ struct TaskDetailView: View {
         }
     }
 
+    /// The task's append-only log: an input to add a note (with its kind), then the
+    /// notes newest first, a page at a time (`AppModel.selectedTaskNotes`, which also
+    /// picks up notes added over MCP on the next poll).
+    private func notesSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Notes") {
+            HStack(alignment: .top, spacing: 8) {
+                TextField("Add a note…", text: $noteText, axis: .vertical)
+                    .lineLimit(1...5)
+                    .qbField()
+                    .onSubmit { commitNote(task) }
+                Picker("", selection: $noteKind) {
+                    ForEach(NoteKind.allCases, id: \.self) { Text($0.display).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+                Button("Add") { commitNote(task) }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                    .disabled(noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            if model.selectedTaskNotes.isEmpty {
+                Text("No notes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
+            } else {
+                LazyVStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
+                    ForEach(model.selectedTaskNotes) { NoteRow(note: $0) }
+                }
+                if model.hasOlderNotes {
+                    Button("Show older notes") { model.showOlderNotes() }
+                        .buttonStyle(QBLinkButtonStyle())
+                }
+            }
+        }
+    }
+
+    private func commitNote(_ task: TodoTask) {
+        guard !noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if model.addNote(task, text: noteText, kind: noteKind) {
+            noteText = ""
+            noteKind = .note
+        }
+    }
+
     private func estimateSection(_ task: TodoTask) -> some View {
         QBDetailSection("Estimate") {
             Stepper(value: $estimateMinutes, in: 0...6000, step: 5) {
@@ -1526,6 +1573,7 @@ struct TaskDetailView: View {
     /// Fill every editor field from `t` and make it the snapshot.
     private func load(_ t: TodoTask) {
         base = t
+        if noteDraftTaskId != t.id { noteText = ""; noteKind = .note; noteDraftTaskId = t.id }
         title = t.title; detail = t.detail; link = t.link ?? ""; status = t.status
         waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
         priority = t.priority
@@ -1624,6 +1672,46 @@ struct HistoryRow: View {
         case "estimate": return "Estimate"
         case "project": return "Moved project"
         default: return event.field.capitalized
+        }
+    }
+}
+
+/// One entry in a task's notes: kind chip and time, then the (selectable) text.
+struct NoteRow: View {
+    let note: TaskNote
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                NoteKindChip(kind: note.kind)
+                Spacer()
+                Text(fmtDateTime(note.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+            Text(note.text)
+                .font(Theme.Fonts.bodySm)
+                .foregroundStyle(Theme.Colors.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// Note kind pill: parchment for a note, gold for a decision, herb green for a review.
+struct NoteKindChip: View {
+    let kind: NoteKind
+    var body: some View {
+        Text(kind.display.lowercased())
+            .font(Theme.Fonts.micro)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(colors.fill, in: Capsule())
+            .foregroundStyle(colors.text)
+    }
+
+    private var colors: (fill: Color, text: Color) {
+        switch kind {
+        case .note: return (Theme.Colors.surface, Theme.Colors.slate)
+        case .decision: return (Theme.Colors.yellowLight, Theme.Colors.yellowDark)
+        case .review: return (Theme.Colors.tealLight, Theme.Colors.mossDark)
         }
     }
 }

@@ -45,6 +45,20 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   `tag` (a whole tag, case-insensitive for ASCII letters) and `parent_id` /
   `parent_code` (subtasks of a task), alongside the existing project filter.
   Filtering happens in the database, not after loading every task.
+- Task **notes**: a timestamped, append-only log on each task, so the detail
+  can stay the task's spec. New MCP tool `add_note` (`id` or `code`, `text`,
+  optional `kind`: `note`, `decision` or `review`) only inserts — nothing is
+  read and rewritten — so two sessions logging at once never lose each
+  other's notes, and the change history no longer stores the whole detail
+  again for every added line. Adding a note bumps the task's `updated_at`.
+  `get_task` returns the latest 5 notes, newest first (`notes_limit` sets how
+  many, 0 for none, up to 100; `more_notes: true` when older ones were left
+  out); `list_tasks` never returns notes. Notes stay with a moved task, are
+  not copied by duplicate or copy, and are deleted with their task. Progress
+  already written into a task's detail is left where it is.
+- In the app, the task detail has a Notes section: notes newest first with a
+  coloured kind chip, and a field with a kind picker to add your own. Notes
+  an agent adds appear within the usual refresh.
 
 ### Changed
 
@@ -66,6 +80,8 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 - Reopening a done task (back to Todo or In Progress) now clears its
   `completed_at`, so it no longer counts as completed in the activity stats.
   Marking an already-done task done again keeps the original `completed_at`.
+- MCP `update_task` now tells agents to log progress with `add_note` instead
+  of appending to the task's detail.
 
 ### Fixed
 

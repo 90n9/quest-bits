@@ -126,7 +126,25 @@ final class MCPServer {
             return try jsonString(readTaskDicts(store.listTasks(matching: filter), compact: compact))
 
         case "get_task":
-            return try jsonString(readTaskDicts([store.getTask(id: try resolveTaskId(args))])[0])
+            let limit = try notesLimitArg(args)
+            let task = try store.getTask(id: try resolveTaskId(args))
+            var d = try readTaskDicts([task])[0]
+            if limit > 0 {
+                // One extra row tells whether older notes were left out.
+                let notes = try store.notes(taskId: task.id, limit: limit + 1)
+                if !notes.isEmpty { d["notes"] = notes.prefix(limit).map(noteDict) }
+                if notes.count > limit { d["more_notes"] = true }
+            }
+            return try jsonString(d)
+
+        case "add_note":
+            // Store.addNote trims and rejects empty text.
+            guard let text = args["text"] as? String else { throw MCPError.missingArg("text") }
+            let added = try store.addNote(taskId: try resolveTaskId(args), text: text, kind: try parseNoteKind(args["kind"]))
+            var d: [String: Any] = ["note_id": added.note.id, "task": taskHandle(code: added.taskCode, id: added.note.taskId),
+                                    "ts": iso(added.note.timestamp)]
+            if added.note.kind != .note { d["kind"] = added.note.kind.rawValue }
+            return try jsonString(d)
 
         case "create_task":
             // Optional parent (subtask). If given and no project is specified,
@@ -400,6 +418,13 @@ final class MCPServer {
         return d
     }
 
+    /// A note in get_task: ts and text, plus kind unless it is the default (note).
+    private func noteDict(_ n: TaskNote) -> [String: Any] {
+        var d: [String: Any] = ["ts": iso(n.timestamp), "text": n.text]
+        if n.kind != .note { d["kind"] = n.kind.rawValue }
+        return d
+    }
+
     private func templateDict(_ t: TaskTemplate) -> [String: Any] {
         [
             "id": t.id,
@@ -528,6 +553,28 @@ final class MCPServer {
             throw MCPError.invalidArg("waiting_on must be one of: \(WaitingOn.allCases.map(\.rawValue).joined(separator: ", "))")
         }
         return on
+    }
+
+    /// add_note `kind`: absent or null = note; otherwise it must be a known kind.
+    private func parseNoteKind(_ v: Any?) throws -> NoteKind {
+        guard let v, !(v is NSNull) else { return .note }
+        guard let s = v as? String, let kind = NoteKind(rawValue: s) else {
+            throw MCPError.invalidArg("kind must be one of: \(NoteKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return kind
+    }
+
+    private static let defaultNotesLimit = 5
+    private static let maxNotesLimit = 100
+
+    /// get_task `notes_limit`: absent or null = the default; 0 = no notes; at most the max.
+    /// Parsed like the other integer arguments (a number or a numeric string).
+    private func notesLimitArg(_ args: [String: Any]) throws -> Int {
+        guard given(args, "notes_limit") else { return Self.defaultNotesLimit }
+        guard let n = try? requireInt(args, "notes_limit"), (0...Int64(Self.maxNotesLimit)).contains(n) else {
+            throw MCPError.invalidArg("notes_limit must be an integer from 0 to \(Self.maxNotesLimit)")
+        }
+        return Int(n)
     }
 
     /// `waiting_reason` double-optional: absent leaves it alone, present+null clears it.

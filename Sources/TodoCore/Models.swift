@@ -96,7 +96,8 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-/// A task belongs to a project. `detail` holds free-form notes; `link` an optional URL.
+/// A task belongs to a project. `detail` holds the task's spec (progress goes in
+/// `TaskNote`s, appended without rewriting the task); `link` an optional URL.
 public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64
     public var code: String          // short human handle, e.g. "GEN-3"
@@ -235,6 +236,40 @@ public struct TaskEvent: Identifiable, Codable, Hashable, Sendable {
         self.field = field
         self.oldValue = oldValue
         self.newValue = newValue
+    }
+}
+
+/// What a task note records. Persisted as the raw string value (the `task_notes.kind`
+/// CHECK constraint lists the same values).
+public enum NoteKind: String, Codable, CaseIterable, Sendable {
+    case note       // progress, findings — the default
+    case decision   // a choice made, and why
+    case review     // review feedback or a verification result
+
+    public var display: String {
+        switch self {
+        case .note: return "Note"
+        case .decision: return "Decision"
+        case .review: return "Review"
+        }
+    }
+}
+
+/// A timestamped entry in a task's append-only log. Notes are only ever inserted,
+/// so concurrent writers never overwrite each other (unlike appending to `detail`).
+public struct TaskNote: Identifiable, Codable, Hashable, Sendable {
+    public var id: Int64
+    public var taskId: Int64
+    public var timestamp: Date
+    public var kind: NoteKind
+    public var text: String
+
+    public init(id: Int64, taskId: Int64, timestamp: Date, kind: NoteKind, text: String) {
+        self.id = id
+        self.taskId = taskId
+        self.timestamp = timestamp
+        self.kind = kind
+        self.text = text
     }
 }
 

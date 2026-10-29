@@ -39,7 +39,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "list_tasks",
-             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape.",
+             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str,
                 "status": ["anyOf": [
@@ -47,15 +47,18 @@ extension MCPServer {
                     ["type": "array", "items": statusEnum, "minItems": 1]
                 ], "description": "status or statuses to include; \"all\" = every status. Default: open (todo, in_progress, waiting)."] as [String: Any],
                 "tag": str, "parent_id": int, "parent_code": str,
-                "view": ["type": "string", "enum": ["compact", "full"], "description": "compact (default) or full (same fields as get_task)"] as [String: Any]
+                "view": ["type": "string", "enum": ["compact", "full"], "description": "compact (default) or full (same fields as get_task, without notes)"] as [String: Any]
              ])],
 
             ["name": "get_task",
-             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason` only on waiting tasks.",
-             "inputSchema": obj(["id": int, "code": str])],
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{ts, text, kind}] (kind omitted when \"note\"; no `notes` key when there are none), and `more_notes: true` when older notes were left out.",
+             "inputSchema": obj([
+                "id": int, "code": str,
+                "notes_limit": ["type": "integer", "minimum": 0, "maximum": 100, "description": "how many latest notes to include (default 5, 0 = none, max 100)"] as [String: Any]
+             ])],
 
             ["name": "create_task",
-             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). Returns the task with its new code.",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). Returns the task with its new code (same shape as get_task, without notes).",
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
@@ -64,7 +67,7 @@ extension MCPServer {
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). Returns the updated task (same shape as get_task; omitted fields are empty/default).",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
@@ -104,6 +107,13 @@ extension MCPServer {
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str]
              ])],
+
+            ["name": "add_note",
+             "description": "Append a note to a task (`id` or `code`): progress, findings, decisions or review results. Use this instead of appending to the task's detail, which stays the spec. Insert only: nothing is read or rewritten, so concurrent sessions never lose each other's notes. `kind` is note (default), decision or review. Bumps the task's updated_at. Notes are newest first in get_task, not in list_tasks; they stay with the task when it moves, are not copied by duplicate_task, and are deleted with the task. Returns {note_id, task, ts} plus kind when not note.",
+             "inputSchema": obj([
+                "id": int, "code": str, "text": str,
+                "kind": ["type": "string", "enum": NoteKind.allCases.map(\.rawValue)] as [String: Any]
+             ], required: ["text"])],
 
             ["name": "get_task_history",
              "description": "Get the change history (status changes, etc.) for a task by `id` or `code`, newest first.",
