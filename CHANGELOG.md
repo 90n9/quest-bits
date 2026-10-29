@@ -79,6 +79,17 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   `bulk_move_tasks`, `duplicate_task` with a target, `new_task_from_template`
   fail with "project X is archived; unarchive it first"); reading and updating
   its tasks works as usual.
+- MCP `inbox`: the tasks an agent is waiting on you to answer — waiting tasks
+  with `waiting_on: user` — across every project that is not archived,
+  longest waiting first. Each item is compact: code, title, project code,
+  `waiting_since` and the waiting reason when there is one.
+  `include_external: true` adds tasks waiting on a third party (each item then
+  says `waiting_on`). An empty inbox is `[]`.
+- Waiting tasks remember when they started waiting: `waiting_since` is set when
+  a task enters Waiting, kept while it stays waiting (also when who it waits on
+  changes), and cleared when it leaves. `get_task` shows it. A waiting task
+  copied to another project counts as a new ask and waits from the copy. Tasks
+  already waiting are filled in once from their history.
 
 ### Changed
 

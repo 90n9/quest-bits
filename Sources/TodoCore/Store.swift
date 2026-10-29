@@ -239,6 +239,8 @@ public final class Store: @unchecked Sendable {
         // --- Additive migration: waiting status (who it waits on + why) ---
         if !columnExists("tasks", "waiting_on") { exec("ALTER TABLE tasks ADD COLUMN waiting_on TEXT;") }
         if !columnExists("tasks", "waiting_reason") { exec("ALTER TABLE tasks ADD COLUMN waiting_reason TEXT;") }
+        // When the task last entered waiting (the inbox's "waiting since"); NULL unless waiting.
+        if !columnExists("tasks", "waiting_since") { exec("ALTER TABLE tasks ADD COLUMN waiting_since REAL;") }
 
         // --- Additive migration: task notes (append-only log; detail stays the spec) ---
         // The kind list is fixed in the table's CHECK: a new NoteKind needs a table rebuild.
@@ -258,6 +260,8 @@ public final class Store: @unchecked Sendable {
 
         // --- One-time data repair: status timestamps (schema user_version 1) ---
         backfillStatusTimestamps()
+        // --- One-time data repair: waiting_since (schema user_version 2) ---
+        backfillWaitingSince()
     }
 
     /// Repair status timestamps written before every status path went through
@@ -304,6 +308,35 @@ public final class Store: @unchecked Sendable {
         } catch {
             exec("ROLLBACK;")
             NSLog("QuestBits: status-timestamp backfill failed, will retry on next open: \(error)")
+        }
+    }
+
+    /// Fill `waiting_since` on tasks already waiting before the column existed: the
+    /// latest status change into waiting from the history, else `updated_at`. Runs once,
+    /// right after the version-1 repair (only from user_version 1, so a v1 that failed and
+    /// will retry is never skipped), with the same re-check inside BEGIN IMMEDIATE.
+    private func backfillWaitingSince() {
+        guard queryInt("PRAGMA user_version;", []) == 1 else { return }
+        // Status history logs the display name; older builds logged the raw value on
+        // create, so match both.
+        let waitingNames = Self.sqlList([TaskStatus.waiting.rawValue, TaskStatus.waiting.display])
+        do {
+            try beginImmediate()
+            if queryInt("PRAGMA user_version;", []) == 1 {
+                try runWrite(
+                    """
+                    UPDATE tasks SET waiting_since = COALESCE(
+                        (SELECT MAX(h.ts) FROM task_history h
+                         WHERE h.task_id = tasks.id AND h.field = 'status' AND h.new_value IN \(waitingNames)),
+                        updated_at)
+                    WHERE status = '\(TaskStatus.waiting.rawValue)' AND waiting_since IS NULL;
+                    """, [])
+                if exec("PRAGMA user_version = 2;") != SQLITE_OK { throw StoreError.step(errmsg()) }
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            NSLog("QuestBits: waiting_since backfill failed, will retry on next open: \(error)")
         }
     }
 
@@ -501,7 +534,11 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since"
+    /// `taskCols` qualified with `tasks.`, for queries that join another table.
+    private static let qualifiedTaskCols = taskCols.components(separatedBy: ", ").map { "tasks.\($0)" }.joined(separator: ", ")
+    /// How many columns `taskCols` selects: the index of a column a query adds after them.
+    private static let taskColCount = Int32(taskCols.components(separatedBy: ", ").count)
 
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
@@ -571,14 +608,15 @@ public final class Store: @unchecked Sendable {
         let due: SQLValue = dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null
         let nowSecs = Int64(now.timeIntervalSince1970)
         let secs: (Date?) -> SQLValue = { $0.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null }
-        // started_at/completed_at come from the shared status rule, evaluated over a
-        // one-row "prior" table (the source's status + timestamps, or an empty todo).
+        // started_at/completed_at/waiting_since come from the shared status rule, evaluated
+        // over a one-row "prior" table (the source's status + timestamps, or an empty todo).
+        // The prior waiting_since is always NULL: a waiting copy is a new ask, waiting from now.
         let ts = Self.statusTimestampExprs(status, now: nowSecs)
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, link, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, started_at, completed_at, created_at, updated_at, sort_order)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(ts.startedAt), \(ts.completedAt), ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)
-            FROM (SELECT ? AS status, ? AS started_at, ? AS completed_at);
+            INSERT INTO tasks (project_id, code, title, detail, link, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, started_at, completed_at, waiting_since, created_at, updated_at, sort_order)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(ts.startedAt), \(ts.completedAt), \(ts.waitingSince), ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)
+            FROM (SELECT ? AS status, ? AS started_at, ? AS completed_at, NULL AS waiting_since);
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
              .text(status.rawValue), waitingOn.map { .text($0.rawValue) } ?? .null, reason.map(SQLValue.text) ?? .null,
@@ -662,6 +700,9 @@ public final class Store: @unchecked Sendable {
     /// The task's project is not archived — for cross-project task lists (a WHERE
     /// condition over the `tasks` table's `project_id`).
     static let activeProjectSQL = "project_id NOT IN (SELECT id FROM projects WHERE archived_at IS NOT NULL)"
+    /// The same rule as `activeProjectSQL`, as a join that also brings the project in as
+    /// `p` (for its code). Change the two together.
+    static let activeProjectJoinSQL = "JOIN projects p ON p.id = tasks.project_id AND p.archived_at IS NULL"
 
     /// `TaskStatus.listRank` as a SQL expression over the `status` column.
     private static let statusRankSQL = "CASE status "
@@ -748,6 +789,29 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
+    /// The inbox: waiting tasks that wait on the user — plus those waiting on a third party
+    /// with `includeExternal` — across every project not archived, each with its project's
+    /// code. Longest waiting first: `waiting_since` (falling back to `updated_at` for a row
+    /// an older build set waiting without it), then id. Filtered and sorted in SQL.
+    public func inbox(includeExternal: Bool = false) throws -> [(task: TodoTask, projectCode: String)] {
+        lock.lock(); defer { lock.unlock() }
+        let who: [WaitingOn] = includeExternal ? [.user, .external] : [.user]
+        let stmt = try prepare(
+            "SELECT \(Self.qualifiedTaskCols), p.code FROM tasks \(Self.activeProjectJoinSQL) "
+            + "WHERE tasks.status=? AND tasks.waiting_on IN (\(Self.placeholders(who.count))) "
+            + "ORDER BY COALESCE(tasks.waiting_since, tasks.updated_at), tasks.id;",
+            [.text(TaskStatus.waiting.rawValue)] + who.map { .text($0.rawValue) })
+        defer { sqlite3_finalize(stmt) }
+        var out: [(task: TodoTask, projectCode: String)] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append((taskFromRow(stmt), colText(stmt, Self.taskColCount)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
     /// Add focused seconds to a task's effort total.
     public func addEffort(toTaskId id: Int64, seconds: Int) throws {
         lock.lock(); defer { lock.unlock() }
@@ -761,16 +825,18 @@ public final class Store: @unchecked Sendable {
     }
 
     /// The one timestamp rule for a status write: SQL expressions for the new
-    /// `started_at` / `completed_at`, evaluated against the prior row's `status`,
-    /// `started_at` and `completed_at` (an UPDATE's SET sees the pre-update row; createTask
-    /// supplies a one-row prior table). `binds` follow the started then completed order.
+    /// `started_at` / `completed_at` / `waiting_since`, evaluated against the prior row's
+    /// `status` and those columns (an UPDATE's SET sees the pre-update row; createTask
+    /// supplies a one-row prior table). `binds` follow the started, completed, waiting order.
     /// Every path that writes a status uses it — updateTask, and createTask for the initial
     /// status, so duplicates, templates and recurrence spawns too:
     /// - started_at: stamped once on entering a status that `impliesStarted`; never cleared.
     /// - completed_at: stamped on entering done (kept if already done); cleared otherwise —
     ///   dropped included, since abandoning a task is not a completion.
+    /// - waiting_since: stamped on entering waiting (kept while it stays waiting, also when
+    ///   who it waits on changes); cleared on any other status.
     private static func statusTimestampExprs(_ status: TaskStatus, now: Int64)
-        -> (startedAt: String, completedAt: String, binds: [SQLValue]) {
+        -> (startedAt: String, completedAt: String, waitingSince: String, binds: [SQLValue]) {
         var binds: [SQLValue] = []
         var started = "started_at"
         if status.impliesStarted { started = "COALESCE(started_at, ?)"; binds.append(.int(now)) }
@@ -779,7 +845,12 @@ public final class Store: @unchecked Sendable {
             completed = "CASE WHEN status='\(TaskStatus.done.rawValue)' AND completed_at IS NOT NULL THEN completed_at ELSE ? END"
             binds.append(.int(now))
         }
-        return (started, completed, binds)
+        var waiting = "NULL"
+        if status == .waiting {
+            waiting = "CASE WHEN status='\(TaskStatus.waiting.rawValue)' AND waiting_since IS NOT NULL THEN waiting_since ELSE ? END"
+            binds.append(.int(now))
+        }
+        return (started, completed, waiting, binds)
     }
 
     /// The waiting rule, shared by createTask and every update path: a `waiting` task
@@ -900,7 +971,8 @@ public final class Store: @unchecked Sendable {
         if let status {
             sets.append("status=?"); binds.append(.text(status.rawValue))
             let ts = Self.statusTimestampExprs(status, now: now)
-            sets += ["started_at=\(ts.startedAt)", "completed_at=\(ts.completedAt)"]; binds += ts.binds
+            sets += ["started_at=\(ts.startedAt)", "completed_at=\(ts.completedAt)", "waiting_since=\(ts.waitingSince)"]
+            binds += ts.binds
             // Leaving waiting (or any non-waiting status write) clears what it waited on.
             if status != .waiting { sets += ["waiting_on=NULL", "waiting_reason=NULL"] }
         }
@@ -1001,7 +1073,8 @@ public final class Store: @unchecked Sendable {
     /// A duplicate within the same project is for reuse: a fresh todo with no
     /// start/completion times or waiting fields, so it never counts as another completion.
     /// A copy to another project carries the record over as is: status, waiting fields
-    /// and started/completed times. App and MCP share this one rule.
+    /// and started/completed times; a waiting copy is a new ask, so its waiting_since is
+    /// now. App and MCP share this one rule.
     /// Composes getTask/createTask (each takes the lock) — must NOT hold the lock here.
     @discardableResult
     public func duplicateTask(id: Int64, toProjectId: Int64? = nil) throws -> TodoTask {
@@ -1313,13 +1386,14 @@ public final class Store: @unchecked Sendable {
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
         //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds,
-        //          waiting_on, waiting_reason
+        //          waiting_on, waiting_reason, waiting_since
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
         func int64Opt(_ i: Int32) -> Int64? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, i)
         }
+        let status = TaskStatus(rawValue: colText(stmt, 6)) ?? .todo
         return TodoTask(
             id: sqlite3_column_int64(stmt, 0),
             code: colText(stmt, 1),
@@ -1327,9 +1401,11 @@ public final class Store: @unchecked Sendable {
             title: colText(stmt, 3),
             detail: colText(stmt, 4),
             link: colTextOpt(stmt, 5),
-            status: TaskStatus(rawValue: colText(stmt, 6)) ?? .todo,
+            status: status,
             waitingOn: colTextOpt(stmt, 19).flatMap(WaitingOn.init(rawValue:)),
             waitingReason: colTextOpt(stmt, 20),
+            // Only a waiting task has one, even if an older build left a stale stamp.
+            waitingSince: status == .waiting ? date(21) : nil,
             priority: Priority(rawValue: colText(stmt, 7)) ?? .none,
             dueDate: date(8),
             tags: decodeTags(colText(stmt, 9)),

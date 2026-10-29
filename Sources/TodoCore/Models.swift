@@ -113,6 +113,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var status: TaskStatus
     public var waitingOn: WaitingOn?   // set iff status == .waiting
     public var waitingReason: String?  // optional note while waiting
+    public var waitingSince: Date?     // when it last entered waiting; set iff status == .waiting
     public var priority: Priority
     public var dueDate: Date?
     public var tags: [String]
@@ -136,6 +137,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         status: TaskStatus,
         waitingOn: WaitingOn? = nil,
         waitingReason: String? = nil,
+        waitingSince: Date? = nil,
         priority: Priority = .none,
         dueDate: Date? = nil,
         tags: [String] = [],
@@ -158,6 +160,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.status = status
         self.waitingOn = waitingOn
         self.waitingReason = waitingReason
+        self.waitingSince = waitingSince
         self.priority = priority
         self.dueDate = dueDate
         self.tags = tags

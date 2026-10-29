@@ -60,7 +60,7 @@ extension MCPServer {
              ])],
 
             ["name": "get_task",
-             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{ts, text, kind}] (kind omitted when \"note\"; no `notes` key when there are none), and `more_notes: true` when older notes were left out.",
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{ts, text, kind}] (kind omitted when \"note\"; no `notes` key when there are none), and `more_notes: true` when older notes were left out.",
              "inputSchema": obj([
                 "id": int, "code": str,
                 "notes_limit": ["type": "integer", "minimum": 0, "maximum": 100, "description": "how many latest notes to include (default 5, 0 = none, max 100)"] as [String: Any]
@@ -116,6 +116,10 @@ extension MCPServer {
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str]
              ])],
+
+            ["name": "inbox",
+             "description": "Your inbox: tasks an agent is waiting on you to answer — status waiting with waiting_on user — across all projects that are not archived. Check it to see what needs your decision or action. Longest waiting first. Each item: code, title, project (project code), waiting_since (when it entered waiting), and waiting_reason when set. With `include_external` true, tasks waiting on a third party are included too, and each item has waiting_on. Returns [] when nothing is waiting.",
+             "inputSchema": obj(["include_external": ["type": "boolean", "description": "also include tasks waiting on external (default false)"] as [String: Any]])],
 
             ["name": "add_note",
              "description": "Append a note to a task (`id` or `code`): progress, findings, decisions or review results. Use this instead of appending to the task's detail, which stays the spec. Insert only: nothing is read or rewritten, so concurrent sessions never lose each other's notes. `kind` is note (default), decision or review. Bumps the task's updated_at. Notes are newest first in get_task, not in list_tasks; they stay with the task when it moves, are not copied by duplicate_task, and are deleted with the task. Returns {note_id, task, ts} plus kind when not note.",

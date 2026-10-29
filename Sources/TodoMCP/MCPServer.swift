@@ -148,6 +148,20 @@ final class MCPServer {
             }
             return try jsonString(d)
 
+        case "inbox":
+            // Compact: what to answer and since when. waiting_on only when external tasks
+            // are included (otherwise every item waits on the user).
+            let includeExternal = try boolArg(args, "include_external") ?? false
+            return try jsonString(store.inbox(includeExternal: includeExternal).map { item in
+                let t = item.task
+                var d: [String: Any] = ["code": taskHandle(code: t.code, id: t.id), "title": t.title,
+                                        "project": item.projectCode,
+                                        "waiting_since": iso(t.waitingSince ?? t.updatedAt)]
+                if includeExternal, let on = t.waitingOn { d["waiting_on"] = on.rawValue }
+                if let reason = t.waitingReason, !reason.isEmpty { d["waiting_reason"] = reason }
+                return d
+            })
+
         case "add_note":
             // Store.addNote trims and rejects empty text.
             guard let text = args["text"] as? String else { throw MCPError.missingArg("text") }
@@ -397,6 +411,7 @@ final class MCPServer {
         ]
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
         if let reason = t.waitingReason, !reason.isEmpty { d["waiting_reason"] = reason }
+        if let since = t.waitingSince { d["waiting_since"] = iso(since) }
         if !t.detail.isEmpty { d["detail"] = t.detail }
         if let link = t.link, !link.isEmpty { d["link"] = link }
         if t.priority != Priority.none { d["priority"] = t.priority.rawValue }
