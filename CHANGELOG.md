@@ -13,7 +13,15 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- MCP responses are compact JSON (no pretty-printing, unescaped `/` in links),
+  cutting task output by about a fifth on a real database. Every tool that
+  returns tasks now uses one shared serializer: other tasks are referenced by
+  code (`parent: "CHU-5"`, `depends_on: ["CHU-2"]`) instead of numeric ids, and
+  null, empty or default fields (no priority, no tags, no link, zero effort or
+  estimate, `blocked: false`) are left out. `effort_seconds` and
+  `estimate_seconds` are dropped in favour of the `*_minutes` fields.
 
 ## [1.2.3] - 2026-07-09
 

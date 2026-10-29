@@ -808,6 +808,52 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
+    /// Depends-on codes, parent codes and blocked flags for a batch of tasks, read with
+    /// a couple of set queries (chunked IN lists) instead of N per-task lookups.
+    /// Throws on a read error rather than returning partial relations.
+    public func taskRelations(for tasks: [TodoTask]) throws -> TaskRelations {
+        lock.lock(); defer { lock.unlock() }
+        var rel = TaskRelations()
+        // Same blocked rule as isBlockedUnlocked: any dependency not yet done.
+        for chunk in Self.chunked(tasks.map(\.id)) {
+            let stmt = try prepare(
+                "SELECT d.task_id, t.code, t.status != 'done' FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id "
+                + "WHERE d.task_id IN (\(Self.placeholders(chunk.count))) ORDER BY d.task_id, d.depends_on_id;",
+                chunk.map { .int($0) })
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                let tid = sqlite3_column_int64(stmt, 0)
+                rel.dependsOnCodes[tid, default: []].append(colText(stmt, 1))
+                if sqlite3_column_int64(stmt, 2) != 0 { rel.blockedIds.insert(tid) }
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        }
+        for chunk in Self.chunked(Array(Set(tasks.compactMap(\.parentId)))) {
+            let stmt = try prepare(
+                "SELECT id, code FROM tasks WHERE id IN (\(Self.placeholders(chunk.count)));",
+                chunk.map { .int($0) })
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                rel.parentCodes[sqlite3_column_int64(stmt, 0)] = colText(stmt, 1)
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        }
+        return rel
+    }
+
+    /// Split ids into batches small enough for SQLite's bound-parameter limit.
+    private static func chunked(_ ids: [Int64], size: Int = 500) -> [[Int64]] {
+        stride(from: 0, to: ids.count, by: size).map { Array(ids[$0..<min($0 + size, ids.count)]) }
+    }
+
+    private static func placeholders(_ n: Int) -> String {
+        Array(repeating: "?", count: n).joined(separator: ",")
+    }
+
     /// Does `from` reach `to` by following depends-on edges transitively? (cycle guard)
     private func dependsReachesUnlocked(from: Int64, to: Int64) -> Bool {
         var seen: Set<Int64> = []

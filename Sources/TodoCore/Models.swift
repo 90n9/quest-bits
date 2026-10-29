@@ -116,6 +116,16 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// Cross-task references for a batch of tasks, resolved to codes in bulk
+/// (see `Store.taskRelations(for:)`) so serializers avoid per-task lookups.
+public struct TaskRelations: Sendable {
+    public var dependsOnCodes: [Int64: [String]] = [:]  // task id → codes it depends on
+    public var parentCodes: [Int64: String] = [:]       // parent task id → its code
+    public var blockedIds: Set<Int64> = []              // tasks with >=1 not-done dependency
+
+    public init() {}
+}
+
 /// A reusable task template: preset fields that spawn a real task on demand.
 public struct TaskTemplate: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64

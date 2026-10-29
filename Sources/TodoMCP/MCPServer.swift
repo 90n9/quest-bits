@@ -108,7 +108,7 @@ final class MCPServer {
             } else {
                 pid = nil
             }
-            return try jsonString(store.listTasks(projectId: pid).map(taskDict))
+            return try jsonString(taskDicts(store.listTasks(projectId: pid)))
 
         case "get_task":
             return try jsonString(taskDict(store.getTask(id: try resolveTaskId(args))))
@@ -299,31 +299,49 @@ final class MCPServer {
         ["id": p.id, "code": p.code, "name": p.name, "description": p.detail, "created_at": iso(p.createdAt)]
     }
 
+    /// The shared task serializer behind every tool that returns tasks. Other tasks are
+    /// referenced by code (`parent`, `depends_on`), and null, empty or default-valued
+    /// fields are omitted — `status` is always present, `blocked` only when true.
+    /// Relations are resolved once for the whole batch, not per task. Never throws:
+    /// mutating tools serialize after their write has committed, so a failed relations
+    /// read degrades the output (numeric `parent_id`, no deps) instead of failing the call.
+    private func taskDicts(_ tasks: [TodoTask]) -> [[String: Any]] {
+        let rel = (try? store.taskRelations(for: tasks)) ?? TaskRelations()
+        return tasks.map { taskDict($0, rel) }
+    }
+
     private func taskDict(_ t: TodoTask) -> [String: Any] {
-        [
+        taskDicts([t])[0]
+    }
+
+    private func taskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
+        var d: [String: Any] = [
             "id": t.id,
             "code": t.code,
             "project_id": t.projectId,
             "title": t.title,
-            "detail": t.detail,
-            "link": t.link ?? NSNull(),
             "status": t.status.rawValue,
-            "priority": t.priority.rawValue,
-            "due_date": t.dueDate.map(iso) ?? NSNull(),
-            "tags": t.tags,
-            "recurrence": t.recurrence ?? NSNull(),
-            "parent_id": t.parentId ?? NSNull(),
-            "depends_on": (try? store.dependencies(taskId: t.id)) ?? [],
-            "blocked": store.isBlocked(taskId: t.id),
-            "started_at": t.startedAt.map(iso) ?? NSNull(),
-            "completed_at": t.completedAt.map(iso) ?? NSNull(),
-            "effort_minutes": t.effortSeconds / 60,
-            "effort_seconds": t.effortSeconds,
-            "estimate_minutes": t.estimateSeconds / 60,
-            "estimate_seconds": t.estimateSeconds,
             "created_at": iso(t.createdAt),
             "updated_at": iso(t.updatedAt)
         ]
+        if !t.detail.isEmpty { d["detail"] = t.detail }
+        if let link = t.link, !link.isEmpty { d["link"] = link }
+        if t.priority != Priority.none { d["priority"] = t.priority.rawValue }
+        if let due = t.dueDate { d["due_date"] = iso(due) }
+        if !t.tags.isEmpty { d["tags"] = t.tags }
+        if let rec = t.recurrence, !rec.isEmpty { d["recurrence"] = rec }
+        if let pid = t.parentId {
+            // Fall back to the numeric id so a subtask never looks top-level.
+            if let code = rel.parentCodes[pid], !code.isEmpty { d["parent"] = code } else { d["parent_id"] = pid }
+        }
+        if let deps = rel.dependsOnCodes[t.id], !deps.isEmpty { d["depends_on"] = deps }
+        if rel.blockedIds.contains(t.id) { d["blocked"] = true }
+        if let started = t.startedAt { d["started_at"] = iso(started) }
+        if let completed = t.completedAt { d["completed_at"] = iso(completed) }
+        // Whole minutes as before, but a non-zero sub-minute value shows as 1, not omitted.
+        if t.effortSeconds > 0 { d["effort_minutes"] = max(1, t.effortSeconds / 60) }
+        if t.estimateSeconds > 0 { d["estimate_minutes"] = max(1, t.estimateSeconds / 60) }
+        return d
     }
 
     private func templateDict(_ t: TaskTemplate) -> [String: Any] {
@@ -429,7 +447,7 @@ final class MCPServer {
     }
 
     private func jsonString(_ obj: Any) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes])
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
