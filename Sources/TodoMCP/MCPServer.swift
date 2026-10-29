@@ -205,7 +205,8 @@ final class MCPServer {
             return "deleted"
 
         case "duplicate_task":
-            // Optional target project (id or code): clone in place, or copy elsewhere.
+            // Optional target project (id or code): clone in place (a fresh todo), or copy
+            // to another project (status and times kept) — Store.duplicateTask's rule.
             let toPid: Int64? = (args["to_project_id"] != nil || args["to_project_code"] != nil)
                 ? try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
                 : nil
@@ -233,7 +234,7 @@ final class MCPServer {
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
             let copy = (args["copy"] as? Bool) ?? false
             for id in ids {
-                if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid, keepStatus: true) }
+                if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid) }
                 else { try store.moveTask(id: id, toProjectId: toPid) }
             }
             return "\(copy ? "copied" : "moved") \(ids.count) tasks"

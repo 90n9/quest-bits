@@ -555,11 +555,13 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Completion progress of a parent's subtasks: (done, total).
+    /// Completion progress of a parent's subtasks: (done, total). Dropped subtasks are
+    /// left out of both — they are no longer part of the work.
     public func subtaskProgress(parentId: Int64) throws -> (done: Int, total: Int) {
         lock.lock(); defer { lock.unlock() }
         let stmt = try prepare(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),0) FROM tasks WHERE parent_id=?;",
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='\(TaskStatus.done.rawValue)' THEN 1 ELSE 0 END),0) "
+            + "FROM tasks WHERE parent_id=? AND status != '\(TaskStatus.dropped.rawValue)';",
             [.int(parentId)]
         )
         defer { sqlite3_finalize(stmt) }
@@ -635,7 +637,8 @@ public final class Store: @unchecked Sendable {
     /// Every path that writes a status uses it — updateTask, and createTask for the initial
     /// status, so duplicates, templates and recurrence spawns too:
     /// - started_at: stamped once on entering a status that `impliesStarted`; never cleared.
-    /// - completed_at: stamped on entering done (kept if already done); cleared otherwise.
+    /// - completed_at: stamped on entering done (kept if already done); cleared otherwise —
+    ///   dropped included, since abandoning a task is not a completion.
     private static func statusTimestampExprs(_ status: TaskStatus, now: Int64)
         -> (startedAt: String, completedAt: String, binds: [SQLValue]) {
         var binds: [SQLValue] = []
@@ -684,10 +687,10 @@ public final class Store: @unchecked Sendable {
                 waitingOn: waitingOn, waitingReason: waitingReason, spawnRecurrence: spawnRecurrence)
         }
         // Writes that depend on the stored row run inside BEGIN IMMEDIATE, re-read there:
-        // a move to done may spawn the next occurrence (two processes could each spawn
-        // one), and the waiting rule depends on whether the task is already waiting.
-        let needsTransaction = status == .done || status == .waiting
-            || (status == nil && Self.setsWaitingFields(waitingOn, waitingReason))
+        // any status write (its history row names the status it replaced, a move to done
+        // may spawn the next occurrence — two processes could each spawn one), and the
+        // waiting rule depends on whether the task is already waiting.
+        let needsTransaction = status != nil || Self.setsWaitingFields(waitingOn, waitingReason)
         guard needsTransaction else { return try apply(true) }
         do {
             try beginImmediate()
@@ -753,11 +756,10 @@ public final class Store: @unchecked Sendable {
         }
         var tags = tags
         if let addTags {
-            var merged = tags ?? old.tags
-            for tag in addTags.map({ $0.trimmingCharacters(in: .whitespaces) }) where !tag.isEmpty && !merged.contains(tag) {
-                merged.append(tag)
-            }
-            tags = merged
+            // Only a merge that adds something writes (and bumps updated_at).
+            let current = tags ?? old.tags
+            let merged = Self.mergeTags(current, addTags)
+            if merged != current { tags = merged }
         }
         let now = Int64(Date().timeIntervalSince1970)
         var sets: [String] = []
@@ -796,8 +798,9 @@ public final class Store: @unchecked Sendable {
         // Recurrence: when a recurring, top-level task transitions INTO done, spawn the
         // next occurrence (fresh todo) with its due date advanced by the interval.
         // Effective recurrence: a value set in this same update wins, else the stored one.
-        // `old` was read before the write, so only a genuine todo/in_progress/waiting -> done
-        // transition spawns (the caller's BEGIN IMMEDIATE keeps that read current).
+        // `old` was read before the write, so only a genuine todo/in_progress/waiting/dropped
+        // -> done transition spawns (the caller's BEGIN IMMEDIATE keeps that read current).
+        // Dropping a recurring task ends the series: no next occurrence.
         let effectiveRecurrence: String?
         if let recurrence { effectiveRecurrence = recurrence } else { effectiveRecurrence = old.recurrence }
         if spawnRecurrence, status == .done, old.status != .done, old.parentId == nil,
@@ -826,9 +829,10 @@ public final class Store: @unchecked Sendable {
         if let status, status != old.status { logEvent(id, "status", old.status.display, status.display) }
         // waiting_on is logged by raw value (user / external); waiting_reason is free text
         // (like title/detail) and is not logged.
+        // Leaving waiting clears it, but the status row already says so: log only a new who.
         let newWaitingOn = (status.map { $0 != .waiting } ?? false) ? nil : (waitingOn ?? old.waitingOn)
-        if newWaitingOn != old.waitingOn {
-            logEvent(id, "waiting on", old.waitingOn?.rawValue ?? "", newWaitingOn?.rawValue ?? "")
+        if let newWaitingOn, newWaitingOn != old.waitingOn {
+            logEvent(id, "waiting on", old.waitingOn?.rawValue ?? "", newWaitingOn.rawValue)
         }
         if let priority, priority != old.priority { logEvent(id, "priority", old.priority.display, priority.display) }
         if let link {
@@ -864,15 +868,16 @@ public final class Store: @unchecked Sendable {
 
     /// Duplicate a task. With no target it clones into the same project; with a
     /// target project id it copies there (original kept). The copy gets a fresh code.
-    /// By default the copy is for reuse: a fresh todo with no start/completion times or
-    /// waiting fields, so copying a done task never counts as another completion.
-    /// `keepStatus` instead relocates the record as is (bulk copy to another project):
-    /// status, waiting fields and started/completed times carry over.
+    /// A duplicate within the same project is for reuse: a fresh todo with no
+    /// start/completion times or waiting fields, so it never counts as another completion.
+    /// A copy to another project carries the record over as is: status, waiting fields
+    /// and started/completed times. App and MCP share this one rule.
     /// Composes getTask/createTask (each takes the lock) — must NOT hold the lock here.
     @discardableResult
-    public func duplicateTask(id: Int64, toProjectId: Int64? = nil, keepStatus: Bool = false) throws -> TodoTask {
+    public func duplicateTask(id: Int64, toProjectId: Int64? = nil) throws -> TodoTask {
         let t = try getTask(id: id)
         let targetProject = toProjectId ?? t.projectId
+        let keepStatus = targetProject != t.projectId
         // Within the same project a copy stays a subtask of the same parent; copying
         // to a different project would leave the child dangling (parent isn't moving),
         // so it becomes a top-level task instead.
@@ -932,14 +937,14 @@ public final class Store: @unchecked Sendable {
         }
     }
 
-    /// Merge tags into a task (keeps existing, adds new uniquely). Composes get/update.
-    public func addTags(toTaskId id: Int64, tags: [String]) throws {
-        let t = try getTask(id: id)
-        var merged = t.tags
-        for tag in tags.map({ $0.trimmingCharacters(in: .whitespaces) }) where !tag.isEmpty && !merged.contains(tag) {
+    /// The one tag-merge rule: `existing` plus each trimmed, non-empty tag of `add`
+    /// not already present, in order.
+    private static func mergeTags(_ existing: [String], _ add: [String]) -> [String] {
+        var merged = existing
+        for tag in add.map({ $0.trimmingCharacters(in: .whitespaces) }) where !tag.isEmpty && !merged.contains(tag) {
             merged.append(tag)
         }
-        try updateTask(id: id, tags: merged)
+        return merged
     }
 
     // MARK: - Dependencies (blocked-by)
@@ -993,7 +998,7 @@ public final class Store: @unchecked Sendable {
         try runWrite("DELETE FROM task_deps WHERE task_id=? AND depends_on_id=?;", [.int(taskId), .int(dependsOnId)])
     }
 
-    /// SQL list of the closed status values (`TaskStatus.isClosed`), e.g. `('done')`.
+    /// SQL list of the closed status values (`TaskStatus.isClosed`), e.g. `('done','dropped')`.
     private static let closedStatusSQL = sqlList(TaskStatus.allCases.filter(\.isClosed).map(\.rawValue))
 
     /// Every dependency edge `d`, joined to its task `a` and the task it depends on `b`.

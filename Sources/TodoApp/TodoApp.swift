@@ -87,6 +87,8 @@ struct TodoCommands: Commands {
                 .keyboardShortcut(sc(.statusWaitingExternal)).disabled(model.selectedTaskId == nil)
             Button("Mark Done") { model.setStatusOnSelected(.done) }
                 .keyboardShortcut(sc(.statusDone)).disabled(model.selectedTaskId == nil)
+            Button("Mark Dropped") { model.setStatusOnSelected(.dropped) }
+                .keyboardShortcut(sc(.statusDropped)).disabled(model.selectedTaskId == nil)
         }
 
         CommandMenu("Timer") {

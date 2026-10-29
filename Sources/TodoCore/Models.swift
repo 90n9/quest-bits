@@ -6,6 +6,7 @@ public enum TaskStatus: String, Codable, CaseIterable, Sendable {
     case inProgress = "in_progress"
     case waiting     // parked on someone — see `WaitingOn`; still open
     case done
+    case dropped     // abandoned: closed like done, but not a completion (history kept)
 
     public var display: String {
         switch self {
@@ -13,24 +14,27 @@ public enum TaskStatus: String, Codable, CaseIterable, Sendable {
         case .inProgress: return "In Progress"
         case .waiting: return "Waiting"
         case .done: return "Done"
+        case .dropped: return "Dropped"
         }
     }
 
     /// A closed task is finished with: it is never reported blocked, and as a
-    /// dependency it no longer blocks anything.
+    /// dependency it no longer blocks anything. Only `done` is a completion
+    /// (`completed_at`, stats, recurrence); `dropped` closes without completing.
     public var isClosed: Bool {
         switch self {
         case .todo, .inProgress, .waiting: return false
-        case .done: return true
+        case .done, .dropped: return true
         }
     }
 
     /// Entering this status means work has begun, so `started_at` is stamped
-    /// (once) if it is still empty. Waiting does not stamp (a task can wait before
-    /// anyone starts it), but like every status it never clears an existing start.
+    /// (once) if it is still empty. Waiting and dropped do not stamp (a task can wait,
+    /// or be dropped, before anyone starts it), but like every status they never clear
+    /// an existing start.
     public var impliesStarted: Bool {
         switch self {
-        case .todo, .waiting: return false
+        case .todo, .waiting, .dropped: return false
         case .inProgress, .done: return true
         }
     }

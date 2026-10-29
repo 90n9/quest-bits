@@ -36,9 +36,10 @@ final class NotificationScheduler {
     ///   - soundEnabled: `settings.soundEnabled`; plays the default sound when true.
     func reconcile(tasks: [TodoTask], enabled: Bool, soundEnabled: Bool) {
         let now = Date()
-        // Desired: not done, has a due date still in the future (never schedule in the past).
+        // Desired: still open (not done or dropped), has a due date still in the future
+        // (never schedule in the past).
         let desired: [TodoTask] = enabled
-            ? tasks.filter { $0.status != .done && ($0.dueDate.map { $0 > now } ?? false) }
+            ? tasks.filter { !$0.status.isClosed && ($0.dueDate.map { $0 > now } ?? false) }
             : []
         let desiredIds = Set(desired.map { identifier(for: $0.id) })
 

@@ -260,9 +260,10 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
-    /// Toggle a subtask between done and todo (checkbox behavior).
+    /// Toggle a subtask between done and todo (checkbox behavior). A dropped subtask
+    /// reopens to todo, like a done one.
     func toggleSubtaskDone(_ sub: TodoTask) {
-        updateTask(sub, status: sub.status == .done ? .todo : .done)
+        updateTask(sub, status: sub.status.isClosed ? .todo : .done)
     }
 
     /// Moving to Waiting without saying on whom keeps the task's current `waitingOn`,
@@ -288,7 +289,7 @@ final class AppModel: ObservableObject {
         case .todo: next = .inProgress
         case .inProgress: next = .done
         case .waiting: next = .inProgress   // the wait is over: resume work
-        case .done: next = .todo
+        case .done, .dropped: next = .todo   // reopen
         }
         setStatus(task, to: next)
     }
@@ -331,7 +332,7 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
-    /// Clone a task within its current project.
+    /// Clone a task within its current project (a fresh todo).
     func duplicateTask(_ id: Int64) {
         _ = try? store.duplicateTask(id: id)
         reloadTasks()
@@ -339,7 +340,7 @@ final class AppModel: ObservableObject {
 
     /// Copy a task into another project (original kept), status and times included.
     func copyTask(_ id: Int64, toProject pid: Int64) {
-        _ = try? store.duplicateTask(id: id, toProjectId: pid, keepStatus: true)
+        _ = try? store.duplicateTask(id: id, toProjectId: pid)
         reloadTasks()
     }
 
@@ -459,7 +460,7 @@ final class AppModel: ObservableObject {
 
     private var selectionCount: Int { selectedTaskIds.count }
 
-    /// `waitingOn` applies only to Waiting; without it each task keeps its own (or user).
+    /// `waitingOn` applies only to Waiting; without it the tasks wait on the user.
     func bulkSetStatus(_ status: TaskStatus, waitingOn: WaitingOn? = nil) {
         let ids = Array(selectedTaskIds)
         let blockedIds = blockedForConfirm(ids, to: status)
@@ -474,14 +475,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// One all-or-nothing store write: on failure no task changes and the toast says why.
     private func performBulkSetStatus(_ status: TaskStatus, waitingOn: WaitingOn?, ids: [Int64]) {
-        for id in ids {
-            let on = status == .waiting ? (waitingOn ?? task(byId: id)?.waitingOn ?? .user) : nil
-            try? store.updateTask(id: id, status: status, waitingOn: on)
+        let on = status == .waiting ? (waitingOn ?? .user) : nil
+        do {
+            try store.bulkUpdateTasks(ids: ids, status: status, waitingOn: on)
+            let label = on.map { "Waiting on \(qbWaitingOnLabel($0))" } ?? status.display
+            flashToast("Set \(ids.count) to \(label)")
+        } catch {
+            flashToast("Couldn't set status: \(error)")
         }
         reloadTasks()
-        let label = waitingOn.flatMap { status == .waiting ? "Waiting on \(qbWaitingOnLabel($0))" : nil } ?? status.display
-        flashToast("Set \(ids.count) to \(label)")
     }
 
     func bulkSetPriority(_ priority: Priority) {
@@ -492,9 +496,13 @@ final class AppModel: ObservableObject {
 
     func bulkAddTags(_ tags: [String]) {
         guard !tags.isEmpty else { return }
-        for id in selectedTaskIds { try? store.addTags(toTaskId: id, tags: tags) }
+        do {
+            try store.bulkUpdateTasks(ids: Array(selectedTaskIds), addTags: tags)
+            flashToast("Tagged \(selectionCount) tasks")
+        } catch {
+            flashToast("Couldn't tag: \(error)")
+        }
         reloadTasks()
-        flashToast("Tagged \(selectionCount) tasks")
     }
 
     func bulkMove(toProject pid: Int64) {
@@ -507,7 +515,7 @@ final class AppModel: ObservableObject {
 
     func bulkCopy(toProject pid: Int64) {
         let n = selectionCount
-        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id, toProjectId: pid, keepStatus: true) }
+        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id, toProjectId: pid) }
         reloadTasks()
         flashToast("Copied \(n) tasks")
     }

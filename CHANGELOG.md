@@ -29,6 +29,18 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   drag onto the Waiting column, or the task detail, which also edits who it
   waits on and the reason. Clicking a waiting task's status icon resumes it
   (In Progress).
+- New **Dropped** status for work you abandon, so you no longer have to delete
+  a task (and lose its history) to stop doing it. A dropped task is closed like
+  a done one — it is never blocked, and tasks that depend on it are no longer
+  blocked — but it is not a completion: it gets no `completed_at`, does not
+  count as completed in stats, and dropping a recurring task spawns no next
+  occurrence. Dropping a done task clears its completion.
+- In the app, dropped tasks are faded, struck through and marked with a cross;
+  they collapse with done tasks into the list's bottom section and sit in the
+  board's Done column. Set Dropped from the bulk Status menu, the Task menu
+  (Mark Dropped ⌘6) or the task detail. Clicking a dropped task's status icon
+  (or a dropped subtask's checkbox) reopens it as Todo, and dropped subtasks
+  leave the parent's n/total subtask count.
 
 ### Changed
 
@@ -52,14 +64,28 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   `create_task` with `status`), bulk status updates, and moving a task from
   Todo straight to Done (which used to leave `started_at` empty). All of them
   share one timestamp rule.
-- Duplicating a task (`duplicate_task`, Duplicate in the app) now creates a
-  fresh todo for reuse — status, `started_at` / `completed_at` and waiting
-  fields are not copied — so copying a done task no longer counts as another
-  completion. Copying tasks to another project (`bulk_move_tasks` with
-  `copy: true`, Copy to in the app) still keeps each task's status and times.
+- Duplicating a task within its project (`duplicate_task` without a target,
+  Duplicate in the app) now creates a fresh todo for reuse — status,
+  `started_at` / `completed_at` and waiting fields are not copied — so it no
+  longer counts as another completion. Copying a task to another project keeps
+  its status, times and waiting fields, and now means the same everywhere:
+  `duplicate_task` with `to_project_*`, `bulk_move_tasks` with `copy: true`,
+  and Copy to in the app (MCP `duplicate_task` used to reset the copy).
 - `bulk_update_tasks` is now all or nothing: every task is checked and written
   in one transaction (including `add_tags`), so a bad or missing task leaves
-  the whole batch unchanged instead of half-applied.
+  the whole batch unchanged instead of half-applied. An `add_tags` that adds
+  nothing new no longer marks the task updated. The app's bulk Status and Add
+  Tags actions use the same all-or-nothing write and show an error instead of
+  a success toast when it fails.
+- Every status change now re-reads the task inside its write transaction, so
+  a status change racing another process's write logs the status it actually
+  replaced. Leaving Waiting no longer adds a separate "waiting on → (empty)"
+  history row; the status row already says it.
+- The task detail pane no longer overwrites changes an agent made while the
+  task was open: it saves only the fields you edited, and fields you have not
+  touched refresh from the database. Selecting a blocked task no longer raises
+  the "Task is blocked" prompt (whose Cancel could write the previous task's
+  status onto it).
 - One-time repair on first launch: done and in-progress tasks missing
   `completed_at` / `started_at` get them back from the task's status history,
   falling back to its last-updated time; reopened tasks still carrying a

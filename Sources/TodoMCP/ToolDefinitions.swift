@@ -56,7 +56,7 @@ extension MCPServer {
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. Returns the updated task (same shape as get_task; omitted fields are empty/default).",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). Returns the updated task (same shape as get_task; omitted fields are empty/default).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
@@ -69,7 +69,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "duplicate_task",
-             "description": "Clone a task (by `id` or `code`) for reuse. Without a target it duplicates in the same project; with `to_project_id`/`to_project_code` it copies there (original kept). The copy gets a fresh code and starts as a todo: status, started/completed times and waiting fields are not copied.",
+             "description": "Clone a task (by `id` or `code`); the copy gets a fresh code. Without a target (or with its own project) it duplicates in the same project for reuse: the copy starts as a todo, and status, started/completed times and waiting fields are not copied. With another project as `to_project_id`/`to_project_code` it copies the task there as is (original kept): status, started/completed times and waiting fields carry over.",
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "move_task",
@@ -85,7 +85,7 @@ extension MCPServer {
              ])],
 
             ["name": "bulk_move_tasks",
-             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy keeps each task's status and started/completed times.",
+             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy to another project keeps each task's status, started/completed times and waiting fields (same rule as duplicate_task).",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
                 "to_project_id": int, "to_project_code": str, "copy": ["type": "boolean"]
@@ -102,7 +102,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "add_dependency",
-             "description": "Make a task blocked by another. The task (`id`/`code`) stays blocked until the dependency (`depends_on_id`/`depends_on_code`) is done; a task that is itself done is never blocked. Rejects self-dependency and cycles.",
+             "description": "Make a task blocked by another. The task (`id`/`code`) stays blocked until the dependency (`depends_on_id`/`depends_on_code`) is closed (done or dropped); a task that is itself closed is never blocked. Rejects self-dependency and cycles.",
              "inputSchema": obj(["id": int, "code": str, "depends_on_id": int, "depends_on_code": str])],
 
             ["name": "remove_dependency",

@@ -419,13 +419,14 @@ func qbPriorityChipColors(_ p: Priority) -> (bg: Color, fg: Color) {
 }
 
 /// Task-status accent: stone (todo), yellow-deep (in progress), clay (waiting),
-/// success-accent (done).
+/// success-accent (done), muted (dropped).
 func qbStatusColor(_ s: TaskStatus) -> Color {
     switch s {
     case .todo: return Theme.Colors.stone
     case .inProgress: return Theme.Colors.brandYellowDeep
     case .waiting: return Theme.Colors.brandCoral
     case .done: return Theme.Colors.successAccent
+    case .dropped: return Theme.Colors.muted
     }
 }
 
@@ -436,6 +437,17 @@ func qbStatusIcon(_ s: TaskStatus) -> String {
     case .inProgress: return "circle.lefthalf.filled"
     case .waiting: return "pause.circle"
     case .done: return "checkmark.circle.fill"
+    case .dropped: return "xmark.circle"
+    }
+}
+
+/// Title color for a task row/card: closed tasks fade (done to stone, dropped further,
+/// to muted); callers also strike through any closed title.
+func qbTitleColor(_ s: TaskStatus) -> Color {
+    switch s {
+    case .todo, .inProgress, .waiting: return Theme.Colors.ink
+    case .done: return Theme.Colors.stone
+    case .dropped: return Theme.Colors.muted
     }
 }
 
@@ -533,7 +545,7 @@ struct TaskListView: View {
                         guard model.smartView == nil, !isSearching else { return }
                         model.moveTasks(activeTasks, from: offsets, to: dest)
                     }
-                    // Done quests collapse into a toggle section at the bottom.
+                    // Closed (done and dropped) quests collapse into a toggle section at the bottom.
                     if !doneTasks.isEmpty {
                         doneToggleRow
                         if showDone {
@@ -582,10 +594,10 @@ struct TaskListView: View {
         }
     }
 
-    /// Done tasks live in a collapsed section at the bottom (see `doneToggleRow`);
-    /// active tasks keep their manual sort order.
-    private var activeTasks: [TodoTask] { displayedTasks.filter { $0.status != .done } }
-    private var doneTasks: [TodoTask] { displayedTasks.filter { $0.status == .done } }
+    /// Closed tasks (done and dropped) live in a collapsed section at the bottom (see
+    /// `doneToggleRow`); active tasks keep their manual sort order.
+    private var activeTasks: [TodoTask] { displayedTasks.filter { !$0.status.isClosed } }
+    private var doneTasks: [TodoTask] { displayedTasks.filter { $0.status.isClosed } }
 
     /// One task row with selection background and context menu — shared by the
     /// active list and the collapsed done section.
@@ -621,7 +633,7 @@ struct TaskListView: View {
             }
     }
 
-    /// "Done (N)" collapse header — click to show/hide finished quests.
+    /// "Done (N)" collapse header — click to show/hide finished (done and dropped) quests.
     private var doneToggleRow: some View {
         HStack(spacing: 6) {
             Image(systemName: showDone ? "chevron.down" : "chevron.right")
@@ -782,6 +794,8 @@ struct TaskRow: View {
     @State private var newSubtaskTitle = ""
 
     private var doneCount: Int { subtasks.filter { $0.status == .done }.count }
+    /// Subtasks still part of the work: dropped ones leave the n/total count.
+    private var countedSubtasks: Int { subtasks.filter { $0.status != .dropped }.count }
     private var isBlocked: Bool { model.blockedTaskIds.contains(task.id) }
 
     var body: some View {
@@ -807,15 +821,15 @@ struct TaskRow: View {
                         CodeBadge(code: task.code)
                         Text(task.title)
                             .font(Theme.Fonts.bodySm)
-                            .strikethrough(task.status == .done)
-                            .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
-                        if !subtasks.isEmpty {
-                            Text("\(doneCount)/\(subtasks.count)")
+                            .strikethrough(task.status.isClosed)
+                            .foregroundStyle(qbTitleColor(task.status))
+                        if countedSubtasks > 0 {
+                            Text("\(doneCount)/\(countedSubtasks)")
                                 .font(Theme.Fonts.micro.monospacedDigit())
                                 .padding(.horizontal, 6).padding(.vertical, 1)
                                 .background(Theme.Colors.surface, in: Capsule())
-                                .foregroundStyle(doneCount == subtasks.count ? Theme.Colors.successAccent : Theme.Colors.steel)
-                                .help("\(doneCount) of \(subtasks.count) subtasks done")
+                                .foregroundStyle(doneCount == countedSubtasks ? Theme.Colors.successAccent : Theme.Colors.steel)
+                                .help("\(doneCount) of \(countedSubtasks) subtasks done")
                         }
                         if isBlocked {
                             Text("🔒 blocked")
@@ -908,7 +922,7 @@ struct TaskRow: View {
     }
 
     private func isOverdue(_ d: Date, _ t: TodoTask) -> Bool {
-        t.status != .done && Calendar.current.startOfDay(for: d) < Calendar.current.startOfDay(for: Date())
+        !t.status.isClosed && Calendar.current.startOfDay(for: d) < Calendar.current.startOfDay(for: Date())
     }
 }
 
@@ -920,8 +934,8 @@ struct SubtaskRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Button(action: { model.toggleSubtaskDone(sub) }) {
-                Image(systemName: sub.status == .done ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(sub.status == .done ? Theme.Colors.successAccent : Theme.Colors.steel)
+                Image(systemName: subtaskBox)
+                    .foregroundStyle(sub.status.isClosed ? qbStatusColor(sub.status) : Theme.Colors.steel)
                     .font(.system(size: 14))
             }
             .buttonStyle(.plain)
@@ -929,11 +943,19 @@ struct SubtaskRow: View {
 
             Text(sub.title)
                 .font(Theme.Fonts.bodySm)
-                .strikethrough(sub.status == .done)
-                .foregroundStyle(sub.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
+                .strikethrough(sub.status.isClosed)
+                .foregroundStyle(qbTitleColor(sub.status))
             Spacer()
         }
         .padding(.leading, 26)
+    }
+
+    private var subtaskBox: String {
+        switch sub.status {
+        case .done: return "checkmark.square.fill"
+        case .dropped: return "xmark.square"
+        case .todo, .inProgress, .waiting: return "square"
+        }
     }
 }
 
@@ -963,8 +985,11 @@ struct ViewModeToggle: View {
 
 /// Kanban board: one column per status (Todo / In Progress / Waiting / Done) for the
 /// current project or smart view. Cards drag between columns to change status.
+/// Dropped has no column of its own: dropped cards sit, faded, in Done (closed).
 struct BoardView: View {
     @EnvironmentObject var model: AppModel
+
+    private static let columns = TaskStatus.allCases.filter { $0.boardColumn == $0 }
 
     /// Cards shown on the board: top-level tasks in a project view (subtasks stay
     /// nested in the list); the flat set in a smart view. The board honors the same
@@ -985,9 +1010,9 @@ struct BoardView: View {
                     Divider()
                     ScrollView(.horizontal, showsIndicators: true) {
                         HStack(alignment: .top, spacing: 14) {
-                            ForEach(TaskStatus.allCases, id: \.self) { status in
+                            ForEach(Self.columns, id: \.self) { status in
                                 BoardColumn(status: status,
-                                            tasks: boardTasks.filter { $0.status == status })
+                                            tasks: boardTasks.filter { $0.status.boardColumn == status })
                             }
                         }
                         .padding(16)
@@ -1006,6 +1031,11 @@ struct BoardView: View {
         if let sv = model.smartView { return sv.title }
         return model.projects.first(where: { $0.id == model.selectedProjectId })?.name ?? "Board"
     }
+}
+
+private extension TaskStatus {
+    /// The board column a card with this status sits in (see `BoardView`).
+    var boardColumn: TaskStatus { self == .dropped ? .done : self }
 }
 
 /// One board column: a status header + a scrollable stack of cards. Accepts a
@@ -1071,7 +1101,8 @@ struct BoardColumn: View {
         provider.loadObject(ofClass: NSString.self) { obj, _ in
             guard let str = obj as? String, let id = Int64(str) else { return }
             Task { @MainActor in
-                if let task = model.task(byId: id), task.status != status {
+                // Compare columns, so a dropped card let go back in Done stays dropped.
+                if let task = model.task(byId: id), task.status.boardColumn != status {
                     // Route through the shared blocked guard so a drag onto In Progress
                     // gets the same confirmation as the list/bulk/menu paths. A drop on
                     // Waiting keeps the card's waiting-on, else waits on the user.
@@ -1101,8 +1132,8 @@ struct BoardCard: View {
             Text(task.title)
                 .font(Theme.Fonts.bodySm)
                 .lineLimit(3)
-                .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
-                .strikethrough(task.status == .done)
+                .foregroundStyle(qbTitleColor(task.status))
+                .strikethrough(task.status.isClosed)
             if task.status == .waiting {
                 HStack(spacing: 6) {
                     WaitingChip(task: task)
@@ -1178,6 +1209,10 @@ struct TaskDetailView: View {
     @State private var tagsText = ""
     @State private var recurrence = "none"   // "none" | "daily" | "weekly" | "monthly"
     @State private var estimateMinutes = 0   // 0 = no estimate
+    /// The stored task the editor fields were last synced from. A field is the user's
+    /// edit only while it differs from this snapshot; autosave sends just those fields,
+    /// and a store change (e.g. an MCP write) refreshes the fields the user hasn't touched.
+    @State private var base: TodoTask?
 
     // Blocked-task guard: confirm before moving a blocked task to In Progress.
     @State private var showBlockedAlert = false
@@ -1188,7 +1223,8 @@ struct TaskDetailView: View {
             if let task = currentTask {
                 sectionsScroll(task)
                 .onAppear { load(task) }
-                .onChange(of: model.selectedTaskId) { _, _ in if let t = currentTask { load(t) } }
+                // Selection change or a store write (app or MCP): resync the editor.
+                .onChange(of: currentTask) { _, new in if let new { sync(new) } }
                 // Auto-save: any field change persists immediately (no Save button).
                 .onChange(of: title) { _, _ in autosave() }
                 .onChange(of: detail) { _, _ in autosave() }
@@ -1197,7 +1233,10 @@ struct TaskDetailView: View {
                     // Moving a blocked task to In Progress requires confirmation. Uses the
                     // shared guard decision; keeps a local alert so the picker can revert
                     // on cancel (the segmented control's binding is view-local state).
-                    if let t = currentTask, model.blockedConfirmNeeded(forIds: [t.id], to: new) {
+                    // Only a user edit (status off the snapshot) is checked: a load or
+                    // resync never raises the alert or queries the store.
+                    if let t = currentTask, new != base?.status,
+                       model.blockedConfirmNeeded(forIds: [t.id], to: new) {
                         statusBeforeBlock = old
                         showBlockedAlert = true
                     } else {
@@ -1349,8 +1388,9 @@ struct TaskDetailView: View {
                 ForEach(deps, id: \.self) { depId in
                     if let dep = model.task(byId: depId) {
                         HStack(spacing: 8) {
-                            Image(systemName: dep.status == .done ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(dep.status == .done ? Theme.Colors.successAccent : Theme.Colors.brandYellowDeep)
+                            // A closed (done or dropped) dependency no longer blocks.
+                            Image(systemName: dep.status.isClosed ? qbStatusIcon(dep.status) : "circle")
+                                .foregroundStyle(dep.status.isClosed ? qbStatusColor(dep.status) : Theme.Colors.brandYellowDeep)
                             CodeBadge(code: dep.code)
                             Text(dep.title).font(Theme.Fonts.bodySm).lineLimit(1)
                             Spacer()
@@ -1456,24 +1496,22 @@ struct TaskDetailView: View {
         return model.allTasks().filter { $0.id != task.id && !existing.contains($0.id) }
     }
 
-    /// True when the editor fields differ from the stored task.
-    private func isDirty(_ t: TodoTask) -> Bool {
-        title != t.title
-            || detail != t.detail
-            || link != (t.link ?? "")
-            || status != t.status
-            || waitingChanged(t)
-            || priority != t.priority
-            || hasDue != (t.dueDate != nil)
-            || (hasDue && !sameDay(dueDate, t.dueDate))
-            || parsedTags != t.tags
-            || recurrence != (t.recurrence ?? "none")
-            || estimateMinutes * 60 != t.estimateSeconds
+    // Per-field edits: the editor value differs from `t` (the snapshot, see `base`).
+    private func titleEdited(_ t: TodoTask) -> Bool { title != t.title }
+    private func detailEdited(_ t: TodoTask) -> Bool { detail != t.detail }
+    private func linkEdited(_ t: TodoTask) -> Bool { link != (t.link ?? "") }
+    private func statusEdited(_ t: TodoTask) -> Bool { status != t.status }
+    private func priorityEdited(_ t: TodoTask) -> Bool { priority != t.priority }
+    private func dueEdited(_ t: TodoTask) -> Bool {
+        hasDue != (t.dueDate != nil) || (hasDue && !sameDay(dueDate, t.dueDate))
     }
-
-    /// Waiting fields differ from the stored task (only meaningful while Waiting).
-    private func waitingChanged(_ t: TodoTask) -> Bool {
-        status == .waiting && (waitingOn != t.waitingOn || waitingReason != (t.waitingReason ?? ""))
+    private func tagsEdited(_ t: TodoTask) -> Bool { parsedTags != t.tags }
+    private func recurrenceEdited(_ t: TodoTask) -> Bool { recurrence != (t.recurrence ?? "none") }
+    private func estimateEdited(_ t: TodoTask) -> Bool { estimateMinutes * 60 != t.estimateSeconds }
+    // The waiting fields count only while the editor is on Waiting (they show only then).
+    private func waitingOnEdited(_ t: TodoTask) -> Bool { status == .waiting && waitingOn != t.waitingOn }
+    private func waitingReasonEdited(_ t: TodoTask) -> Bool {
+        status == .waiting && waitingReason != (t.waitingReason ?? "")
     }
 
     private func sameDay(_ a: Date, _ b: Date?) -> Bool {
@@ -1485,7 +1523,9 @@ struct TaskDetailView: View {
         model.tasks.first(where: { $0.id == model.selectedTaskId })
     }
 
+    /// Fill every editor field from `t` and make it the snapshot.
     private func load(_ t: TodoTask) {
+        base = t
         title = t.title; detail = t.detail; link = t.link ?? ""; status = t.status
         waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
         priority = t.priority
@@ -1496,25 +1536,53 @@ struct TaskDetailView: View {
         estimateMinutes = t.estimateSeconds / 60
     }
 
-    /// Persist current editor state if it differs from the stored task.
-    /// No-op right after load() (fields equal the task), so it won't loop.
+    /// The stored task changed: a new selection loads outright; for the same task each
+    /// field the user has not edited (still equal to the snapshot) takes the stored
+    /// value, and an edited field keeps the user's value. Then `t` is the snapshot.
+    /// The field onChange handlers that follow see no edits, so nothing is written back.
+    private func sync(_ t: TodoTask) {
+        guard let b = base, b.id == t.id else { return load(t) }
+        if !titleEdited(b) { title = t.title }
+        if !detailEdited(b) { detail = t.detail }
+        if !linkEdited(b) { link = t.link ?? "" }
+        if !waitingOnEdited(b) { waitingOn = t.waitingOn ?? .user }   // before status: reads it
+        if !waitingReasonEdited(b) { waitingReason = t.waitingReason ?? "" }
+        if !statusEdited(b) { status = t.status }
+        if !priorityEdited(b) { priority = t.priority }
+        // Due date and tags refresh only when the stored value moved, so an unchanged
+        // field keeps the user's in-progress text (e.g. a trailing ", ") and time of day.
+        if !dueEdited(b), t.dueDate != b.dueDate { hasDue = t.dueDate != nil; dueDate = t.dueDate ?? Date() }
+        if !tagsEdited(b), t.tags != b.tags { tagsText = t.tags.joined(separator: ", ") }
+        if !recurrenceEdited(b) { recurrence = t.recurrence ?? "none" }
+        if !estimateEdited(b) { estimateMinutes = t.estimateSeconds / 60 }
+        base = t
+    }
+
+    /// Persist the user's edits: only the fields that differ from the snapshot, so a
+    /// field the store changed underneath (an MCP write) is never overwritten with a
+    /// stale value. No-op right after load()/sync() (nothing edited), so it won't loop.
+    /// The store write reloads the tasks, and the resulting sync() moves the snapshot.
     private func autosave() {
-        guard let t = currentTask, isDirty(t) else { return }
+        guard let b = base, let t = currentTask, b.id == t.id else { return }
+        let edits = [titleEdited(b), detailEdited(b), linkEdited(b), statusEdited(b), priorityEdited(b),
+                     dueEdited(b), tagsEdited(b), recurrenceEdited(b), estimateEdited(b),
+                     waitingOnEdited(b), waitingReasonEdited(b)]
+        guard edits.contains(true) else { return }
         model.updateTask(
             t,
-            title: title,
-            detail: detail,
-            link: .some(link.isEmpty ? nil : link),
-            // Status and waiting fields go only when they changed, so ordinary edits on a
+            title: titleEdited(b) ? title : nil,
+            detail: detailEdited(b) ? detail : nil,
+            link: linkEdited(b) ? .some(link.isEmpty ? nil : link) : nil,
+            // Status and waiting fields go only when edited, so ordinary edits on a
             // waiting task skip the store's waiting check. Any other status clears them.
-            status: status != t.status ? status : nil,
-            priority: priority,
-            dueDate: .some(hasDue ? dueDate : nil),
-            tags: parsedTags,
-            recurrence: .some(recurrence == "none" ? nil : recurrence),
-            estimateSeconds: estimateMinutes * 60,
-            waitingOn: waitingChanged(t) ? waitingOn : nil,
-            waitingReason: waitingChanged(t) ? .some(waitingReason) : nil
+            status: statusEdited(b) ? status : nil,
+            priority: priorityEdited(b) ? priority : nil,
+            dueDate: dueEdited(b) ? .some(hasDue ? dueDate : nil) : nil,
+            tags: tagsEdited(b) ? parsedTags : nil,
+            recurrence: recurrenceEdited(b) ? .some(recurrence == "none" ? nil : recurrence) : nil,
+            estimateSeconds: estimateEdited(b) ? estimateMinutes * 60 : nil,
+            waitingOn: waitingOnEdited(b) ? waitingOn : nil,
+            waitingReason: waitingReasonEdited(b) ? .some(waitingReason) : nil
         )
     }
 }
