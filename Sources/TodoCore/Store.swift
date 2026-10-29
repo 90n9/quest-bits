@@ -523,21 +523,64 @@ public final class Store: @unchecked Sendable {
 
     public func listTasks(projectId: Int64? = nil) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
-        let sql: String
-        let binds: [SQLValue]
         if let pid = projectId {
-            sql = "SELECT \(Self.taskCols) FROM tasks WHERE project_id=? ORDER BY sort_order, id;"
-            binds = [.int(pid)]
-        } else {
-            sql = "SELECT \(Self.taskCols) FROM tasks ORDER BY project_id, sort_order, id;"
-            binds = []
+            return try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE project_id=? ORDER BY sort_order, id;", [.int(pid)])
         }
+        return try readTasks("SELECT \(Self.taskCols) FROM tasks ORDER BY project_id, sort_order, id;", [])
+    }
+
+    /// Tasks matching `filter`, filtered in SQL and ordered by status (`TaskStatus.listRank`:
+    /// in progress, waiting, todo, done, dropped), then project, sort_order, id.
+    /// Values are bound, never interpolated.
+    public func listTasks(matching filter: TaskFilter) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        var conds: [String] = []
+        var binds: [SQLValue] = []
+        if let pid = filter.projectId {
+            conds.append("project_id=?"); binds.append(.int(pid))
+        }
+        if let statuses = filter.statuses {
+            // An empty set matches nothing rather than everything.
+            conds.append(statuses.isEmpty ? "0" : "status IN (\(Self.placeholders(statuses.count)))")
+            binds += statuses.map { .text($0.rawValue) }
+        }
+        if let tag = filter.tag {
+            // Tags are stored comma-joined (encodeTags trims them; spaces around commas are
+            // also dropped here in case an older row kept them). Wrap both sides in commas
+            // so only a whole tag matches; instr, not LIKE, so % and _ are literal.
+            // lower() folds ASCII letters only.
+            conds.append("instr(',' || lower(REPLACE(REPLACE(trim(tags), ', ', ','), ' ,', ',')) || ',', "
+                         + "',' || lower(?) || ',') > 0")
+            binds.append(.text(tag))
+        }
+        if let parentId = filter.parentId {
+            conds.append("parent_id=?"); binds.append(.int(parentId))
+        }
+        let whereSQL = conds.isEmpty ? "" : "WHERE " + conds.joined(separator: " AND ")
+        return try readTasks(
+            "SELECT \(Self.taskCols) FROM tasks \(whereSQL) "
+            + "ORDER BY \(Self.statusRankSQL), project_id, sort_order, id;", binds)
+    }
+
+    /// Run a `taskCols` SELECT and read every row; a step error throws instead of
+    /// returning a partial list. Caller holds the lock.
+    private func readTasks(_ sql: String, _ binds: [SQLValue]) throws -> [TodoTask] {
         let stmt = try prepare(sql, binds)
         defer { sqlite3_finalize(stmt) }
         var out: [TodoTask] = []
-        while sqlite3_step(stmt) == SQLITE_ROW { out.append(taskFromRow(stmt)) }
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(taskFromRow(stmt))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
     }
+
+    /// `TaskStatus.listRank` as a SQL expression over the `status` column.
+    private static let statusRankSQL = "CASE status "
+        + TaskStatus.allCases.map { "WHEN '\($0.rawValue)' THEN \($0.listRank) " }.joined()
+        + "ELSE \(TaskStatus.allCases.count) END"
 
     /// Subtasks of a parent task, ordered like the main list.
     public func subtasks(parentId: Int64) throws -> [TodoTask] {
@@ -1068,15 +1111,19 @@ public final class Store: @unchecked Sendable {
         // Same blocked rule as isBlockedUnlocked (blockingEdgeSQL), evaluated per edge.
         for chunk in Self.chunked(tasks.map(\.id)) {
             let stmt = try prepare(
-                "SELECT d.task_id, b.code, \(Self.blockingEdgeSQL) FROM \(Self.depEdgesSQL) "
+                "SELECT d.task_id, b.code, \(Self.blockingEdgeSQL), b.id FROM \(Self.depEdgesSQL) "
                 + "WHERE d.task_id IN (\(Self.placeholders(chunk.count))) ORDER BY d.task_id, d.depends_on_id;",
                 chunk.map { .int($0) })
             defer { sqlite3_finalize(stmt) }
             var rc = sqlite3_step(stmt)
             while rc == SQLITE_ROW {
                 let tid = sqlite3_column_int64(stmt, 0)
-                rel.dependsOnCodes[tid, default: []].append(colText(stmt, 1))
-                if sqlite3_column_int64(stmt, 2) != 0 { rel.blockedIds.insert(tid) }
+                let code = colText(stmt, 1)
+                rel.dependsOnCodes[tid, default: []].append(code)
+                if sqlite3_column_int64(stmt, 2) != 0 {
+                    rel.blockedIds.insert(tid)
+                    rel.blockedBy[tid, default: []].append((id: sqlite3_column_int64(stmt, 3), code: code))
+                }
                 rc = sqlite3_step(stmt)
             }
             guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }

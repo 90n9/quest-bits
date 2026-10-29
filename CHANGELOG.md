@@ -41,6 +41,10 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   (Mark Dropped ⌘6) or the task detail. Clicking a dropped task's status icon
   (or a dropped subtask's checkbox) reopens it as Todo, and dropped subtasks
   leave the parent's n/total subtask count.
+- MCP `list_tasks` filters: `status` (one status, an array, or `"all"`),
+  `tag` (a whole tag, case-insensitive for ASCII letters) and `parent_id` /
+  `parent_code` (subtasks of a task), alongside the existing project filter.
+  Filtering happens in the database, not after loading every task.
 
 ### Changed
 
@@ -51,12 +55,23 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   null, empty or default fields (no priority, no tags, no link, zero effort or
   estimate, `blocked: false`) are left out. `effort_seconds` and
   `estimate_seconds` are dropped in favour of the `*_minutes` fields.
+- MCP `list_tasks` now returns only open tasks (todo, in progress, waiting) in
+  a compact view by default: code, title, status, and — only when set —
+  priority, parent, `blocked_by` (codes of the open dependencies blocking it),
+  tags, due date and `waiting_on`. Use `get_task` to read a task's detail, or
+  pass `view: "full"` for the old shape and `status: "all"` to include done
+  and dropped tasks. Results are sorted In Progress, Waiting, Todo, Done,
+  Dropped, then by board order. On a real database a project listing shrank
+  from 35,378 to 1,500 characters and from 234,725 to 3,959.
 - Reopening a done task (back to Todo or In Progress) now clears its
   `completed_at`, so it no longer counts as completed in the activity stats.
   Marking an already-done task done again keeps the original `completed_at`.
 
 ### Fixed
 
+- An MCP `*_code` argument that matches no task or project (e.g.
+  `parent_code: "ZZZ-9"`) now fails with "not found: task ZZZ-9" instead of
+  "missing or invalid argument".
 - A task that is itself done is no longer reported as `blocked`, even when one
   of its dependencies is still open.
 - `started_at` and `completed_at` are now set on every path that changes a

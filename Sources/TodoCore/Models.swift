@@ -38,6 +38,19 @@ public enum TaskStatus: String, Codable, CaseIterable, Sendable {
         case .inProgress, .done: return true
         }
     }
+
+    /// Sort position in filtered task lists (`Store.listTasks(matching:)`): active work
+    /// first, then the backlog, then closed. Separate from `allCases`, whose order drives
+    /// board columns and pickers.
+    public var listRank: Int {
+        switch self {
+        case .inProgress: return 0
+        case .waiting: return 1
+        case .todo: return 2
+        case .done: return 3
+        case .dropped: return 4
+        }
+    }
 }
 
 /// Who a `waiting` task is waiting on. Persisted as the raw string value; set only
@@ -160,8 +173,25 @@ public struct TaskRelations: Sendable {
     public var dependsOnCodes: [Int64: [String]] = [:]  // task id → codes it depends on
     public var parentCodes: [Int64: String] = [:]       // parent task id → its code
     public var blockedIds: Set<Int64> = []              // open tasks with >=1 open dependency (closed tasks never)
+    public var blockedBy: [Int64: [(id: Int64, code: String)]] = [:]  // task id → the open dependencies blocking it
 
     public init() {}
+}
+
+/// Which tasks `Store.listTasks(matching:)` returns. Every set field narrows the list;
+/// nil means no constraint on that field.
+public struct TaskFilter: Sendable {
+    public var projectId: Int64?
+    public var statuses: [TaskStatus]?   // any of these; nil = every status
+    public var tag: String?              // has this tag (whole tag, case-insensitive)
+    public var parentId: Int64?          // direct subtasks of this task
+
+    public init(projectId: Int64? = nil, statuses: [TaskStatus]? = nil, tag: String? = nil, parentId: Int64? = nil) {
+        self.projectId = projectId
+        self.statuses = statuses
+        self.tag = tag
+        self.parentId = parentId
+    }
 }
 
 /// A reusable task template: preset fields that spawn a real task on demand.

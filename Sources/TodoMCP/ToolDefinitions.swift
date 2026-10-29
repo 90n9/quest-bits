@@ -39,8 +39,16 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "list_tasks",
-             "description": "List tasks, optionally filtered by `project_id` or `project_code`. Each task has the same shape as get_task.",
-             "inputSchema": obj(["project_id": int, "project_code": str])],
+             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on. To read detail and the other fields use get_task, or pass view \"full\" for get_task's shape.",
+             "inputSchema": obj([
+                "project_id": int, "project_code": str,
+                "status": ["anyOf": [
+                    ["type": "string", "enum": TaskStatus.allCases.map(\.rawValue) + ["all"]],
+                    ["type": "array", "items": statusEnum, "minItems": 1]
+                ], "description": "status or statuses to include; \"all\" = every status. Default: open (todo, in_progress, waiting)."] as [String: Any],
+                "tag": str, "parent_id": int, "parent_code": str,
+                "view": ["type": "string", "enum": ["compact", "full"], "description": "compact (default) or full (same fields as get_task)"] as [String: Any]
+             ])],
 
             ["name": "get_task",
              "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason` only on waiting tasks.",

@@ -102,16 +102,31 @@ final class MCPServer {
             return "deleted"
 
         case "list_tasks":
-            let pid: Int64?
-            if args["project_id"] != nil || args["project_code"] != nil {
-                pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
-            } else {
-                pid = nil
+            // Every argument is validated before the query; an explicit null means not given.
+            let compact: Bool
+            switch args["view"] {
+            case nil, is NSNull: compact = true
+            case let v as String where v == "compact" || v == "full": compact = v == "compact"
+            default: throw MCPError.invalidArg("view must be \"compact\" or \"full\"")
             }
-            return try jsonString(taskDicts(store.listTasks(projectId: pid)))
+            var filter = TaskFilter(statuses: try parseStatusFilter(args["status"]))
+            if given(args, "project_id", "project_code") {
+                filter.projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            }
+            if given(args, "parent_id", "parent_code") {
+                filter.parentId = try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code")
+            }
+            if given(args, "tag") {
+                guard let tag = (args["tag"] as? String)?.trimmingCharacters(in: .whitespaces),
+                      !tag.isEmpty, !tag.contains(",") else {
+                    throw MCPError.invalidArg("tag must be a single non-empty tag")
+                }
+                filter.tag = tag
+            }
+            return try jsonString(readTaskDicts(store.listTasks(matching: filter), compact: compact))
 
         case "get_task":
-            return try jsonString(taskDict(store.getTask(id: try resolveTaskId(args))))
+            return try jsonString(readTaskDicts([store.getTask(id: try resolveTaskId(args))])[0])
 
         case "create_task":
             // Optional parent (subtask). If given and no project is specified,
@@ -313,6 +328,21 @@ final class MCPServer {
         return tasks.map { taskDict($0, rel) }
     }
 
+    /// The serializer for read-only tools (list_tasks, get_task): nothing was written, so
+    /// a failed relations read fails the call rather than returning tasks that silently
+    /// lack their parent, dependencies or blocked state. `compact` is list_tasks' default
+    /// view — only what an agent needs to pick a task; get_task has the rest.
+    private func readTaskDicts(_ tasks: [TodoTask], compact: Bool = false) throws -> [[String: Any]] {
+        let rel = try store.taskRelations(for: tasks)
+        return tasks.map { compact ? compactTaskDict($0, rel) : taskDict($0, rel) }
+    }
+
+    /// How output refers to another task: its code, or its numeric id if it has no code.
+    private func taskHandle(code: String?, id: Int64) -> Any {
+        if let code, !code.isEmpty { return code }
+        return id
+    }
+
     private func taskDict(_ t: TodoTask) -> [String: Any] {
         taskDicts([t])[0]
     }
@@ -337,7 +367,8 @@ final class MCPServer {
         if let rec = t.recurrence, !rec.isEmpty { d["recurrence"] = rec }
         if let pid = t.parentId {
             // Fall back to the numeric id so a subtask never looks top-level.
-            if let code = rel.parentCodes[pid], !code.isEmpty { d["parent"] = code } else { d["parent_id"] = pid }
+            let parent = taskHandle(code: rel.parentCodes[pid], id: pid)
+            d[parent is String ? "parent" : "parent_id"] = parent
         }
         if let deps = rel.dependsOnCodes[t.id], !deps.isEmpty { d["depends_on"] = deps }
         if rel.blockedIds.contains(t.id) { d["blocked"] = true }
@@ -346,6 +377,26 @@ final class MCPServer {
         // Whole minutes as before, but a non-zero sub-minute value shows as 1, not omitted.
         if t.effortSeconds > 0 { d["effort_minutes"] = max(1, t.effortSeconds / 60) }
         if t.estimateSeconds > 0 { d["estimate_minutes"] = max(1, t.estimateSeconds / 60) }
+        return d
+    }
+
+    /// The compact list shape: code, title, status, plus priority, parent, blocked_by
+    /// (the open dependencies blocking it), tags, due_date and waiting_on only when set.
+    /// No detail or timestamps; ids only where a task has no code (`taskHandle`).
+    private func compactTaskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
+        var d: [String: Any] = ["code": t.code, "title": t.title, "status": t.status.rawValue]
+        if t.code.isEmpty { d["id"] = t.id }
+        if t.priority != Priority.none { d["priority"] = t.priority.rawValue }
+        if let pid = t.parentId {
+            let parent = taskHandle(code: rel.parentCodes[pid], id: pid)
+            d[parent is String ? "parent" : "parent_id"] = parent
+        }
+        if let deps = rel.blockedBy[t.id], !deps.isEmpty {
+            d["blocked_by"] = deps.map { taskHandle(code: $0.code, id: $0.id) }
+        }
+        if !t.tags.isEmpty { d["tags"] = t.tags }
+        if let due = t.dueDate { d["due_date"] = iso(due) }
+        if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
         return d
     }
 
@@ -418,7 +469,10 @@ final class MCPServer {
     private func resolveTaskId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
         if let n = args[idKey] as? NSNumber { return n.int64Value }
         if let s = args[idKey] as? String, let n = Int64(s) { return n }
-        if let code = args[codeKey] as? String, let id = store.taskId(forCode: code) { return id }
+        if let code = args[codeKey] as? String {
+            guard let id = store.taskId(forCode: code) else { throw StoreError.notFound("task \(code)") }
+            return id
+        }
         throw MCPError.missingArg("\(idKey) or \(codeKey)")
     }
 
@@ -426,18 +480,45 @@ final class MCPServer {
     private func resolveProjectId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
         if let n = args[idKey] as? NSNumber { return n.int64Value }
         if let s = args[idKey] as? String, let n = Int64(s) { return n }
-        if let code = args[codeKey] as? String, let id = store.projectId(forCode: code) { return id }
+        if let code = args[codeKey] as? String {
+            guard let id = store.projectId(forCode: code) else { throw StoreError.notFound("project \(code)") }
+            return id
+        }
         throw MCPError.missingArg("\(idKey) or \(codeKey)")
     }
 
+    /// True if any of `keys` is present with a non-null value.
+    private func given(_ args: [String: Any], _ keys: String...) -> Bool {
+        keys.contains { k in args[k].map { !($0 is NSNull) } ?? false }
+    }
+
+    private static let isoFormatter = ISO8601DateFormatter()
+
     private func iso(_ d: Date) -> String {
-        let f = ISO8601DateFormatter()
-        return f.string(from: d)
+        Self.isoFormatter.string(from: d)
     }
 
     private func parseStatus(_ v: Any?) -> TaskStatus? {
         guard let s = v as? String else { return nil }
         return TaskStatus(rawValue: s)
+    }
+
+    /// list_tasks `status`: a status or an array of them; "all" means every status.
+    /// Absent or null = the open statuses (not `isClosed`). Unknown values are an error.
+    private func parseStatusFilter(_ v: Any?) throws -> [TaskStatus]? {
+        guard let v, !(v is NSNull) else { return TaskStatus.allCases.filter { !$0.isClosed } }
+        let names: [String]
+        if let s = v as? String { names = [s] }
+        else if let arr = v as? [String], !arr.isEmpty { names = arr }
+        else { throw MCPError.invalidArg("status must be a status, an array of statuses, or \"all\"") }
+        if names.contains("all") { return nil }
+        return try names.map { name in
+            guard let st = TaskStatus(rawValue: name) else {
+                throw MCPError.invalidArg("unknown status \"\(name)\"; use one of: "
+                    + (TaskStatus.allCases.map(\.rawValue) + ["all"]).joined(separator: ", "))
+            }
+            return st
+        }
     }
 
     /// `waiting_on`: absent or null = not given; otherwise it must be a known value.
