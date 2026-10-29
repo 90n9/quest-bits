@@ -418,12 +418,32 @@ func qbPriorityChipColors(_ p: Priority) -> (bg: Color, fg: Color) {
     }
 }
 
-/// Task-status accent: stone (todo), yellow-deep (in progress), success-accent (done).
+/// Task-status accent: stone (todo), yellow-deep (in progress), clay (waiting),
+/// success-accent (done).
 func qbStatusColor(_ s: TaskStatus) -> Color {
     switch s {
     case .todo: return Theme.Colors.stone
     case .inProgress: return Theme.Colors.brandYellowDeep
+    case .waiting: return Theme.Colors.brandCoral
     case .done: return Theme.Colors.successAccent
+    }
+}
+
+/// Status glyph, shared by list rows and board column headers.
+func qbStatusIcon(_ s: TaskStatus) -> String {
+    switch s {
+    case .todo: return "circle"
+    case .inProgress: return "circle.lefthalf.filled"
+    case .waiting: return "pause.circle"
+    case .done: return "checkmark.circle.fill"
+    }
+}
+
+/// Who a waiting task waits on, as the app's own user reads it ("Waiting on Me").
+func qbWaitingOnLabel(_ w: WaitingOn) -> String {
+    switch w {
+    case .user: return "Me"
+    case .external: return "External"
     }
 }
 
@@ -685,7 +705,13 @@ struct BulkActionBar: View {
 
             Menu {
                 ForEach(TaskStatus.allCases, id: \.self) { s in
-                    Button(s.display) { model.bulkSetStatus(s) }
+                    if s == .waiting {
+                        ForEach(WaitingOn.allCases, id: \.self) { on in
+                            Button("Waiting on \(qbWaitingOnLabel(on))") { model.bulkSetStatus(s, waitingOn: on) }
+                        }
+                    } else {
+                        Button(s.display) { model.bulkSetStatus(s) }
+                    }
                 }
             } label: { FilterPillLabel(text: "Status") }
                 .menuStyle(.button).buttonStyle(.plain).fixedSize()
@@ -766,7 +792,7 @@ struct TaskRow: View {
                     // which surfaces the confirmation for a blocked todo → In Progress move.
                     model.cycleStatus(task)
                 }) {
-                    Image(systemName: statusIcon)
+                    Image(systemName: qbStatusIcon(task.status))
                         .foregroundStyle(qbStatusColor(task.status))
                         .font(.system(size: 16))
                 }
@@ -799,8 +825,14 @@ struct TaskRow: View {
                                 .foregroundStyle(Theme.Colors.coralDark)
                                 .help("Blocked by an unfinished dependency")
                         }
+                        WaitingChip(task: task)
                     }
                     HStack(spacing: 8) {
+                        if task.status == .waiting, let reason = task.waitingReason, !reason.isEmpty {
+                            Text(reason)
+                                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+                                .lineLimit(1)
+                        }
                         if task.link != nil && !(task.link?.isEmpty ?? true) {
                             Image(systemName: "link").font(.caption2).foregroundStyle(Theme.Colors.steel)
                         }
@@ -878,14 +910,6 @@ struct TaskRow: View {
     private func isOverdue(_ d: Date, _ t: TodoTask) -> Bool {
         t.status != .done && Calendar.current.startOfDay(for: d) < Calendar.current.startOfDay(for: Date())
     }
-
-    private var statusIcon: String {
-        switch task.status {
-        case .todo: return "circle"
-        case .inProgress: return "circle.lefthalf.filled"
-        case .done: return "checkmark.circle.fill"
-        }
-    }
 }
 
 /// A single subtask line: checkbox + title, indented under its parent.
@@ -920,7 +944,7 @@ struct ViewModeToggle: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        // Only offer the board where all three status columns can populate. Single-status
+        // Only offer the board where every status column can populate. Single-status
         // smart views force the list, so hide the toggle there.
         if model.boardAvailable {
             Picker("View", selection: Binding(
@@ -937,7 +961,7 @@ struct ViewModeToggle: View {
     }
 }
 
-/// Kanban board: one column per status (Todo / In Progress / Done) for the
+/// Kanban board: one column per status (Todo / In Progress / Waiting / Done) for the
 /// current project or smart view. Cards drag between columns to change status.
 struct BoardView: View {
     @EnvironmentObject var model: AppModel
@@ -995,7 +1019,7 @@ struct BoardColumn: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
-                Image(systemName: icon).foregroundStyle(qbStatusColor(status))
+                Image(systemName: qbStatusIcon(status)).foregroundStyle(qbStatusColor(status))
                 Text(status.display).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
                 Text("\(tasks.count)")
                     .font(Theme.Fonts.micro.monospacedDigit())
@@ -1049,20 +1073,13 @@ struct BoardColumn: View {
             Task { @MainActor in
                 if let task = model.task(byId: id), task.status != status {
                     // Route through the shared blocked guard so a drag onto In Progress
-                    // gets the same confirmation as the list/bulk/menu paths.
+                    // gets the same confirmation as the list/bulk/menu paths. A drop on
+                    // Waiting keeps the card's waiting-on, else waits on the user.
                     model.setStatus(task, to: status)
                 }
             }
         }
         return true
-    }
-
-    private var icon: String {
-        switch status {
-        case .todo: return "circle"
-        case .inProgress: return "circle.lefthalf.filled"
-        case .done: return "checkmark.circle.fill"
-        }
     }
 }
 
@@ -1086,6 +1103,16 @@ struct BoardCard: View {
                 .lineLimit(3)
                 .foregroundStyle(task.status == .done ? Theme.Colors.stone : Theme.Colors.ink)
                 .strikethrough(task.status == .done)
+            if task.status == .waiting {
+                HStack(spacing: 6) {
+                    WaitingChip(task: task)
+                    if let reason = task.waitingReason, !reason.isEmpty {
+                        Text(reason)
+                            .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+                            .lineLimit(2)
+                    }
+                }
+            }
             HStack(spacing: 8) {
                 if task.priority != .none {
                     let chip = qbPriorityChipColors(task.priority)
@@ -1143,6 +1170,8 @@ struct TaskDetailView: View {
     @State private var detail = ""
     @State private var link = ""
     @State private var status: TaskStatus = .todo
+    @State private var waitingOn: WaitingOn = .user   // used only while status is Waiting
+    @State private var waitingReason = ""
     @State private var priority: Priority = .none
     @State private var hasDue = false
     @State private var dueDate = Date()
@@ -1175,6 +1204,8 @@ struct TaskDetailView: View {
                         autosave()
                     }
                 }
+                .onChange(of: waitingOn) { _, _ in autosave() }
+                .onChange(of: waitingReason) { _, _ in autosave() }
                 .onChange(of: priority) { _, _ in autosave() }
                 .onChange(of: hasDue) { _, _ in autosave() }
                 .onChange(of: dueDate) { _, _ in autosave() }
@@ -1253,6 +1284,17 @@ struct TaskDetailView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            if status == .waiting {
+                labeledRow("Waiting on") {
+                    Picker("", selection: $waitingOn) {
+                        ForEach(WaitingOn.allCases, id: \.self) { Text(qbWaitingOnLabel($0)).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                TextField("Reason (optional)", text: $waitingReason).qbField()
+            }
             labeledRow("Priority") {
                 Picker("", selection: $priority) {
                     ForEach(Priority.allCases, id: \.self) { Text($0.display).tag($0) }
@@ -1420,12 +1462,18 @@ struct TaskDetailView: View {
             || detail != t.detail
             || link != (t.link ?? "")
             || status != t.status
+            || waitingChanged(t)
             || priority != t.priority
             || hasDue != (t.dueDate != nil)
             || (hasDue && !sameDay(dueDate, t.dueDate))
             || parsedTags != t.tags
             || recurrence != (t.recurrence ?? "none")
             || estimateMinutes * 60 != t.estimateSeconds
+    }
+
+    /// Waiting fields differ from the stored task (only meaningful while Waiting).
+    private func waitingChanged(_ t: TodoTask) -> Bool {
+        status == .waiting && (waitingOn != t.waitingOn || waitingReason != (t.waitingReason ?? ""))
     }
 
     private func sameDay(_ a: Date, _ b: Date?) -> Bool {
@@ -1439,6 +1487,7 @@ struct TaskDetailView: View {
 
     private func load(_ t: TodoTask) {
         title = t.title; detail = t.detail; link = t.link ?? ""; status = t.status
+        waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
         priority = t.priority
         hasDue = t.dueDate != nil
         dueDate = t.dueDate ?? Date()
@@ -1456,12 +1505,16 @@ struct TaskDetailView: View {
             title: title,
             detail: detail,
             link: .some(link.isEmpty ? nil : link),
-            status: status,
+            // Status and waiting fields go only when they changed, so ordinary edits on a
+            // waiting task skip the store's waiting check. Any other status clears them.
+            status: status != t.status ? status : nil,
             priority: priority,
             dueDate: .some(hasDue ? dueDate : nil),
             tags: parsedTags,
             recurrence: .some(recurrence == "none" ? nil : recurrence),
-            estimateSeconds: estimateMinutes * 60
+            estimateSeconds: estimateMinutes * 60,
+            waitingOn: waitingChanged(t) ? waitingOn : nil,
+            waitingReason: waitingChanged(t) ? .some(waitingReason) : nil
         )
     }
 }
@@ -1477,17 +1530,25 @@ struct HistoryRow: View {
                 Text(fmtDateTime(event.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
             if event.field != "created" {
-                Text(event.oldValue.isEmpty ? "→ \(event.newValue)" : "\(event.oldValue) → \(event.newValue)")
+                let old = value(event.oldValue), new = value(event.newValue)
+                Text(old.isEmpty ? "→ \(new)" : "\(old) → \(new)")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
         }
         .padding(.vertical, 1)
     }
 
+    /// History stores waiting-on by raw value (user / external); show the app's labels.
+    private func value(_ v: String) -> String {
+        guard event.field == "waiting on", let on = WaitingOn(rawValue: v) else { return v }
+        return qbWaitingOnLabel(on)
+    }
+
     private var label: String {
         switch event.field {
         case "created": return "Created"
         case "status": return "Status"
+        case "waiting on": return "Waiting on"
         case "priority": return "Priority"
         case "due date": return "Due date"
         case "tags": return "Tags"
@@ -1595,6 +1656,22 @@ struct TagChip: View {
             .padding(.horizontal, 8).padding(.vertical, 2)
             .background(Theme.Colors.surfacePricingFeatured, in: Capsule())
             .foregroundStyle(Theme.Colors.brandBlue)
+    }
+}
+
+/// Who a waiting task waits on (clay fill, ember text); the reason shows on hover.
+/// Renders nothing for a task that is not waiting.
+struct WaitingChip: View {
+    let task: TodoTask
+    var body: some View {
+        if task.status == .waiting, let on = task.waitingOn {
+            Text("⏸ waiting on \(qbWaitingOnLabel(on).lowercased())")
+                .font(Theme.Fonts.micro)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(Theme.Colors.coralLight, in: Capsule())
+                .foregroundStyle(Theme.Colors.bluePressed)
+                .help(task.waitingReason.flatMap { $0.isEmpty ? nil : $0 } ?? "Waiting on \(qbWaitingOnLabel(on))")
+        }
     }
 }
 

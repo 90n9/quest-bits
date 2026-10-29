@@ -13,6 +13,23 @@ repo by CI on every `v*` tag. Source history and tags live in the private
 
 ## [Unreleased]
 
+### Added
+
+- New **Waiting** status for tasks parked on someone else. A waiting task says
+  who it waits on — `user` (you have to decide or act) or `external` (a reply,
+  a review, a deploy) — plus an optional reason. MCP `create_task`,
+  `update_task` and `bulk_update_tasks` take `waiting_on` / `waiting_reason`;
+  setting `status: waiting` without `waiting_on` is an error unless the task is
+  already waiting, and moving to any other status clears both fields. Waiting
+  is still open: it can be blocked, and tasks that depend on it stay blocked.
+  Changes to who a task waits on show in its history.
+- In the app, Waiting has its own clay colour, pause icon, board column and a
+  "waiting on me / external" chip with the reason. Set it from the bulk Status
+  menu, the Task menu (Mark Waiting on Me ⌘4, Mark Waiting on External ⌘5), a
+  drag onto the Waiting column, or the task detail, which also edits who it
+  waits on and the reason. Clicking a waiting task's status icon resumes it
+  (In Progress).
+
 ### Changed
 
 - MCP responses are compact JSON (no pretty-printing, unescaped `/` in links),
@@ -34,9 +51,15 @@ repo by CI on every `v*` tag. Source history and tags live in the private
   task's status: creating a task straight into In Progress or Done (MCP
   `create_task` with `status`), bulk status updates, and moving a task from
   Todo straight to Done (which used to leave `started_at` empty). All of them
-  share one timestamp rule. Duplicating or copying a done task keeps the
-  original's `started_at` / `completed_at`, so the copy does not count as a
-  new completion today.
+  share one timestamp rule.
+- Duplicating a task (`duplicate_task`, Duplicate in the app) now creates a
+  fresh todo for reuse — status, `started_at` / `completed_at` and waiting
+  fields are not copied — so copying a done task no longer counts as another
+  completion. Copying tasks to another project (`bulk_move_tasks` with
+  `copy: true`, Copy to in the app) still keeps each task's status and times.
+- `bulk_update_tasks` is now all or nothing: every task is checked and written
+  in one transaction (including `add_tags`), so a bad or missing task leaves
+  the whole batch unchanged instead of half-applied.
 - One-time repair on first launch: done and in-progress tasks missing
   `completed_at` / `started_at` get them back from the task's status history,
   falling back to its last-updated time; reopened tasks still carrying a

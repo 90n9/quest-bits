@@ -144,6 +144,8 @@ final class MCPServer {
                 detail: args["detail"] as? String ?? "",
                 link: args["link"] as? String,
                 status: parseStatus(args["status"]) ?? .todo,
+                waitingOn: try parseWaitingOn(args["waiting_on"]),
+                waitingReason: try waitingReasonArg(args) ?? nil,
                 priority: parsePriority(args["priority"]) ?? .none,
                 dueDate: parseDate(args["due_date"]),
                 tags: parseTags(args["tags"]) ?? [],
@@ -192,7 +194,9 @@ final class MCPServer {
                 dueDate: dueArg,
                 tags: parseTags(args["tags"]),
                 recurrence: recurArg,
-                estimateSeconds: parseMinutes(args["estimate_minutes"]).map { $0 * 60 }
+                estimateSeconds: parseMinutes(args["estimate_minutes"]).map { $0 * 60 },
+                waitingOn: try parseWaitingOn(args["waiting_on"]),
+                waitingReason: try waitingReasonArg(args)
             )
             return try jsonString(taskDict(store.getTask(id: id)))
 
@@ -215,15 +219,13 @@ final class MCPServer {
 
         case "bulk_update_tasks":
             let ids = try resolveTaskIds(args)
-            let status = parseStatus(args["status"])
-            let priority = parsePriority(args["priority"])
-            let addTags = parseTags(args["add_tags"])
             let dueArg: Date??
             if args.keys.contains("due_date") { dueArg = .some(parseDate(args["due_date"])) } else { dueArg = .none }
-            for id in ids {
-                try store.updateTask(id: id, status: status, priority: priority, dueDate: dueArg)
-                if let addTags, !addTags.isEmpty { try store.addTags(toTaskId: id, tags: addTags) }
-            }
+            // One transaction for the whole batch: any bad task leaves every task unchanged.
+            try store.bulkUpdateTasks(
+                ids: ids, status: parseStatus(args["status"]), priority: parsePriority(args["priority"]),
+                dueDate: dueArg, addTags: parseTags(args["add_tags"]),
+                waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args))
             return "updated \(ids.count) tasks"
 
         case "bulk_move_tasks":
@@ -231,7 +233,7 @@ final class MCPServer {
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
             let copy = (args["copy"] as? Bool) ?? false
             for id in ids {
-                if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid) }
+                if copy { _ = try store.duplicateTask(id: id, toProjectId: toPid, keepStatus: true) }
                 else { try store.moveTask(id: id, toProjectId: toPid) }
             }
             return "\(copy ? "copied" : "moved") \(ids.count) tasks"
@@ -324,6 +326,8 @@ final class MCPServer {
             "created_at": iso(t.createdAt),
             "updated_at": iso(t.updatedAt)
         ]
+        if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
+        if let reason = t.waitingReason, !reason.isEmpty { d["waiting_reason"] = reason }
         if !t.detail.isEmpty { d["detail"] = t.detail }
         if let link = t.link, !link.isEmpty { d["link"] = link }
         if t.priority != Priority.none { d["priority"] = t.priority.rawValue }
@@ -433,6 +437,24 @@ final class MCPServer {
     private func parseStatus(_ v: Any?) -> TaskStatus? {
         guard let s = v as? String else { return nil }
         return TaskStatus(rawValue: s)
+    }
+
+    /// `waiting_on`: absent or null = not given; otherwise it must be a known value.
+    private func parseWaitingOn(_ v: Any?) throws -> WaitingOn? {
+        guard let v, !(v is NSNull) else { return nil }
+        guard let s = v as? String, let on = WaitingOn(rawValue: s) else {
+            throw MCPError.invalidArg("waiting_on must be one of: \(WaitingOn.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return on
+    }
+
+    /// `waiting_reason` double-optional: absent leaves it alone, present+null clears it.
+    /// Any other non-string value is rejected rather than read as a clear.
+    private func waitingReasonArg(_ args: [String: Any]) throws -> String?? {
+        guard let v = args["waiting_reason"] else { return .none }
+        if v is NSNull { return .some(nil) }
+        guard let s = v as? String else { throw MCPError.invalidArg("waiting_reason must be a string or null") }
+        return .some(s)
     }
 
     private func requireString(_ args: [String: Any], _ key: String) throws -> String {

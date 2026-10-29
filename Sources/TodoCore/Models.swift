@@ -4,12 +4,14 @@ import Foundation
 public enum TaskStatus: String, Codable, CaseIterable, Sendable {
     case todo
     case inProgress = "in_progress"
+    case waiting     // parked on someone — see `WaitingOn`; still open
     case done
 
     public var display: String {
         switch self {
         case .todo: return "Todo"
         case .inProgress: return "In Progress"
+        case .waiting: return "Waiting"
         case .done: return "Done"
         }
     }
@@ -18,19 +20,27 @@ public enum TaskStatus: String, Codable, CaseIterable, Sendable {
     /// dependency it no longer blocks anything.
     public var isClosed: Bool {
         switch self {
-        case .todo, .inProgress: return false
+        case .todo, .inProgress, .waiting: return false
         case .done: return true
         }
     }
 
     /// Entering this status means work has begun, so `started_at` is stamped
-    /// (once) if it is still empty.
+    /// (once) if it is still empty. Waiting does not stamp (a task can wait before
+    /// anyone starts it), but like every status it never clears an existing start.
     public var impliesStarted: Bool {
         switch self {
-        case .todo: return false
+        case .todo, .waiting: return false
         case .inProgress, .done: return true
         }
     }
+}
+
+/// Who a `waiting` task is waiting on. Persisted as the raw string value; set only
+/// while the task is waiting (see `Store.waitingViolation`).
+public enum WaitingOn: String, Codable, CaseIterable, Sendable {
+    case user       // the human has to decide or act
+    case external   // a third party: a reply, a review, a deploy
 }
 
 /// Task priority. `none` = unset.
@@ -78,6 +88,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var detail: String
     public var link: String?
     public var status: TaskStatus
+    public var waitingOn: WaitingOn?   // set iff status == .waiting
+    public var waitingReason: String?  // optional note while waiting
     public var priority: Priority
     public var dueDate: Date?
     public var tags: [String]
@@ -99,6 +111,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         detail: String,
         link: String?,
         status: TaskStatus,
+        waitingOn: WaitingOn? = nil,
+        waitingReason: String? = nil,
         priority: Priority = .none,
         dueDate: Date? = nil,
         tags: [String] = [],
@@ -119,6 +133,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.detail = detail
         self.link = link
         self.status = status
+        self.waitingOn = waitingOn
+        self.waitingReason = waitingReason
         self.priority = priority
         self.dueDate = dueDate
         self.tags = tags
@@ -139,7 +155,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
 public struct TaskRelations: Sendable {
     public var dependsOnCodes: [Int64: [String]] = [:]  // task id → codes it depends on
     public var parentCodes: [Int64: String] = [:]       // parent task id → its code
-    public var blockedIds: Set<Int64> = []              // tasks with >=1 not-done dependency
+    public var blockedIds: Set<Int64> = []              // open tasks with >=1 open dependency (closed tasks never)
 
     public init() {}
 }

@@ -13,7 +13,7 @@ enum SmartView: String, CaseIterable {
     var icon: String { self == .allTasks ? "tray.full" : "circle.lefthalf.filled" }
 
     /// True when the view pre-filters tasks to a single status. The kanban board
-    /// is meaningless here (only one of its three columns can ever populate), so
+    /// is meaningless here (only one of its columns can ever populate), so
     /// the board toggle is suppressed for these views.
     var isSingleStatus: Bool { self == .inProgress }
 }
@@ -66,7 +66,7 @@ final class AppModel: ObservableObject {
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
 
     /// Whether the kanban board is offered for the current view. The board needs all
-    /// three status columns to be meaningful, so it is suppressed in single-status
+    /// its status columns to be meaningful, so it is suppressed in single-status
     /// smart views (which pre-filter tasks to one status). Available in project views
     /// and multi-status smart views (e.g. All Tasks).
     var boardAvailable: Bool {
@@ -265,12 +265,20 @@ final class AppModel: ObservableObject {
         updateTask(sub, status: sub.status == .done ? .todo : .done)
     }
 
+    /// Moving to Waiting without saying on whom keeps the task's current `waitingOn`,
+    /// else defaults to the user — the store rejects a waiting task with neither.
     func updateTask(_ task: TodoTask, title: String? = nil, detail: String? = nil, link: String?? = nil,
                     status: TaskStatus? = nil, priority: Priority? = nil, dueDate: Date?? = nil, tags: [String]? = nil,
-                    recurrence: String?? = nil, estimateSeconds: Int? = nil) {
-        try? store.updateTask(id: task.id, title: title, detail: detail, link: link, status: status,
-                              priority: priority, dueDate: dueDate, tags: tags, recurrence: recurrence,
-                              estimateSeconds: estimateSeconds)
+                    recurrence: String?? = nil, estimateSeconds: Int? = nil,
+                    waitingOn: WaitingOn? = nil, waitingReason: String?? = nil) {
+        let on = status == .waiting ? (waitingOn ?? task.waitingOn ?? .user) : waitingOn
+        do {
+            try store.updateTask(id: task.id, title: title, detail: detail, link: link, status: status,
+                                 priority: priority, dueDate: dueDate, tags: tags, recurrence: recurrence,
+                                 estimateSeconds: estimateSeconds, waitingOn: on, waitingReason: waitingReason)
+        } catch {
+            flashToast("Couldn't save \(task.code): \(error)")
+        }
         reloadTasks()
     }
 
@@ -279,6 +287,7 @@ final class AppModel: ObservableObject {
         switch task.status {
         case .todo: next = .inProgress
         case .inProgress: next = .done
+        case .waiting: next = .inProgress   // the wait is over: resume work
         case .done: next = .todo
         }
         setStatus(task, to: next)
@@ -288,8 +297,13 @@ final class AppModel: ObservableObject {
     /// prompt for confirmation — i.e. the target is In Progress and at least one task
     /// has an unfinished dependency. Marking Done is never guarded.
     func blockedConfirmNeeded(forIds ids: [Int64], to status: TaskStatus) -> Bool {
-        guard status == .inProgress else { return false }
-        return !idsWithOpenDependency(ids).isEmpty
+        !blockedForConfirm(ids, to: status).isEmpty
+    }
+
+    /// The ids behind `blockedConfirmNeeded`: those with an open dependency when the
+    /// target is In Progress, else none. Callers that also need the count use this.
+    private func blockedForConfirm(_ ids: [Int64], to status: TaskStatus) -> Set<Int64> {
+        status == .inProgress ? idsWithOpenDependency(ids) : []
     }
 
     /// Which of `ids` have an unfinished dependency, whatever their own status. Not
@@ -323,9 +337,9 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
-    /// Copy a task into another project (original kept).
+    /// Copy a task into another project (original kept), status and times included.
     func copyTask(_ id: Int64, toProject pid: Int64) {
-        _ = try? store.duplicateTask(id: id, toProjectId: pid)
+        _ = try? store.duplicateTask(id: id, toProjectId: pid, keepStatus: true)
         reloadTasks()
     }
 
@@ -430,7 +444,9 @@ final class AppModel: ObservableObject {
     }
 
     // Commands act on the whole selection (1 or many).
-    func setStatusOnSelected(_ status: TaskStatus) { bulkSetStatus(status) }
+    func setStatusOnSelected(_ status: TaskStatus, waitingOn: WaitingOn? = nil) {
+        bulkSetStatus(status, waitingOn: waitingOn)
+    }
 
     func duplicateSelected() {
         for id in selectedTaskIds { _ = try? store.duplicateTask(id: id) }
@@ -443,23 +459,29 @@ final class AppModel: ObservableObject {
 
     private var selectionCount: Int { selectedTaskIds.count }
 
-    func bulkSetStatus(_ status: TaskStatus) {
+    /// `waitingOn` applies only to Waiting; without it each task keeps its own (or user).
+    func bulkSetStatus(_ status: TaskStatus, waitingOn: WaitingOn? = nil) {
         let ids = Array(selectedTaskIds)
-        if blockedConfirmNeeded(forIds: ids, to: status) {
-            let blocked = idsWithOpenDependency(ids).count
+        let blockedIds = blockedForConfirm(ids, to: status)
+        if !blockedIds.isEmpty {
+            let blocked = blockedIds.count
             let noun = blocked == 1 ? "task is" : "tasks are"
             blockedConfirm = BlockedConfirm(
                 message: "\(blocked) selected \(noun) blocked by an unfinished dependency. Move to In Progress anyway?",
-                onConfirm: { [weak self] in self?.performBulkSetStatus(status, ids: ids) })
+                onConfirm: { [weak self] in self?.performBulkSetStatus(status, waitingOn: waitingOn, ids: ids) })
         } else {
-            performBulkSetStatus(status, ids: Array(selectedTaskIds))
+            performBulkSetStatus(status, waitingOn: waitingOn, ids: Array(selectedTaskIds))
         }
     }
 
-    private func performBulkSetStatus(_ status: TaskStatus, ids: [Int64]) {
-        for id in ids { try? store.updateTask(id: id, status: status) }
+    private func performBulkSetStatus(_ status: TaskStatus, waitingOn: WaitingOn?, ids: [Int64]) {
+        for id in ids {
+            let on = status == .waiting ? (waitingOn ?? task(byId: id)?.waitingOn ?? .user) : nil
+            try? store.updateTask(id: id, status: status, waitingOn: on)
+        }
         reloadTasks()
-        flashToast("Set \(ids.count) to \(status.display)")
+        let label = waitingOn.flatMap { status == .waiting ? "Waiting on \(qbWaitingOnLabel($0))" : nil } ?? status.display
+        flashToast("Set \(ids.count) to \(label)")
     }
 
     func bulkSetPriority(_ priority: Priority) {
@@ -485,7 +507,7 @@ final class AppModel: ObservableObject {
 
     func bulkCopy(toProject pid: Int64) {
         let n = selectionCount
-        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id, toProjectId: pid) }
+        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id, toProjectId: pid, keepStatus: true) }
         reloadTasks()
         flashToast("Copied \(n) tasks")
     }

@@ -8,7 +8,9 @@ extension MCPServer {
         }
         let str: [String: Any] = ["type": "string"]
         let int: [String: Any] = ["type": "integer"]
-        let statusEnum: [String: Any] = ["type": "string", "enum": ["todo", "in_progress", "done"]]
+        let statusEnum: [String: Any] = ["type": "string", "enum": TaskStatus.allCases.map(\.rawValue)]
+        let waitingOnEnum: [String: Any] = ["type": "string", "enum": WaitingOn.allCases.map(\.rawValue), "description": "who a waiting task waits on: user (the human must decide/act) or external (a third party). Required when setting status waiting, unless the task is already waiting."]
+        let waitingReasonStr: [String: Any] = ["type": "string", "description": "why the task is waiting (optional); null clears it"]
         let priorityEnum: [String: Any] = ["type": "string", "enum": ["none", "low", "medium", "high"]]
         let dateStr: [String: Any] = ["type": "string", "description": "ISO-8601 or yyyy-MM-dd; null to clear"]
         let tagsArr: [String: Any] = ["type": "array", "items": str]
@@ -41,22 +43,24 @@ extension MCPServer {
              "inputSchema": obj(["project_id": int, "project_code": str])],
 
             ["name": "get_task",
-             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true.",
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason` only on waiting tasks.",
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "create_task",
-             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). Returns the task with its new code.",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, priority, due_date, tags, recurrence optional; status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). Returns the task with its new code.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str,
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
+                "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
+                "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
                 "estimate_minutes": estimateInt, "parent_id": int, "parent_code": str
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). Returns the updated task (same shape as get_task; omitted fields are empty/default).",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. Returns the updated task (same shape as get_task; omitted fields are empty/default).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
+                "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
+                "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
                 "estimate_minutes": estimateInt
              ])],
 
@@ -65,7 +69,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "duplicate_task",
-             "description": "Clone a task (by `id` or `code`). Without a target it duplicates in the same project; with `to_project_id`/`to_project_code` it copies there (original kept). The copy gets a fresh code.",
+             "description": "Clone a task (by `id` or `code`) for reuse. Without a target it duplicates in the same project; with `to_project_id`/`to_project_code` it copies there (original kept). The copy gets a fresh code and starts as a todo: status, started/completed times and waiting fields are not copied.",
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "move_task",
@@ -73,14 +77,15 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "bulk_update_tasks",
-             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, priority, due_date, add_tags to all. add_tags merges (keeps existing).",
+             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, waiting_on, waiting_reason, priority, due_date, add_tags to all. add_tags merges (keeps existing). Waiting rules match update_task. All or nothing: if any task fails (e.g. the waiting rule), no task changes.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
-                "status": statusEnum, "priority": priorityEnum, "due_date": dateStr, "add_tags": tagsArr
+                "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
+                "priority": priorityEnum, "due_date": dateStr, "add_tags": tagsArr
              ])],
 
             ["name": "bulk_move_tasks",
-             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`.",
+             "description": "Move (or copy, if copy=true) many tasks to another project. Give `ids`/`codes` and `to_project_id`/`to_project_code`. A copy keeps each task's status and started/completed times.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
                 "to_project_id": int, "to_project_code": str, "copy": ["type": "boolean"]
