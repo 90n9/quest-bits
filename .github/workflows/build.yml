@@ -1,0 +1,36 @@
+# Build check for pull requests and main: compiles both binaries on the same
+# runner image the release uses, so compiler problems (e.g. the type-checker
+# timeout that broke the v1.3.0 release build) show up before a tag is pushed.
+#
+# This repo is public: the workflow must never use secrets, and must stay on
+# `pull_request` (never `pull_request_target`), so code from a fork runs
+# without access to SPARKLE_ED_PRIVATE_KEY or RELEASES_REPO_TOKEN.
+
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Sparkle
+        uses: actions/cache@v4
+        with:
+          path: vendor/Sparkle
+          key: sparkle-2.6.4
+
+      - name: Build app bundle
+        run: bash Scripts/build-app.sh

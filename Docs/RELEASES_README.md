@@ -3,7 +3,7 @@
 Public download page for **QuestBits**, a native macOS todo + Pomodoro app with a
 bundled MCP server so **Claude Code** can manage your tasks for you.
 
-Source lives in the private repo `90n9/quest-bits`. Every tagged release there
+Source lives in [`90n9/quest-bits`](https://github.com/90n9/quest-bits). Every tagged release there
 (`vX.Y.Z`) is built by CI and published here as a downloadable DMG, and this
 repo's `appcast.xml` feeds the app's built-in auto-updater.
 
