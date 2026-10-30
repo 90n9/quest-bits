@@ -17,6 +17,20 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.5.0] - 2026-10-31
+
+### Added
+
+- **Guide templates by kind of project.** New Project has a Kind picker
+  (Web app, App, Research, Animation, or None) that starts the project's
+  agent guide from a short template you then edit. A project whose guide is
+  still empty gets a **Start from template** menu in its guide sheet. The
+  template is saved as an ordinary guide version, so History shows it and
+  can restore past it. The templates are first drafts and will be rewritten
+  from the guides you actually keep.
+- MCP `create_project` takes an optional `guide_template` (`web_app`, `app`,
+  `research` or `animation`) and `session`.
+
 ## [1.4.2] - 2026-10-30
 
 ### Added

@@ -69,6 +69,9 @@ struct GuideSheet: View {
                 Text(project.map { "Guide · \($0.name)" } ?? "Guide · All projects")
                     .font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
                 Spacer()
+                if project != nil, loaded, markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    templateMenu
+                }
                 Button("History…") { showHistory = true }
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
             }
@@ -138,6 +141,16 @@ struct GuideSheet: View {
     /// Save an earlier version's text as a new version, and show it.
     private func restore(_ v: GuideVersion) {
         save(v.markdown, reason: "Restored version \(v.id)")
+    }
+
+    /// Fill a still-empty project guide from a template, as a version of its own.
+    private var templateMenu: some View {
+        Menu("Start from template") {
+            ForEach(GuideTemplate.allCases) { t in
+                Button(t.label) { save(t.markdown, reason: t.reason) }
+            }
+        }
+        .menuStyle(.button).buttonStyle(QBSecondaryButtonStyle(compact: true)).fixedSize()
     }
 
     static func changedLabel(_ v: GuideVersion) -> String {

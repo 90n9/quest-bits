@@ -424,8 +424,8 @@ final class AppModel: ObservableObject {
 
     // MARK: - Project CRUD
 
-    func addProject(name: String, detail: String = "") {
-        guard let p = try? store.createProject(name: name, detail: detail) else { return }
+    func addProject(name: String, detail: String = "", guideTemplate: GuideTemplate? = nil) {
+        guard let p = try? store.createProject(name: name, detail: detail, guideTemplate: guideTemplate) else { return }
         reloadAll()
         selectProject(p.id)
     }

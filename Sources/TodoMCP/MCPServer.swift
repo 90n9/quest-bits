@@ -262,7 +262,19 @@ final class MCPServer: @unchecked Sendable {
         case "create_project":
             let name = try requireString(args, "name")
             let desc = args["description"] as? String ?? ""
-            return try jsonString(projectDict(store.createProject(name: name, detail: desc)))
+            var template: GuideTemplate?
+            if let raw = args["guide_template"], !(raw is NSNull) {
+                guard let s = raw as? String, let t = GuideTemplate(rawValue: s) else {
+                    throw MCPError.invalidArg("guide_template must be one of: "
+                        + GuideTemplate.allCases.map(\.rawValue).joined(separator: ", "))
+                }
+                template = t
+            }
+            let p = try store.createProject(name: name, detail: desc, guideTemplate: template,
+                                            author: .agent, sessionId: try sessionArg(args))
+            var d = projectDict(p)
+            if let template { d["guide_template"] = template.rawValue }
+            return try jsonString(d)
 
         case "rename_project":
             try store.renameProject(id: try resolveProjectId(args, idKey: "id", codeKey: "code"), name: try requireString(args, "name"))

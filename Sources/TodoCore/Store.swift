@@ -537,7 +537,10 @@ public final class Store: @unchecked Sendable {
     // MARK: - Projects
 
     @discardableResult
-    public func createProject(name: String, detail: String = "") throws -> Project {
+    /// `guideTemplate` starts the project's guide from that template, as its first version
+    /// (by `author`, in the same transaction).
+    public func createProject(name: String, detail: String = "", guideTemplate: GuideTemplate? = nil,
+                              author: NoteAuthor = .user, sessionId: String? = nil) throws -> Project {
         lock.lock(); defer { lock.unlock() }
         // The code pick, the end-of-list sort_order and the INSERT are one read-modify-write
         // the app and MCP server can race on (both picking the same code).
@@ -551,6 +554,13 @@ public final class Store: @unchecked Sendable {
                 [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970)), .int(sortOrder)]
             )
             let id = lastInsertId()
+            if let guideTemplate {
+                let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
+                try runWrite(
+                    "INSERT INTO guide_versions (project_id, ts, markdown, author, session_id, reason) VALUES (?, ?, ?, ?, ?, ?);",
+                    [.int(id), .double(now.timeIntervalSince1970), .text(guideTemplate.markdown), .text(author.rawValue),
+                     session.map(SQLValue.text) ?? .null, .text(guideTemplate.reason)])
+            }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: Int(sortOrder))
         } catch {

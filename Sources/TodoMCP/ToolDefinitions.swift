@@ -31,8 +31,11 @@ extension MCPServer {
              "inputSchema": obj(["include_archived": ["type": "boolean", "description": "also list archived projects (default false)"] as [String: Any]])],
 
             ["name": "create_project",
-             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned.",
-             "inputSchema": obj(["name": str, "description": str], required: ["name"])],
+             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned. Optional `guide_template` starts the project's guide (see get_guide) from a template for that kind of project, for the user to edit; pass it only when the user picked the kind.",
+             "inputSchema": obj(["name": str, "description": str,
+                                 "guide_template": ["type": "string", "enum": GuideTemplate.allCases.map(\.rawValue),
+                                                    "description": "web_app, app, research or animation; omit for an empty guide"] as [String: Any],
+                                 "session": sessionStr], required: ["name"])],
 
             ["name": "rename_project",
              "description": "Rename a project, identified by `id` or `code`.",

@@ -272,12 +272,12 @@ struct ProjectSidebar: View {
             }
         }
         .sheet(isPresented: $showNew) {
-            ProjectSheet(title: "New Project") { name, detail in
-                model.addProject(name: name, detail: detail)
+            ProjectSheet(title: "New Project", picksTemplate: true) { name, detail, template in
+                model.addProject(name: name, detail: detail, guideTemplate: template)
             }
         }
         .sheet(item: $editing) { p in
-            ProjectSheet(title: "Edit Project", name: p.name, detail: p.detail) { name, detail in
+            ProjectSheet(title: "Edit Project", name: p.name, detail: p.detail) { name, detail, _ in
                 model.updateProject(p.id, name: name, detail: detail)
             }
         }
@@ -442,12 +442,15 @@ struct ArchiveProjectSheet: View {
     }
 }
 
-/// Create/edit sheet for a project: name + description.
+/// Create/edit sheet for a project: name + description, and when creating
+/// (`picksTemplate`) the kind of project, whose template starts its agent guide.
 struct ProjectSheet: View {
     let title: String
     @State var name: String = ""
     @State var detail: String = ""
-    let onSave: (String, String) -> Void
+    var picksTemplate = false
+    @State private var template: GuideTemplate?
+    let onSave: (String, String, GuideTemplate?) -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -459,13 +462,14 @@ struct ProjectSheet: View {
             TextEditor(text: $detail)
                 .frame(height: 90)
                 .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
+            if picksTemplate { templatePicker }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
                 Button("Save") {
                     let n = name.trimmingCharacters(in: .whitespaces)
-                    if !n.isEmpty { onSave(n, detail) }
+                    if !n.isEmpty { onSave(n, detail, template) }
                     dismiss()
                 }
                 .buttonStyle(QBPrimaryButtonStyle(compact: true))
@@ -476,6 +480,17 @@ struct ProjectSheet: View {
         .padding(Theme.Spacing.lg)
         .frame(width: 380)
         .qbParchment()
+    }
+
+    private var templatePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("Kind", selection: $template) {
+                Text("None").tag(GuideTemplate?.none)
+                ForEach(GuideTemplate.allCases) { t in Text(t.label).tag(GuideTemplate?.some(t)) }
+            }
+            Text("Starts the project's agent guide from a template you can edit.")
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+        }
     }
 }
 
