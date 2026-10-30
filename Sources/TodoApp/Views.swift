@@ -443,13 +443,17 @@ struct ArchiveProjectSheet: View {
 }
 
 /// Create/edit sheet for a project: name + description, and when creating
-/// (`picksTemplate`) the kind of project, whose template starts its agent guide.
+/// (`picksTemplate`) the kind of project, whose template starts its agent guide. The
+/// description uses the task Detail editor (blocks, bold, links, images), stored as markdown.
 struct ProjectSheet: View {
+    @EnvironmentObject var model: AppModel
     let title: String
     @State var name: String = ""
     @State var detail: String = ""
     var picksTemplate = false
     @State private var template: GuideTemplate?
+    @State private var detailHeight: CGFloat = 120
+    @State private var flush = EditorFlush()
     let onSave: (String, String, GuideTemplate?) -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -459,27 +463,40 @@ struct ProjectSheet: View {
             TextField("Project name", text: $name)
                 .textFieldStyle(.roundedBorder)
             Text("Description").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
-            TextEditor(text: $detail)
-                .frame(height: 90)
-                .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
+            ScrollView {
+                // One document, so docId is fixed; an edit flushed as the sheet closes
+                // without Save is dropped, like the rest of the sheet.
+                MarkdownEditor(docId: 0, markdown: $detail, height: $detailHeight, store: model.store,
+                               onOtherDoc: { _, _ in }, onError: { model.flashToast($0) }, flush: flush)
+                    .frame(height: max(140, detailHeight + 8))
+            }
+            .frame(height: 240)
+            .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
             if picksTemplate { templatePicker }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
-                Button("Save") {
-                    let n = name.trimmingCharacters(in: .whitespaces)
-                    if !n.isEmpty { onSave(n, detail, template) }
-                    dismiss()
-                }
-                .buttonStyle(QBPrimaryButtonStyle(compact: true))
-                .keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                // ⌘Return, not Return: Return belongs to the editor.
+                Button("Save") { save() }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding(Theme.Spacing.lg)
-        .frame(width: 380)
+        .frame(width: 560)
         .qbParchment()
+    }
+
+    /// Take the editor's last keystrokes (it sends edits 150 ms late), then save.
+    private func save() {
+        flush { md in
+            if let md { detail = md }
+            let n = name.trimmingCharacters(in: .whitespaces)
+            if !n.isEmpty { onSave(n, detail, template) }
+            dismiss()
+        }
     }
 
     private var templatePicker: some View {

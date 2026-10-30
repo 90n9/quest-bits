@@ -30,6 +30,12 @@ _Nothing yet._
   from the guides you actually keep.
 - MCP `create_project` takes an optional `guide_template` (`web_app`, `app`,
   `research` or `animation`) and `session`.
+- **Project descriptions use the Notion-style editor** of a task's Detail:
+  headings, lists, bold and italic, links and pasted or dropped images. The
+  text is still markdown. In the project sheet, Save is ⌘Return, because
+  Return belongs to the editor.
+- MCP project results (`list_projects`, `create_project`) list the files of
+  images in the description as `attachments`, as tasks already do.
 
 ## [1.4.2] - 2026-10-30
 

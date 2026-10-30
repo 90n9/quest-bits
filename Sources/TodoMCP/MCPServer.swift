@@ -634,6 +634,9 @@ final class MCPServer: @unchecked Sendable {
         var d: [String: Any] = ["id": p.id, "code": p.code, "name": p.name, "description": p.detail,
                                 "created_at": iso(p.createdAt)]
         if let a = p.archivedAt { d["archived_at"] = iso(a) }
+        // Images in the description, as for a task's detail.
+        let files = attachmentFiles(in: p.detail)
+        if !files.isEmpty { d["attachments"] = files }
         return d
     }
 

@@ -19,6 +19,9 @@ struct MarkdownEditor: NSViewRepresentable {
     /// Save `markdown` as the detail of task `docId`, which is no longer the one shown.
     var onOtherDoc: (Int64, String) -> Void
     var onError: (String) -> Void = { _ in }
+    /// Set by a view that acts on the text at once (a sheet's Save), to take the edit not
+    /// sent yet first.
+    var flush: EditorFlush? = nil
 
     static let scheme = "qb-attachment"
 
@@ -32,6 +35,7 @@ struct MarkdownEditor: NSViewRepresentable {
         view.navigationDelegate = context.coordinator
         view.setValue(false, forKey: "drawsBackground")
         context.coordinator.webView = view
+        flush?.webView = view
         context.coordinator.docId = docId
         context.coordinator.known = markdown
         if let page = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "Editor") {
@@ -178,6 +182,21 @@ struct MarkdownEditor: NSViewRepresentable {
             guard let data = try? JSONSerialization.data(withJSONObject: [s]),
                   let json = String(data: data, encoding: .utf8) else { return nil }
             return String(json.dropFirst().dropLast())
+        }
+    }
+}
+
+/// Takes a MarkdownEditor's edit not sent yet (the page sends edits 150 ms after the last
+/// keystroke): calls back with the editor's markdown, or nil when everything was sent or
+/// the page is not loaded.
+@MainActor
+final class EditorFlush {
+    fileprivate weak var webView: WKWebView?
+
+    func callAsFunction(_ done: @escaping @MainActor (String?) -> Void) {
+        guard let webView else { return done(nil) }
+        webView.evaluateJavaScript("qb.flush()") { result, _ in
+            done((result as? [String: Any])?["markdown"] as? String)
         }
     }
 }
