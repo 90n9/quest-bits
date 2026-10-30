@@ -196,6 +196,7 @@ coexists with the production app without touching its data.
   identity so notification permissions and MCP trust don't re-prompt every rebuild.
 - **Live reload is 1.5 s polling**, not FSEvents — simple and reliable for WAL,
   with a slight lag.
-- **DB override** for testing: set `TODO_DB_PATH` when running `todo-mcp`.
+- **DB override** for testing: set `TODO_DB_PATH` when running `todo-mcp`. Only
+  the MCP server reads it; the app always opens the data location below.
 - **Data location:** `~/Library/Application Support/TodoApp/db.sqlite`
   (plus `-wal` / `-shm` sidecars).

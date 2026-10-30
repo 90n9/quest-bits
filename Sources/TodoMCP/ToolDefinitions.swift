@@ -112,7 +112,7 @@ extension MCPServer {
              ])],
 
             ["name": "bulk_delete_tasks",
-             "description": "Delete many tasks at once. Give `ids` and/or `codes` arrays.",
+             "description": "Delete many tasks at once (with their subtasks). Give `ids` and/or `codes` arrays. All or nothing: if any task is unknown, no task is deleted. Returns how many tasks were deleted, subtasks included.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str]
              ])],

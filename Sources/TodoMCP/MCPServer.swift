@@ -299,8 +299,9 @@ final class MCPServer {
 
         case "bulk_delete_tasks":
             let ids = try resolveTaskIds(args)
-            for id in ids { try store.deleteTask(id: id) }
-            return "deleted \(ids.count) tasks"
+            // One transaction for the whole batch: an unknown task leaves every task in place.
+            let deleted = try store.bulkDeleteTasks(ids: ids)
+            return "deleted \(deleted) tasks"
 
         case "get_task_history":
             let id = try resolveTaskId(args)
@@ -501,7 +502,8 @@ final class MCPServer {
     /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).
     /// Like `resolveTaskId`, an unknown code (or an id that is not a number) is an error
     /// naming it, never skipped, so the bulk tools stay all or nothing. An unknown numeric
-    /// id is left to the store, which reports it inside the batch.
+    /// id is left to the store, which reports it inside the batch. A task named twice (by
+    /// id and by code, or repeated) is kept once, in first-seen order.
     private func resolveTaskIds(_ args: [String: Any]) throws -> [Int64] {
         var ids: [Int64] = []
         if let arr = args["ids"] as? [Any] {
@@ -518,7 +520,8 @@ final class MCPServer {
             }
         }
         guard !ids.isEmpty else { throw MCPError.missingArg("ids or codes") }
-        return ids
+        var seen = Set<Int64>()
+        return ids.filter { seen.insert($0).inserted }
     }
 
     /// Resolve a task id from either `id` (int) or `code` (string handle like "GEN-3").
