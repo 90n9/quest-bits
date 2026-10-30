@@ -1,0 +1,12 @@
+{
+  "name": "questbits-editor",
+  "private": true,
+  "description": "The task Detail editor: Milkdown Crepe, bundled by Scripts/build-app.sh into the app's Resources/Editor.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@milkdown/crepe": "7.23.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

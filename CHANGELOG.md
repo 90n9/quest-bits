@@ -17,6 +17,34 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.4.1] - 2026-10-30
+
+### Changed
+
+- **Detail is now a Notion-style editor.** Type `/` for blocks: headings,
+  lists, to-dos, quotes, tables and images. Drag a block by its handle, and
+  format selected text from the toolbar. Paste a link, or select text to add
+  one; ⌘-click a link to open it in your browser.
+- Attach images to a task's Detail: paste one, drop a file, or use the image
+  block. Images are saved in an `attachments` folder next to the database.
+- Detail is still saved as markdown, so agents read and write it as before.
+  Opening a task never rewrites its Detail; only your edits are saved. A
+  single line break stays a line break. MCP `get_task` lists the files of
+  attached images in `attachments`, so an agent can open them.
+- Detail has no text-field frame any more, so it takes less room.
+- Thai text in Detail uses the system Thai font, and long words or paths
+  wrap instead of running off the edge.
+- Task rows in the list show the code and status chips on their own line,
+  so a title in a narrow column wraps between words, not inside one.
+
+### Added
+
+- Click a subtask to open it in the detail column, to give it its own
+  Detail and notes.
+- The sidebar footer has an **Update to vX** button when a new version is
+  out, even after you close the top banner. Otherwise it has a **Check for
+  updates** link.
+
 ## [1.4.0] - 2026-10-30
 
 ### Added

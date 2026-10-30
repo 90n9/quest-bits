@@ -93,6 +93,18 @@ mkdir -p "$APP/Contents/Resources/Frames" "$APP/Contents/Resources/Textures"
 cp "$ROOT/Resources/Frames/"* "$APP/Contents/Resources/Frames/"
 cp "$ROOT/Resources/Textures/"* "$APP/Contents/Resources/Textures/"
 
+echo "==> Bundle the Detail editor (Milkdown, MIT; esbuild from Editor/)"
+# Needs Node/npm. npm ci only when the lockfile changed since the last install
+# (first build needs network); the bundle is rebuilt every time (well under a second).
+if [[ ! -f Editor/node_modules/.package-lock.json || Editor/package-lock.json -nt Editor/node_modules/.package-lock.json ]]; then
+    (cd Editor && npm ci --no-audit --no-fund --silent)
+fi
+mkdir -p "$APP/Contents/Resources/Editor"
+(cd Editor && npx --no-install esbuild src/main.js --bundle --minify --format=iife --target=safari17 \
+    --loader:.svg=text '--external:../Fonts/*' --log-level=warning \
+    --outfile="$APP/Contents/Resources/Editor/editor.js")
+cp Editor/index.html "$APP/Contents/Resources/Editor/index.html"
+
 echo "==> Write Info.plist"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

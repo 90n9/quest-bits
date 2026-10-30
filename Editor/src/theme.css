@@ -1,0 +1,54 @@
+/* QuestBits look for the Detail editor: parchment colors and the app's fonts (the app
+   is light only). Fonts load from the app bundle's Resources/Fonts. */
+@font-face { font-family: 'Quicksand'; src: url('../Fonts/Quicksand.ttf'); font-weight: 300 700; }
+@font-face { font-family: 'Alegreya'; src: url('../Fonts/Alegreya.ttf'); font-weight: 400 900; }
+
+:root { color-scheme: light; }
+html, body { margin: 0; padding: 0; background: transparent; }
+
+.milkdown {
+  --crepe-color-background: transparent;   /* the detail section shows through */
+  --crepe-color-on-background: #4a3423;
+  --crepe-color-surface: #faf3e3;
+  --crepe-color-surface-low: #f1e5cc;
+  --crepe-color-on-surface: #4a3423;
+  --crepe-color-on-surface-variant: #6f583f;
+  --crepe-color-outline: #d9c4a0;
+  --crepe-color-primary: #c8622f;
+  --crepe-color-secondary: #f1e5cc;
+  --crepe-color-on-secondary: #4a3423;
+  --crepe-color-inverse: #4a3423;
+  --crepe-color-on-inverse: #fdf9ec;
+  --crepe-color-inline-code: #a34a1f;
+  --crepe-color-error: #b3261e;
+  --crepe-color-hover: #f1e5cc;
+  --crepe-color-selected: #ead9b6;
+  --crepe-color-inline-area: #f1e5cc;
+
+  --crepe-base-font-size: 14px;
+  --crepe-font-title: 'Alegreya', Georgia, serif;
+  /* Quicksand has no Thai: Thai text takes Sukhumvit Set (the macOS Thai UI font), whose
+     weight matches, instead of a heavier fallback. */
+  --crepe-font-default: 'Quicksand', 'Sukhumvit Set', 'Thonburi', -apple-system, BlinkMacSystemFont, sans-serif;
+  --crepe-font-code: ui-monospace, Menlo, monospace;
+
+  --crepe-shadow-1: 0 1px 3px 1px rgba(74, 52, 35, .12), 0 1px 2px 0 rgba(74, 52, 35, .2);
+  --crepe-shadow-2: 0 2px 6px 2px rgba(74, 52, 35, .12), 0 1px 2px 0 rgba(74, 52, 35, .2);
+}
+
+/* Fit the detail panel: no page padding, only the left room the drag handle needs. */
+.milkdown .ProseMirror { padding: 2px 4px 2px 26px; }
+.milkdown .ProseMirror p { line-height: 1.6; }
+/* Thai wraps between words (WebKit's dictionary line breaking); a token too long for the
+   line, such as a file path, wraps anywhere rather than overflowing. */
+.milkdown .ProseMirror { word-break: normal; line-break: auto; overflow-wrap: anywhere; }
+.milkdown .ProseMirror a { color: #c8622f; }
+
+/* A single newline in Detail is an inline break (Milkdown saves it back as a plain
+   newline) that Milkdown draws as a space: draw it as a line break, as the old
+   plain-text Detail showed it. */
+.milkdown .ProseMirror span[data-type="hardbreak"]::after { content: "\A"; white-space: pre; }
+
+/* Images fit the panel: at most 480px wide and 360px tall, aspect kept. */
+.milkdown .milkdown-image-block > .image-wrapper { max-width: 480px; }
+.milkdown .milkdown-image-block > .image-wrapper img { max-height: 360px; width: auto; max-width: 100%; object-fit: contain; }

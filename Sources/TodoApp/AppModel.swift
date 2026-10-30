@@ -405,6 +405,18 @@ final class AppModel: ObservableObject {
         return true
     }
 
+    /// Save the Detail of a task that is no longer the one in the detail column: an editor
+    /// change that arrived after the user moved on. Toasts on failure.
+    func saveDetail(taskId: Int64, markdown: String) {
+        do {
+            try store.updateTask(id: taskId, detail: markdown)
+        } catch {
+            flashToast("Couldn't save the detail of a task you left: \(error)")
+            return
+        }
+        reloadTasks()
+    }
+
     /// A note's earlier texts, newest first (empty on a read error).
     func noteEdits(_ note: TaskNote) -> [NoteEdit] {
         (try? store.noteEdits(noteId: note.id)) ?? []

@@ -301,6 +301,10 @@ final class MCPServer: @unchecked Sendable {
                 if !notes.isEmpty { d["notes"] = notes.prefix(limit).map(noteDict) }
                 if notes.count > limit { d["more_notes"] = true }
             }
+            // Images in the detail are stored as attachments/<name>; give their files, so an
+            // agent can open them.
+            let files = attachmentFiles(in: task.detail)
+            if !files.isEmpty { d["attachments"] = files }
             // Questions still in play: open (waiting on the user) or answered (to resume).
             let questions = try store.questions(statuses: [.open, .answered], taskId: task.id)
             if !questions.isEmpty { d["questions"] = questions.map(questionDict) }
@@ -660,6 +664,20 @@ final class MCPServer: @unchecked Sendable {
         if let due = t.dueDate { d["due_date"] = iso(due) }
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
         return d
+    }
+
+    /// Absolute paths of the attachment files a detail's markdown links to (images or
+    /// links whose target starts with attachments/), in order, each once, existing files only.
+    private func attachmentFiles(in markdown: String) -> [String] {
+        guard markdown.contains(Store.attachmentPrefix) else { return [] }
+        let pattern = #"\]\((\#(NSRegularExpression.escapedPattern(for: Store.attachmentPrefix))[^)\s]+)"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        var seen = Set<String>()
+        return re.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown)).compactMap { m in
+            guard let r = Range(m.range(at: 1), in: markdown), let file = store.attachmentFile(String(markdown[r])),
+                  FileManager.default.fileExists(atPath: file.path), seen.insert(file.path).inserted else { return nil }
+            return file.path
+        }
     }
 
     /// A note in get_task and search: id, ts and text, plus kind unless it is the default

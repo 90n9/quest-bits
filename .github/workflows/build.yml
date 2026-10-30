@@ -36,7 +36,7 @@ jobs:
       - name: Build app bundle
         run: bash Scripts/build-app.sh
 
-  # A PR that changes the app (Sources/, Scripts/, Resources/, or the public
+  # A PR that changes the app (Sources/, Scripts/, Resources/, Editor/, or the public
   # releases README) ships as a new version: merging it to main releases the
   # top CHANGELOG version (see release.yml). Fail early if that version is not
   # X.Y.Z or not newer than every released version, so a merge never ships code
@@ -57,7 +57,7 @@ jobs:
         run: |
           set -euo pipefail
           CHANGED=$(git diff --name-only "$BASE_SHA"...HEAD)
-          if ! grep -qE '^(Sources|Scripts|Resources)/|^Docs/RELEASES_README\.md$' <<<"$CHANGED"; then
+          if ! grep -qE '^(Sources|Scripts|Resources|Editor)/|^Docs/RELEASES_README\.md$' <<<"$CHANGED"; then
             echo "No app changes; no new version needed."
             exit 0
           fi

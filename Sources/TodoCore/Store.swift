@@ -30,6 +30,33 @@ public final class Store: @unchecked Sendable {
 
     public let dbURL: URL
 
+    /// Images attached to task details: files in `attachments/` next to the database,
+    /// referenced from the markdown as `attachments/<name>` (`Store.attachmentPrefix`).
+    public var attachmentsURL: URL {
+        dbURL.deletingLastPathComponent().appendingPathComponent("attachments", isDirectory: true)
+    }
+    public static let attachmentPrefix = "attachments/"
+
+    /// Save an image for a task detail; returns the path to put in the markdown. The name
+    /// is random, so files never collide; nothing else is written. Deleting a task or
+    /// removing the image from its detail leaves the file.
+    public func saveAttachment(_ data: Data, fileExtension ext: String) throws -> String {
+        let clean = ext.lowercased().filter { $0.isLetter || $0.isNumber }
+        let name = UUID().uuidString.lowercased() + "." + (clean.isEmpty ? "png" : String(clean.prefix(5)))
+        try FileManager.default.createDirectory(at: attachmentsURL, withIntermediateDirectories: true)
+        try data.write(to: attachmentsURL.appendingPathComponent(name), options: .atomic)
+        return Self.attachmentPrefix + name
+    }
+
+    /// The file behind an attachment path from a detail, or nil when the path is not one
+    /// (or tries to leave the folder).
+    public func attachmentFile(_ path: String) -> URL? {
+        guard path.hasPrefix(Self.attachmentPrefix) else { return nil }
+        let name = String(path.dropFirst(Self.attachmentPrefix.count)).removingPercentEncoding ?? ""
+        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return nil }
+        return attachmentsURL.appendingPathComponent(name)
+    }
+
     /// Default shared location: ~/Library/Application Support/TodoApp/db.sqlite
     /// Dev builds (compiled with -D DEV_BUILD) use a separate TodoAppDev
     /// directory so experiments never touch production data.

@@ -106,7 +106,7 @@ jobs:
                 git tag "$TAG" "$GITHUB_SHA"
                 git push origin "$TAG"
                 echo "Pushed the missing tag ${TAG}."
-              elif [[ "$TAG_SHA" != "$GITHUB_SHA" ]] && grep -qE '^(Sources|Scripts|Resources)/|^Docs/RELEASES_README\.md$' <<<"$CHANGED"; then
+              elif [[ "$TAG_SHA" != "$GITHUB_SHA" ]] && grep -qE '^(Sources|Scripts|Resources|Editor)/|^Docs/RELEASES_README\.md$' <<<"$CHANGED"; then
                 echo "::error file=CHANGELOG.md::This push changes the app but ${TAG} was already released from another commit. Add a new ## [X.Y.Z] section."
                 exit 1
               fi
