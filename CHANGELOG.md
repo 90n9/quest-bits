@@ -4,11 +4,13 @@ All notable changes to QuestBits are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-(`MAJOR.MINOR.PATCH` — the version is stamped into the app bundle from the git tag).
+(`MAJOR.MINOR.PATCH` — the top `## [X.Y.Z]` heading below is the version CI
+stamps into the app bundle and tags as `vX.Y.Z`).
 
 Releases (signed `.dmg`) are published to the public
 [`90n9/quest-bits-releases`](https://github.com/90n9/quest-bits-releases/releases)
-repo by CI on every `v*` tag. Source history and tags live in the public
+repo by CI when a merge to main adds a new `## [X.Y.Z]` here (or on a
+hand-pushed `v*` tag). Source history and tags live in the public
 `90n9/quest-bits` repo.
 
 ## [Unreleased]

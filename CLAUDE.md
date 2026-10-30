@@ -11,7 +11,7 @@ Scripts/build-app.sh                # local default: DEV flavor → "build/Quest
 FLAVOR=prod Scripts/build-app.sh    # production flavor → build/QuestBits.app (CI implies this)
 Scripts/make-dmg.sh                 # package build/QuestBits.app → build/QuestBits.dmg (prod only)
 open "build/QuestBits Dev.app"
-VERSION=1.2.0 Scripts/build-app.sh  # override bundle version (CI passes the git tag here)
+VERSION=1.2.0 Scripts/build-app.sh  # override bundle version (CI passes the release version here)
 ```
 
 **Dev vs prod flavor.** Local builds default to a fully isolated **QuestBits Dev** app
@@ -71,9 +71,10 @@ Projects have a short code (`GEN`), tasks have one too (`GEN-3`). **Every MCP to
 
 Source lives in the **public** `90n9/quest-bits`; built DMGs are published to `90n9/quest-bits-releases`.
 
-- `.github/workflows/build.yml` compiles both binaries on `macos-latest` for every PR and push to main. It must never use secrets or `pull_request_target` (the repo is public; fork PRs need approval). Local builds can pass where CI fails (different Swift version, slower runner) — wait for this check before tagging.
-- Push a tag to release: `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml` builds a DMG on macOS and creates a GitHub release on the public repo (via the `RELEASES_REPO_TOKEN` PAT secret).
+- `.github/workflows/build.yml` compiles both binaries on `macos-latest` for every PR and push to main. It must never use secrets or `pull_request_target` (the repo is public; fork PRs need approval). Local builds can pass where CI fails (different Swift version, slower runner) — wait for this check before merging.
+- **One PR = one release.** A PR that touches `Sources/`, `Scripts/`, `Resources/` or `Docs/RELEASES_README.md` must add a new `## [X.Y.Z] - YYYY-MM-DD` section at the top of `CHANGELOG.md` (plain X.Y.Z, newer than every released version); the `version` check in `build.yml` fails otherwise. Docs/CI-only PRs need no version.
+- **Merging to main releases.** `.github/workflows/release.yml` reads the top `## [X.Y.Z]` of `CHANGELOG.md`; if the public `appcast.xml` doesn't list it yet, it builds the DMG, publishes the release (via the `RELEASES_REPO_TOKEN` PAT secret), updates the appcast, then pushes tag `vX.Y.Z` to this repo. Already released → the run skips, but fails if the push changed the app (that code would ship to no one). Every step is safe to re-run. Don't tag by hand after a merge. Pushing a `v*` tag by hand still works (e.g. to re-release a commit whose run failed).
 - **Auto-update (Sparkle):** CI signs the DMG with the `SPARKLE_ED_PRIVATE_KEY` secret and prepends an item to `appcast.xml` in the public releases repo (the app's `SUFeedURL` points at that file's raw main URL). The matching public key is baked into Info.plist by `build-app.sh`. Rotating the key breaks updates for already-shipped builds.
-- **Release notes come from `CHANGELOG.md`** — the workflow extracts that tag's `## [X.Y.Z]` block. Add an entry (under `## [Unreleased]` or a new `## [X.Y.Z]`) **before** tagging.
+- **Release notes come from `CHANGELOG.md`** — the workflow extracts that version's `## [X.Y.Z]` block, so write it in the PR, not after the merge.
 - Git remote uses the SSH host alias **`github.com-90n9`** (`git@github.com-90n9:90n9/quest-bits.git`), not plain `github.com` — the local `gh` CLI is authed to a different account: it can read this public repo but can't push, open or merge PRs.
 - Builds are **ad-hoc code-signed** (no Apple Developer cert). Shared builds need a one-time Gatekeeper allow: `xattr -dr com.apple.quarantine /Applications/QuestBits.app`.

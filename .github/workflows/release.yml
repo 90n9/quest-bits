@@ -5,8 +5,19 @@
 # ad-hoc code-signed — see Scripts/build-app.sh. No Apple notarization, so the
 # README on the public repo documents the one-time Gatekeeper allow command.
 #
-# Trigger: push a tag like `v1.2.0`. The version CI stamps into the app bundle
-# is taken from the tag (the `v` is stripped).
+# Triggers:
+#   - push to main (a merged PR): the version is the top `## [X.Y.Z]` heading of
+#     CHANGELOG.md. A version is released once the public appcast.xml lists it
+#     (that is what users' Sparkle reads). Not released yet → the app is built
+#     and published, then tag `vX.Y.Z` is pushed to this repo at the merged
+#     commit. A tag pushed with GITHUB_TOKEN starts no workflow, so this run
+#     does not trigger itself again through the tag trigger below. Already
+#     released → the run skips, unless the push changed the app: then it fails,
+#     because that code would ship to no one (add a new version).
+#   - push a tag like `v1.2.0` by hand: the version is the tag (the `v` is
+#     stripped). Skipped if that version is already released.
+# Every step is safe to re-run: a release that already exists gets its DMG
+# replaced, and appcast.xml never gets a second item for the same version.
 #
 # Required repo secrets (Settings → Secrets and variables → Actions):
 #   RELEASES_REPO_TOKEN     fine-grained PAT with contents:write on
@@ -19,6 +30,7 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
 
@@ -28,9 +40,93 @@ permissions:
 env:
   PUBLIC_REPO: 90n9/quest-bits-releases
 
+# One run per ref at a time; a running release is never cancelled. GitHub keeps
+# one waiting run per group, so after quick merges to main only the newest
+# waits: it releases the top CHANGELOG version, which contains the earlier
+# merges. Hand-pushed tags have their own groups, so main never cancels them.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # finish an earlier release whose tag push failed
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      skip: ${{ steps.ver.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags and the pushed range, for the checks below
+
+      - name: Resolve version and check what is already released
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(sed -nE 's/^## \[([^]]+)\].*/\1/p' CHANGELOG.md | grep -vx 'Unreleased' | head -n1 || true)
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=CHANGELOG.md::Release version must be X.Y.Z, got '${VERSION}'."
+            exit 1
+          fi
+          TAG="v${VERSION}"
+
+          # Released = the public appcast lists it. A 404 (no appcast yet) is
+          # "not released"; any other API error fails rather than guessing.
+          CODE=$(curl -sS -o "$RUNNER_TEMP/appcast.xml" -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${PUBLIC_REPO}/contents/appcast.xml")
+          case "$CODE" in
+            200) grep -qF "<sparkle:version>${VERSION}</sparkle:version>" "$RUNNER_TEMP/appcast.xml" && DONE=true || DONE=false ;;
+            404) DONE=false ;;
+            *) echo "::error::Reading ${PUBLIC_REPO}/appcast.xml failed (HTTP ${CODE})."; exit 1 ;;
+          esac
+
+          SKIP=false
+          if [[ "$DONE" == true ]]; then
+            SKIP=true
+            echo "${TAG} is already released on ${PUBLIC_REPO}."
+            if [[ "$GITHUB_REF_TYPE" == "branch" ]]; then
+              TAG_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}" | cut -f1)
+              CHANGED=""
+              if [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+                CHANGED=$(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+              fi
+              if [[ -z "$TAG_SHA" ]]; then
+                # Released but untagged: an earlier run's last step failed.
+                git tag "$TAG" "$GITHUB_SHA"
+                git push origin "$TAG"
+                echo "Pushed the missing tag ${TAG}."
+              elif [[ "$TAG_SHA" != "$GITHUB_SHA" ]] && grep -qE '^(Sources|Scripts|Resources)/|^Docs/RELEASES_README\.md$' <<<"$CHANGED"; then
+                echo "::error file=CHANGELOG.md::This push changes the app but ${TAG} was already released from another commit. Add a new ## [X.Y.Z] section."
+                exit 1
+              fi
+            fi
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "skip=$SKIP"
+          } >> "$GITHUB_OUTPUT"
+
   release:
+    needs: version
+    if: needs.version.outputs.skip != 'true'
     runs-on: macos-latest
+    permissions:
+      contents: write   # push the vX.Y.Z tag to this repo after a main release
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,14 +136,8 @@ jobs:
           path: vendor/Sparkle
           key: sparkle-2.6.4
 
-      - name: Build app bundle (version from tag)
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          # Strip the leading "v" from the tag for the bundle version string.
-          export VERSION="${VERSION#v}"
-          bash Scripts/build-app.sh
+      - name: Build app bundle (VERSION is stamped into the bundle)
+        run: bash Scripts/build-app.sh
 
       - name: Package DMG
         run: bash Scripts/make-dmg.sh
@@ -56,7 +146,6 @@ jobs:
         id: stage
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist-release
           cp build/QuestBits.dmg "dist-release/QuestBits_${VERSION}.dmg"
 
@@ -93,7 +182,6 @@ jobs:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
           DMG_PATH="dist-release/QuestBits_${VERSION}.dmg"
 
           KEY_FILE="$(mktemp -t sparkle-key)"
@@ -124,20 +212,25 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$PUBLIC_REPO" \
-            --title "QuestBits ${{ steps.stage.outputs.version }}" \
-            --notes-file dist-release/notes.md \
-            "dist-release/QuestBits_${{ steps.stage.outputs.version }}.dmg"
+          DMG="dist-release/QuestBits_${VERSION}.dmg"
+          # A re-run after a later step failed: the release exists, so replace
+          # its DMG with this build (the appcast below signs this one).
+          if gh release view "$TAG" --repo "$PUBLIC_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" --repo "$PUBLIC_REPO" --clobber
+          else
+            gh release create "$TAG" \
+              --repo "$PUBLIC_REPO" \
+              --title "QuestBits ${VERSION}" \
+              --notes-file dist-release/notes.md \
+              "$DMG"
+          fi
 
       - name: Update appcast.xml in public releases repo
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          export VERSION
-          export DMG_URL="https://github.com/${PUBLIC_REPO}/releases/download/${GITHUB_REF_NAME}/QuestBits_${VERSION}.dmg"
+          export DMG_URL="https://github.com/${PUBLIC_REPO}/releases/download/${TAG}/QuestBits_${VERSION}.dmg"
 
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${PUBLIC_REPO}.git" public-repo
 
@@ -200,6 +293,10 @@ jobs:
               f"{{{SPARKLE_NS}}}shortVersionString": VERSION,
           })
 
+          # A re-run replaces this version's item instead of adding a second one.
+          for old in channel.findall("item"):
+              if old.findtext(f"{{{SPARKLE_NS}}}version") == VERSION:
+                  channel.remove(old)
           # Newest first — Sparkle reads top-down.
           channel.insert(0, item)
           ET.indent(tree, space="    ")
@@ -216,5 +313,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add appcast.xml README.md
-          git commit -m "appcast: QuestBits ${VERSION}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "appcast.xml and README.md are already up to date."
+          else
+            git commit -m "appcast: QuestBits ${VERSION}"
+            git push origin HEAD:main
+          fi
+
+      - name: Tag the released commit in this repo
+        if: github.ref_type == 'branch'
+        run: |
+          set -euo pipefail
+          # Last, so a failed publish leaves no tag. (If only this step fails, the
+          # next main run's version job pushes the tag.)
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} already exists in this repo; leaving it."
+          else
+            git tag "$TAG" "$GITHUB_SHA"
+            git push origin "$TAG"
+          fi
