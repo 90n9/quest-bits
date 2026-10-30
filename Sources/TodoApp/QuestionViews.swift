@@ -31,9 +31,11 @@ extension QuestionListView {
     /// the user stopped it): what to paste there so it picks the answers up.
     var resumeCommands: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // No fixedSize: the split view measures this column at tiny widths, and a text
+            // fixed to its full height there would stretch the whole window's content.
             Text("An agent waiting on your answers carries on by itself. If its session stopped waiting, paste one of these there:")
                 .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(3)
             CommandRow(command: AgentCommand.resume, note: "pick up answers now")
             CommandRow(command: AgentCommand.resumeLoop, note: "check again every 20 minutes")
         }
@@ -114,6 +116,8 @@ struct QuestionCard: View {
             }
             .padding(Theme.Spacing.lg)
             .frame(maxWidth: 640, alignment: .leading)
+            // Fill the column, so the parchment does too (not just under the card).
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .qbParchment()
         .background(WindowReader(window: $cardWindow))

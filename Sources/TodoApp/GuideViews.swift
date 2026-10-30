@@ -48,7 +48,9 @@ struct CommandRow: View {
 /// Edit an agent guide: the user's guide for every project (`project` nil) or one
 /// project's. get_guide gives agents QuestBits' built-in guide, then the user's, then the
 /// project's. Saved as you type; History lists every version (the user's and agents') and
-/// restores one. The guide is read when the sheet opens.
+/// restores one. Each save names the version it was edited from: if an agent saved in
+/// between, the sheet shows the agent's version instead of overwriting it. After any
+/// other failed save it stops saving and says so, rather than failing on every keystroke.
 struct GuideSheet: View {
     @EnvironmentObject var model: AppModel
     let project: Project?
@@ -58,6 +60,7 @@ struct GuideSheet: View {
     @State private var loaded = false
     @State private var showHistory = false
     @State private var showBuiltIn = false
+    @State private var saveError: String?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -74,7 +77,9 @@ struct GuideSheet: View {
                  : "How agents should work on this project's tasks, e.g. what to check before asking and what \"done\" means. They read it with get_guide, after your guide for all projects.")
                 .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
                 .fixedSize(horizontal: false, vertical: true)
-            if let latest {
+            if let saveError {
+                Text(saveError).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+            } else if let latest {
                 Text(Self.changedLabel(latest)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
             ScrollView {
@@ -88,12 +93,10 @@ struct GuideSheet: View {
             .frame(maxHeight: .infinity)
             DisclosureGroup("QuestBits' built-in rules (\(AgentGuide.version))", isExpanded: $showBuiltIn) {
                 ScrollView {
-                    Text(AgentGuide.builtIn)
-                        .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.slate)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    GuideMarkdownView(markdown: AgentGuide.builtIn)
+                        .padding(.vertical, 4)
                 }
-                .frame(height: 160)
+                .frame(height: 220)
             }
             .font(Theme.Fonts.caption)
             HStack {
@@ -117,17 +120,24 @@ struct GuideSheet: View {
         }
     }
 
-    private func save(_ md: String) {
-        guard loaded, let v = model.saveGuide(projectId: project?.id, markdown: md) else { return }
-        latest = v
+    private func save(_ md: String, reason: String? = nil) {
+        guard loaded, saveError == nil else { return }
+        do {
+            latest = try model.saveGuide(projectId: project?.id, markdown: md, basedOn: latest?.id, reason: reason)
+            if reason != nil, let latest { markdown = latest.markdown }
+        } catch let conflict as GuideConflict {
+            // An agent saved first: show its version (the edit that hit it is not saved).
+            latest = conflict.current
+            markdown = conflict.current.markdown
+            model.flashToast("An agent changed this guide; showing its version")
+        } catch {
+            saveError = "Couldn't save the guide: \(error). Close and open it again."
+        }
     }
 
     /// Save an earlier version's text as a new version, and show it.
     private func restore(_ v: GuideVersion) {
-        guard let saved = model.saveGuide(projectId: project?.id, markdown: v.markdown,
-                                          reason: "Restored version \(v.id)") else { return }
-        latest = saved
-        markdown = saved.markdown
+        save(v.markdown, reason: "Restored version \(v.id)")
     }
 
     static func changedLabel(_ v: GuideVersion) -> String {
@@ -192,5 +202,53 @@ struct GuideHistoryView: View {
                 }
         }
         .padding(.vertical, 3)
+    }
+}
+
+/// Read-only rendering of the guide markdown QuestBits writes itself (AgentGuide.builtIn):
+/// `## ` headings, `- ` bullets and paragraphs, with inline `code` and **bold**.
+struct GuideMarkdownView: View {
+    let markdown: String
+
+    private enum Block: Hashable {
+        case heading(String), bullet(String), paragraph(String)
+    }
+
+    private var blocks: [Block] {
+        markdown.split(separator: "\n", omittingEmptySubsequences: true).map { raw in
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#") { return .heading(line.drop { $0 == "#" }.trimmingCharacters(in: .whitespaces)) }
+            if line.hasPrefix("- ") { return .bullet(String(line.dropFirst(2))) }
+            return .paragraph(line)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { i, block in
+                switch block {
+                case .heading(let t):
+                    Text(t.uppercased())
+                        .font(Theme.Fonts.microUppercase).tracking(0.5)
+                        .foregroundStyle(Theme.Colors.steel)
+                        .padding(.top, i == 0 ? 0 : 8)
+                case .bullet(let t):
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("•").foregroundStyle(Theme.Colors.brandYellowDeep)
+                        inline(t)
+                    }
+                case .paragraph(let t):
+                    inline(t)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
+    }
+
+    private func inline(_ s: String) -> some View {
+        Text((try? AttributedString(markdown: s)) ?? AttributedString(s))
+            .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }

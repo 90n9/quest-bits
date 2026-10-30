@@ -302,6 +302,12 @@ public struct GuideVersion: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Store.saveGuide refused a save made from an older version: `current` came first.
+public struct GuideConflict: Error, CustomStringConvertible {
+    public let current: GuideVersion
+    public var description: String { "the guide changed (version \(current.id)) since it was opened" }
+}
+
 /// A timestamped entry in a task's log. Notes are inserted, never rewritten by
 /// another writer, so concurrent writers never overwrite each other (unlike appending
 /// to `detail`). The one exception: the user may edit their own note in the app, and

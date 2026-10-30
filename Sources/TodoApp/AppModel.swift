@@ -452,17 +452,13 @@ final class AppModel: ObservableObject {
         (try? store.guideHistory(projectId: projectId, limit: 50)) ?? []
     }
 
-    /// Save the user's edit of a guide. Edits within 10 minutes of the user's last save
-    /// stay one version (the editor saves as you type). Toasts on failure.
+    /// Save the user's edit of a guide, made from version `basedOn` (nil: the scope had
+    /// none). Edits within 10 minutes of the user's last save stay one version (the editor
+    /// saves as you type). Throws GuideConflict when another save (an agent's) came first.
     @discardableResult
-    func saveGuide(projectId: Int64?, markdown: String, reason: String? = nil) -> GuideVersion? {
-        do {
-            return try store.saveGuide(projectId: projectId, markdown: markdown, author: .user, reason: reason,
-                                       mergeWindow: reason == nil ? 600 : nil)
-        } catch {
-            flashToast("Couldn't save the guide: \(error)")
-            return nil
-        }
+    func saveGuide(projectId: Int64?, markdown: String, basedOn: Int64?, reason: String? = nil) throws -> GuideVersion {
+        try store.saveGuide(projectId: projectId, markdown: markdown, author: .user, reason: reason,
+                            mergeWindow: reason == nil ? 600 : nil, basedOn: .some(basedOn))
     }
 
     /// Archive or unarchive a project. It stays selected (an archived project is still

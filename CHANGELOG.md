@@ -46,6 +46,11 @@ _Nothing yet._
   question or routine work in another repo no longer brings in the ask loop.
   The full rules moved to `get_guide`.
 
+### Fixed
+
+- The Questions page no longer shows white strips on either side of the
+  question card.
+
 ## [1.4.1] - 2026-10-30
 
 ### Changed

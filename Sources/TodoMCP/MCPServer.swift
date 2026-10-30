@@ -427,9 +427,11 @@ final class MCPServer: @unchecked Sendable {
             } else {
                 recurArg = .none
             }
-            // A subtask must not recur — reject a non-nil recurrence on a subtask.
+            // A subtask must not recur — reject a non-nil recurrence on a task that is a
+            // subtask after this update (a parent_code null in it makes it top-level).
+            let parent = try parentArg(args)
             if let rec = args["recurrence"] as? String, !rec.isEmpty,
-               try store.getTask(id: id).parentId != nil {
+               try parent ?? store.getTask(id: id).parentId != nil {
                 throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
             }
             let status = try statusArg(args)
@@ -447,7 +449,7 @@ final class MCPServer: @unchecked Sendable {
                 estimateSeconds: parseMinutes(args["estimate_minutes"]).map { $0 * 60 },
                 waitingOn: try parseWaitingOn(args["waiting_on"]),
                 waitingReason: try waitingReasonArg(args),
-                parentId: try parentArg(args),
+                parentId: parent,
                 note: note
             )
             return try jsonString(taskDict(store.getTask(id: id)))
@@ -590,7 +592,9 @@ final class MCPServer: @unchecked Sendable {
 
         case "update_guide":
             let pid = try guideScopeArg(args)
-            let saved = try store.saveGuide(projectId: pid, markdown: try requireString(args, "markdown"), author: .agent,
+            // "" is a valid guide: it clears it (requireString would refuse it).
+            guard let markdown = args["markdown"] as? String else { throw MCPError.missingArg("markdown") }
+            let saved = try store.saveGuide(projectId: pid, markdown: markdown, author: .agent,
                                             sessionId: try sessionArg(args), reason: args["reason"] as? String)
             return try jsonString(["version": saved.id, "scope": try scopeName(pid), "ts": iso(saved.timestamp)])
 
@@ -800,11 +804,6 @@ final class MCPServer: @unchecked Sendable {
         return Priority(rawValue: s)
     }
 
-    /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).
-    /// Like `resolveTaskId`, an unknown code (or an id that is not a number) is an error
-    /// naming it, never skipped, so the bulk tools stay all or nothing. An unknown numeric
-    /// id is left to the store, which reports it inside the batch. A task named twice (by
-    /// id and by code, or repeated) is kept once, in first-seen order.
     // MARK: - Guides
 
     /// get_guide's markdown: the built-in guide, the user's guide for every project, and
@@ -828,7 +827,7 @@ final class MCPServer: @unchecked Sendable {
         if given(args, "project_id", "project_code") {
             return try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
         }
-        if let code = args["code"] as? String, args["id"] == nil,
+        if let code = args["code"] as? String, !given(args, "id"),
            store.taskId(forCode: code) == nil, let pid = store.projectId(forCode: code) {
             return pid
         }
@@ -848,10 +847,8 @@ final class MCPServer: @unchecked Sendable {
 
     private func scopeName(_ projectId: Int64?) throws -> String {
         guard let projectId else { return "global" }
-        guard let p = try store.listProjects().first(where: { $0.id == projectId }) else {
-            throw StoreError.notFound("project \(projectId)")
-        }
-        return p.code
+        guard let code = store.projectCode(id: projectId) else { throw StoreError.notFound("project \(projectId)") }
+        return code
     }
 
     private func guideVersionDict(_ v: GuideVersion) -> [String: Any] {
@@ -870,6 +867,11 @@ final class MCPServer: @unchecked Sendable {
         return .some(try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code"))
     }
 
+    /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).
+    /// Like `resolveTaskId`, an unknown code (or an id that is not a number) is an error
+    /// naming it, never skipped, so the bulk tools stay all or nothing. An unknown numeric
+    /// id is left to the store, which reports it inside the batch. A task named twice (by
+    /// id and by code, or repeated) is kept once, in first-seen order.
     private func resolveTaskIds(_ args: [String: Any]) throws -> [Int64] {
         var ids: [Int64] = []
         if let arr = args["ids"] as? [Any] {

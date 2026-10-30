@@ -720,6 +720,12 @@ public final class Store: @unchecked Sendable {
     }
 
     /// Resolve a project id from its code (case-insensitive). Locks internally.
+    /// A project's code, or nil when there is no such project.
+    public func projectCode(id: Int64) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return queryString("SELECT code FROM projects WHERE id=?;", [.int(id)])
+    }
+
     public func projectId(forCode code: String) -> Int64? {
         lock.lock(); defer { lock.unlock() }
         return queryInt("SELECT id FROM projects WHERE code=? COLLATE NOCASE;", [.text(code)])
@@ -783,12 +789,7 @@ public final class Store: @unchecked Sendable {
         // moveTask's cascade and the recurrence subtask-clone only walk direct children,
         // so a grandchild would silently orphan on those paths. Internal callers that
         // already know the parent is top-level pass enforceNesting:false to skip the lookup.
-        if enforceNesting, let parentId {
-            let parentOfParent = queryString("SELECT parent_id FROM tasks WHERE id=?;", [.int(parentId)])
-            if parentOfParent != nil {
-                throw StoreError.step("cannot nest a subtask under another subtask (one level of nesting only)")
-            }
-        }
+        if enforceNesting, let parentId { try requireTopLevelParentUnlocked(parentId) }
         // A subtask must not recur: on completion a recurring task spawns a fresh
         // top-level occurrence, so a recurring subtask would leak a detached duplicate.
         // Force recurrence to nil whenever this task has a parent.
@@ -1236,7 +1237,9 @@ public final class Store: @unchecked Sendable {
         if let recurrence {
             // Ignore a non-nil recurrence on a subtask (subtasks must not recur —
             // it would spawn a detached top-level dupe). Clearing (nil) is allowed.
-            if !(old.parentId != nil && recurrence != nil) {
+            // The parent is the one this update leaves the task with.
+            let parentAfter = newParent ?? old.parentId
+            if !(parentAfter != nil && recurrence != nil) {
                 sets.append("recurrence=?"); binds.append(recurrence.map(SQLValue.text) ?? .null)
             }
         }
@@ -1318,16 +1321,28 @@ public final class Store: @unchecked Sendable {
         return statusEventId
     }
 
+    /// The one-level-nesting rule every way of giving a task a parent shares (create, the
+    /// recurrence spawn, update): the parent exists and is itself top-level. moveTask's
+    /// cascade and the recurrence subtask-clone only walk direct children, so a grandchild
+    /// would silently orphan on those paths.
+    private func requireTopLevelParentUnlocked(_ parentId: Int64) throws {
+        guard let row = queryString("SELECT code || '|' || COALESCE(parent_id, '') FROM tasks WHERE id=?;", [.int(parentId)]) else {
+            throw StoreError.notFound("task \(parentId)")
+        }
+        let parts = row.split(separator: "|", omittingEmptySubsequences: false)
+        if parts.count > 1, !parts[1].isEmpty {
+            throw StoreError.invalid("\(parts[0]) is a subtask; the parent must be a top-level task (one level of nesting)")
+        }
+    }
+
     /// Can `task` become a subtask of `parentId`? One level of nesting: the parent is a
     /// top-level task and the task has no subtasks of its own. Same project (move_task
     /// first), never itself, and the task must not recur: a recurring subtask would spawn
     /// a detached top-level copy. `recurrence` is the same update's recurrence write.
     private func checkNewParentUnlocked(_ task: TodoTask, _ parentId: Int64, recurrence: String??) throws {
         guard parentId != task.id else { throw StoreError.invalid("a task cannot be its own parent") }
+        try requireTopLevelParentUnlocked(parentId)
         guard let parent = getTaskUnlocked(parentId) else { throw StoreError.notFound("task \(parentId)") }
-        guard parent.parentId == nil else {
-            throw StoreError.invalid("\(parent.code) is a subtask; the parent must be a top-level task (one level of nesting)")
-        }
         guard parent.projectId == task.projectId else {
             throw StoreError.invalid("\(parent.code) is in another project; move the task there first (move_task)")
         }
@@ -1721,26 +1736,32 @@ public final class Store: @unchecked Sendable {
     /// The current guide of a scope (`projectId` nil = the guide for every project): its
     /// newest version, or nil when none was ever saved.
     public func guide(projectId: Int64?) throws -> GuideVersion? {
-        lock.lock(); defer { lock.unlock() }
-        return try readGuides("SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT 1;",
-                              [projectId.map(SQLValue.int) ?? .null]).first
+        try guideHistory(projectId: projectId, limit: 1).first
     }
 
     /// A scope's versions, newest first (the first is the current guide).
     public func guideHistory(projectId: Int64?, limit: Int = 20) throws -> [GuideVersion] {
         lock.lock(); defer { lock.unlock() }
-        return try readGuides("SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT ?;",
-                              [projectId.map(SQLValue.int) ?? .null, .int(Int64(max(0, limit)))])
+        return try guideVersionsUnlocked(projectId: projectId, limit: limit)
+    }
+
+    private func guideVersionsUnlocked(projectId: Int64?, limit: Int) throws -> [GuideVersion] {
+        try readGuides("SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT ?;",
+                       [projectId.map(SQLValue.int) ?? .null, .int(Int64(max(0, limit)))])
     }
 
     /// Save a scope's guide as a new version; an unchanged text saves nothing and returns
     /// the current version. `mergeWindow` (the app's autosave): when the current version
-    /// is the user's own and was saved less than that long ago, it is updated in place, so
-    /// one sitting of typing is one version. Agent saves are always a new version. Read and
-    /// written in one BEGIN IMMEDIATE, so a concurrent save is never lost or merged into.
+    /// is the user's own, has no reason (a restore keeps its text) and was saved less than
+    /// that long ago, it is updated in place, so one sitting of typing is one version.
+    /// Agent saves are always a new version. `basedOn` (the app's editor): the version the
+    /// text was edited from, nil for a scope with none; when another save came first, the
+    /// save is refused with `GuideConflict`, so an open editor never overwrites it. Read
+    /// and written in one BEGIN IMMEDIATE.
     @discardableResult
     public func saveGuide(projectId: Int64?, markdown: String, author: NoteAuthor, sessionId: String? = nil,
-                          reason: String? = nil, mergeWindow: TimeInterval? = nil) throws -> GuideVersion {
+                          reason: String? = nil, mergeWindow: TimeInterval? = nil,
+                          basedOn: Int64?? = .none) throws -> GuideVersion {
         let text = markdown.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
         let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
         let why = reason.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
@@ -1751,13 +1772,13 @@ public final class Store: @unchecked Sendable {
             if let projectId, queryInt("SELECT id FROM projects WHERE id=?;", [.int(projectId)]) == nil {
                 throw StoreError.notFound("project \(projectId)")
             }
-            let current = try readGuides(
-                "SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT 1;", [scope]).first
+            let current = try guideVersionsUnlocked(projectId: projectId, limit: 1).first
+            if let basedOn, current?.id != basedOn, let current { throw GuideConflict(current: current) }
             let now = Date()
             var saved: GuideVersion
             if let current, current.markdown == text {
                 saved = current
-            } else if var current, let mergeWindow, author == .user, current.author == .user,
+            } else if var current, let mergeWindow, author == .user, current.author == .user, current.reason == nil,
                       now.timeIntervalSince(current.timestamp) < mergeWindow {
                 try runWrite("UPDATE guide_versions SET markdown=?, ts=? WHERE id=?;",
                              [.text(text), .double(now.timeIntervalSince1970), .int(current.id)])
