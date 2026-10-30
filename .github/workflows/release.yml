@@ -234,77 +234,10 @@ jobs:
 
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${PUBLIC_REPO}.git" public-repo
 
-          # Appcast description = this version's CHANGELOG section (same awk as
-          # the release-notes extractor above, without the download footer).
-          awk -v ver="$VERSION" '
-            $0 ~ "^## \\[" ver "\\]" { grab=1 }
-            grab && $0 ~ "^## \\[" && $0 !~ "\\[" ver "\\]" { exit }
-            grab { print }
-          ' CHANGELOG.md > appcast-notes.md || true
-
-          python3 - <<'PYEOF'
-          import os
-          from email.utils import formatdate
-          from xml.etree import ElementTree as ET
-
-          VERSION = os.environ["VERSION"]
-          DMG_URL = os.environ["DMG_URL"]
-          DMG_SIZE = os.environ["ENCLOSURE_LENGTH"]
-          ED_SIG = os.environ["ED_SIGNATURE"]
-
-          SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-          ET.register_namespace("sparkle", SPARKLE_NS)
-
-          try:
-              description = open("appcast-notes.md").read().strip()
-          except OSError:
-              description = ""
-          if not description:
-              description = f"QuestBits {VERSION}"
-
-          path = "public-repo/appcast.xml"
-          if os.path.exists(path):
-              tree = ET.parse(path)
-              rss = tree.getroot()
-          else:
-              rss = ET.Element("rss", {"version": "2.0"})
-              ET.SubElement(rss, "channel")
-              tree = ET.ElementTree(rss)
-
-          channel = rss.find("channel")
-          if channel is None:
-              raise SystemExit("appcast.xml missing <channel>")
-
-          item = ET.Element("item")
-          ET.SubElement(item, "title").text = f"QuestBits {VERSION}"
-          ET.SubElement(item, f"{{{SPARKLE_NS}}}version").text = VERSION
-          ET.SubElement(item, f"{{{SPARKLE_NS}}}shortVersionString").text = VERSION
-          ET.SubElement(item, "pubDate").text = formatdate(localtime=False, usegmt=True)
-          desc = ET.SubElement(item, "description")
-          # ElementTree has no native CDATA; mark for post-processing.
-          desc.text = f"__CDATA_OPEN__{description}__CDATA_CLOSE__"
-          ET.SubElement(item, f"{{{SPARKLE_NS}}}minimumSystemVersion").text = "14.0"
-          ET.SubElement(item, "enclosure", {
-              "url": DMG_URL,
-              "length": DMG_SIZE,
-              "type": "application/octet-stream",
-              f"{{{SPARKLE_NS}}}edSignature": ED_SIG,
-              f"{{{SPARKLE_NS}}}version": VERSION,
-              f"{{{SPARKLE_NS}}}shortVersionString": VERSION,
-          })
-
-          # A re-run replaces this version's item instead of adding a second one.
-          for old in channel.findall("item"):
-              if old.findtext(f"{{{SPARKLE_NS}}}version") == VERSION:
-                  channel.remove(old)
-          # Newest first — Sparkle reads top-down.
-          channel.insert(0, item)
-          ET.indent(tree, space="    ")
-          xml = ET.tostring(rss, encoding="unicode", xml_declaration=True)
-          xml = xml.replace("__CDATA_OPEN__", "<![CDATA[").replace("__CDATA_CLOSE__", "]]>")
-          with open(path, "w") as f:
-              f.write(xml + "\n")
-          PYEOF
+          # Add this version's item and rebuild every item's notes from CHANGELOG.md as
+          # HTML (Sparkle shows the description as HTML, not markdown).
+          python3 .github/scripts/release_notes.py appcast CHANGELOG.md public-repo/appcast.xml \
+            --add "$VERSION" "$DMG_URL" "$ENCLOSURE_LENGTH" "$ED_SIGNATURE"
 
           # Keep the public repo's README in sync with the canonical copy here.
           cp Docs/RELEASES_README.md public-repo/README.md
