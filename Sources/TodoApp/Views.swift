@@ -77,6 +77,35 @@ struct ToastView: View {
     }
 }
 
+/// The sidebar footer's update entry: "Update to vX" once Sparkle found a newer version
+/// (kept after the banner is closed), else a "Check for updates" link. Both go through the
+/// same updater as the menu's Check for Updates….
+struct SidebarUpdateLink: View {
+    @ObservedObject private var notifier = UpdateNotifier.shared
+
+    var body: some View {
+        if let version = notifier.availableVersion {
+            // A small pill, about the size of the version number.
+            Button { notifier.onInstallTapped?() } label: {
+                Label("Update to v\(version)", systemImage: "arrow.down.circle.fill")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Theme.Colors.onPrimary)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(Theme.Colors.primary, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .help("Install QuestBits \(version)")
+        } else {
+            // Same size as the version number under it.
+            Button { notifier.requestCheck?() } label: {
+                Text("Check for updates").font(.caption2).foregroundStyle(Theme.Colors.brandBlue)
+            }
+            .buttonStyle(.plain)
+            .help("Look for a newer QuestBits now")
+        }
+    }
+}
+
 /// `promo-banner`: black strip above the content when Sparkle finds a newer
 /// version. Yellow "NEW" chip (`badge-promo`), on-dark copy, white pill
 /// "Update Now" (`button-on-dark`) that re-opens Sparkle's install dialog.
@@ -84,7 +113,7 @@ struct UpdateBanner: View {
     @ObservedObject private var notifier = UpdateNotifier.shared
 
     var body: some View {
-        if let version = notifier.availableVersion {
+        if let version = notifier.availableVersion, !notifier.bannerDismissed {
             HStack(spacing: Theme.Spacing.sm) {
                 Text("NEW")
                     .qbBadge(background: Theme.Colors.brandYellow, foreground: Theme.Colors.primary)
@@ -216,18 +245,21 @@ struct ProjectSidebar: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 6) {
-                Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
-                    .font(.caption2)
-                    .foregroundStyle(Theme.Colors.stone)
-                #if DEV_BUILD
-                Text("DEV")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(.orange))
-                #endif
+            VStack(spacing: 4) {
+                SidebarUpdateLink()
+                HStack(spacing: 6) {
+                    Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.Colors.stone)
+                    #if DEV_BUILD
+                    Text("DEV")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(.orange))
+                    #endif
+                }
             }
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.vertical, 6)
@@ -964,16 +996,15 @@ struct TaskRow: View {
                 .buttonStyle(.plain)
                 .help("Click to cycle status")
 
+                // Code and chips on their own line, each at its natural size (wrapping onto
+                // another line when the column is too narrow), and the title below at the full
+                // width: it wraps between words instead of being squeezed next to the chips.
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
+                    FlowLayout(spacing: 6, lineSpacing: 3) {
                         if task.priority != .none {
                             Image(systemName: "flag.fill").font(.caption2).foregroundStyle(qbPriorityColor(task.priority))
                         }
                         CodeBadge(code: task.code)
-                        Text(task.title)
-                            .font(Theme.Fonts.bodySm)
-                            .strikethrough(task.status.isClosed)
-                            .foregroundStyle(qbTitleColor(task.status))
                         if countedSubtasks > 0 {
                             Text("\(doneCount)/\(countedSubtasks)")
                                 .font(Theme.Fonts.micro.monospacedDigit())
@@ -992,6 +1023,11 @@ struct TaskRow: View {
                         }
                         WaitingChip(task: task)
                     }
+                    Text(task.title)
+                        .font(Theme.Fonts.bodySm)
+                        .strikethrough(task.status.isClosed)
+                        .foregroundStyle(qbTitleColor(task.status))
+                        .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 8) {
                         if task.status == .waiting, let reason = task.waitingReason, !reason.isEmpty {
                             Text(reason)
@@ -1019,8 +1055,9 @@ struct TaskRow: View {
                         ForEach(task.tags.prefix(3), id: \.self) { TagChip(text: $0) }
                     }
                 }
-                Spacer()
+                Spacer(minLength: 4)
                 Text(task.status.display).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.stone)
+                    .fixedSize()
             }
 
             // Subtasks (one level of nesting), shown only for top-level tasks in a project view.
@@ -1080,6 +1117,54 @@ struct TaskRow: View {
     }
 }
 
+/// Lays children out left to right at their natural size, starting a new line when the
+/// next one would not fit the width offered (the task row's code and chips).
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+    var lineSpacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(subviews, width: proposal.width ?? .infinity)
+        let width = rows.map(\.width).max() ?? 0
+        let height = rows.map(\.height).reduce(0, +) + lineSpacing * CGFloat(max(0, rows.count - 1))
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(subviews, width: bounds.width) {
+            var x = bounds.minX
+            for (i, size) in zip(row.indices, row.sizes) {
+                subviews[i].place(at: CGPoint(x: x, y: y + (row.height - size.height) / 2),
+                                  proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + lineSpacing
+        }
+    }
+
+    private struct Row { var indices: [Int] = []; var sizes: [CGSize] = []; var width: CGFloat = 0; var height: CGFloat = 0 }
+
+    private func arrange(_ subviews: Subviews, width: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var row = Row()
+        for (i, view) in subviews.enumerated() {
+            let size = view.sizeThatFits(.unspecified)
+            let needed = row.indices.isEmpty ? size.width : row.width + spacing + size.width
+            if !row.indices.isEmpty && needed > width {
+                rows.append(row)
+                row = Row()
+            }
+            row.width = row.indices.isEmpty ? size.width : row.width + spacing + size.width
+            row.height = max(row.height, size.height)
+            row.indices.append(i)
+            row.sizes.append(size)
+        }
+        if !row.indices.isEmpty { rows.append(row) }
+        return rows
+    }
+}
+
 /// A single subtask line: checkbox + title, indented under its parent.
 struct SubtaskRow: View {
     @EnvironmentObject var model: AppModel
@@ -1099,10 +1184,21 @@ struct SubtaskRow: View {
                 .font(Theme.Fonts.bodySm)
                 .strikethrough(sub.status.isClosed)
                 .foregroundStyle(qbTitleColor(sub.status))
+                .fixedSize(horizontal: false, vertical: true)
             Spacer()
         }
-        .padding(.leading, 26)
+        .padding(.vertical, 2)
+        .padding(.horizontal, 6)
+        .background(selected ? Theme.Colors.surfacePricingFeatured : .clear,
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.sm))
+        // Click to open the subtask in the detail column, for its Detail and notes.
+        .contentShape(Rectangle())
+        .onTapGesture { model.selectedTaskIds = [sub.id] }
+        .help("Open \(sub.code)")
+        .padding(.leading, 20)
     }
+
+    private var selected: Bool { model.selectedTaskId == sub.id }
 
     private var subtaskBox: String {
         switch sub.status {
@@ -1373,6 +1469,7 @@ struct TaskDetailView: View {
     @State private var noteKind: NoteKind = .note
     @State private var noteDraftTaskId: Int64?
     @AppStorage("qbTimelineFilter") private var timelineFilter: TimelineFilter = .all
+    @State private var detailHeight: CGFloat = 120   // the Detail editor's content height
 
     // Blocked-task guard: confirm before moving a blocked task to In Progress.
     @State private var showBlockedAlert = false
@@ -1472,7 +1569,7 @@ struct TaskDetailView: View {
                 tagsSection
                 blockedSection(task)
                 linkSection
-                detailSection
+                detailSection(task)
                 timelineSection(task)
                 estimateSection(task)
                 timingSection(task)
@@ -1613,12 +1710,16 @@ struct TaskDetailView: View {
         }
     }
 
-    private var detailSection: some View {
+    /// The Detail editor (Notion-style blocks over markdown, `MarkdownEditor`), as tall as
+    /// its content. No field frame: the text sits on the section like a page.
+    private func detailSection(_ task: TodoTask) -> some View {
         QBDetailSection("Detail") {
-            TextEditor(text: $detail)
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 120)
-                .qbField()
+            MarkdownEditor(docId: task.id, markdown: $detail, height: $detailHeight, store: model.store,
+                           onOtherDoc: { id, md in model.saveDetail(taskId: id, markdown: md) },
+                           onError: { model.flashToast($0) })
+                // A little room under short text for the "/" menu and link popups, which
+                // stay inside the view.
+                .frame(height: max(140, detailHeight + 8))
         }
     }
 

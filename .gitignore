@@ -30,3 +30,6 @@ vendor/
 assets-candidates/
 design-themes.html
 asset-candidates.html
+
+# Detail editor dependencies (npm ci in Scripts/build-app.sh)
+Editor/node_modules/

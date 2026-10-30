@@ -10,6 +10,8 @@ final class UpdateNotifier: ObservableObject {
     static let shared = UpdateNotifier()
 
     @Published var availableVersion: String?
+    /// The banner was closed for this version. The sidebar footer keeps offering the update.
+    @Published var bannerDismissed = false
 
     /// Re-presents Sparkle's install dialog for an already-found update.
     var onInstallTapped: (() -> Void)?
@@ -19,14 +21,16 @@ final class UpdateNotifier: ObservableObject {
     private init() {}
 
     func setAvailable(version: String?) {
-        if Thread.isMainThread {
-            availableVersion = version
-        } else {
-            DispatchQueue.main.async { self.availableVersion = version }
+        let apply = {
+            // A different version shows the banner again.
+            if version != self.availableVersion { self.bannerDismissed = false }
+            self.availableVersion = version
         }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }
 
+    /// Close the banner until another version is found.
     func dismiss() {
-        setAvailable(version: nil)
+        bannerDismissed = true
     }
 }
