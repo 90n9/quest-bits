@@ -68,10 +68,11 @@ Projects have a short code (`GEN`), tasks have one too (`GEN-3`). **Every MCP to
 
 ## Releases & CI
 
-Source lives in the **private** `90n9/quest-bits`; built DMGs are published to the **public** `90n9/quest-bits-releases`.
+Source lives in the **public** `90n9/quest-bits`; built DMGs are published to `90n9/quest-bits-releases`.
 
+- `.github/workflows/build.yml` compiles both binaries on `macos-latest` for every PR and push to main. It must never use secrets or `pull_request_target` (the repo is public; fork PRs need approval). Local builds can pass where CI fails (different Swift version, slower runner) — wait for this check before tagging.
 - Push a tag to release: `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml` builds a DMG on macOS and creates a GitHub release on the public repo (via the `RELEASES_REPO_TOKEN` PAT secret).
 - **Auto-update (Sparkle):** CI signs the DMG with the `SPARKLE_ED_PRIVATE_KEY` secret and prepends an item to `appcast.xml` in the public releases repo (the app's `SUFeedURL` points at that file's raw main URL). The matching public key is baked into Info.plist by `build-app.sh`. Rotating the key breaks updates for already-shipped builds.
 - **Release notes come from `CHANGELOG.md`** — the workflow extracts that tag's `## [X.Y.Z]` block. Add an entry (under `## [Unreleased]` or a new `## [X.Y.Z]`) **before** tagging.
-- Git remote uses the SSH host alias **`github.com-90n9`** (`git@github.com-90n9:90n9/quest-bits.git`), not plain `github.com` — the local `gh` CLI is authed to a different account and can't reach 90n9.
+- Git remote uses the SSH host alias **`github.com-90n9`** (`git@github.com-90n9:90n9/quest-bits.git`), not plain `github.com` — the local `gh` CLI is authed to a different account: it can read this public repo but can't push, open or merge PRs.
 - Builds are **ad-hoc code-signed** (no Apple Developer cert). Shared builds need a one-time Gatekeeper allow: `xattr -dr com.apple.quarantine /Applications/QuestBits.app`.

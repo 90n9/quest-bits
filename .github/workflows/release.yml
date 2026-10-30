@@ -1,4 +1,4 @@
-# Build QuestBits in this PRIVATE repo, publish the DMG to the PUBLIC
+# Build QuestBits in this repo, publish the DMG to the public
 # downloads repo (90n9/quest-bits-releases).
 #
 # QuestBits is a native SwiftUI app compiled with swiftc (no Xcode/SPM) and
