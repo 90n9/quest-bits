@@ -39,6 +39,8 @@ _Nothing yet._
 
 ### Added
 
+- Click a subtask to open it in the detail column, to give it its own
+  Detail and notes.
 - The sidebar footer has an **Update to vX** button when a new version is
   out, even after you close the top banner. Otherwise it has a **Check for
   updates** link.
