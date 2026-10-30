@@ -15,7 +15,10 @@ struct ContentView: View {
                 ProjectSidebar()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
             } content: {
-                if model.showQuestions {
+                if model.showArchived {
+                    ArchivedProjectsView()
+                        .navigationSplitViewColumnWidth(min: 320, ideal: 420)
+                } else if model.showQuestions {
                     QuestionListView()
                         .navigationSplitViewColumnWidth(min: 260, ideal: 320)
                 } else if model.showDashboard {
@@ -35,7 +38,9 @@ struct ContentView: View {
                         .navigationSplitViewColumnWidth(min: 280, ideal: 360)
                 }
             } detail: {
-                if model.showQuestions {
+                if model.showArchived {
+                    ContentUnavailableViewCompat(text: "Find an archived project to open or unarchive it")
+                } else if model.showQuestions {
                     QuestionDetailView()
                 } else if model.showDashboard {
                     ContentUnavailableViewCompat(text: "Your activity at a glance")
@@ -235,6 +240,13 @@ struct ProjectSidebar: View {
                     .contentShape(Rectangle())
                     .onTapGesture { showTemplates = true }
                     .help("Manage reusable task templates")
+                Label { Text("Archived") } icon: { QBIcon(name: "tabler-barrel") }
+                    .font(Theme.Fonts.bodySmMedium)
+                    .foregroundStyle(model.showArchived ? Theme.Colors.brandBlue : Theme.Colors.ink)
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.selectArchived() }
+                    .listRowBackground(sidebarRowCard(model.showArchived))
+                    .help("Find archived projects and unarchive them")
             } header: {
                 sidebarHeader("Quests")
             }
@@ -308,7 +320,7 @@ struct ProjectSidebar: View {
 
     /// True while the selected sidebar item is an archived project.
     private var selectedIsArchived: Bool {
-        guard model.smartView == nil, !model.showDashboard, !model.showQuestions,
+        guard model.smartView == nil, !model.showDashboard, !model.showQuestions, !model.showArchived,
               let sel = model.selectedProjectId else { return false }
         return model.archivedProjects.contains { $0.id == sel }
     }
@@ -347,7 +359,8 @@ struct ProjectSidebar: View {
         .opacity(p.isArchived ? 0.6 : 1)
         .tag(p.id)
         .listRowBackground(sidebarRowCard(
-            model.smartView == nil && !model.showDashboard && !model.showQuestions && model.selectedProjectId == p.id))
+            model.smartView == nil && !model.showDashboard && !model.showQuestions && !model.showArchived
+                && model.selectedProjectId == p.id))
         .help(p.detail.isEmpty ? p.name : p.detail)
         .contextMenu {
             Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
@@ -428,7 +441,7 @@ struct ArchiveProjectSheet: View {
             Text("Archive \(project.name)?").font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
             Text("\(openCount) open task\(openCount == 1 ? "" : "s") will stay open. "
                  + "Archived projects leave All Tasks, In Progress and the menu bar, "
-                 + "but you can still open them from the Archived group.")
+                 + "but you can still open them from Archived in the sidebar, and unarchive them there.")
                 .font(Theme.Fonts.bodySm)
                 .foregroundStyle(Theme.Colors.slate)
                 .fixedSize(horizontal: false, vertical: true)

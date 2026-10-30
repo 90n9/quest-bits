@@ -69,6 +69,8 @@ final class AppModel: ObservableObject {
     // the detail column answers the selected one.
     @Published var showQuestions = false
     @Published var selectedQuestionId: Int64?
+    /// Archived page: the content column lists archived projects to find and unarchive.
+    @Published var showArchived = false
     /// Open questions in projects not archived, longest waiting first; refreshed with the
     /// tasks (so with every poll), republished only when they changed.
     @Published private(set) var openQuestions: [Question] = []
@@ -83,7 +85,7 @@ final class AppModel: ObservableObject {
     /// The project page is shown (not a smart view, the dashboard or the Questions page),
     /// so its tabs are.
     var selectedProject: Project? {
-        guard smartView == nil, !showDashboard, !showQuestions, let id = selectedProjectId else { return nil }
+        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, let id = selectedProjectId else { return nil }
         return projects.first { $0.id == id }
     }
 
@@ -258,6 +260,7 @@ final class AppModel: ObservableObject {
         if id != selectedProjectId { projectTab = .tasks }
         showDashboard = false
         showQuestions = false
+        showArchived = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -268,6 +271,7 @@ final class AppModel: ObservableObject {
     func selectSmartView(_ v: SmartView) {
         showDashboard = false
         showQuestions = false
+        showArchived = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
@@ -278,6 +282,7 @@ final class AppModel: ObservableObject {
     func selectDashboard() {
         showDashboard = true
         showQuestions = false
+        showArchived = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -288,6 +293,7 @@ final class AppModel: ObservableObject {
     func selectQuestions() {
         showQuestions = true
         showDashboard = false
+        showArchived = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -308,6 +314,17 @@ final class AppModel: ObservableObject {
     func selectProjectTab(_ tab: ProjectTab) {
         projectTab = tab
         if tab == .questions { selectedQuestionId = nil; reloadQuestions() }
+    }
+
+    func selectArchived() {
+        showArchived = true
+        showQuestions = false
+        showDashboard = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        reloadTasks()
     }
 
     /// The question after `id` in the list shown (wrapping), or nil when it is the only one.

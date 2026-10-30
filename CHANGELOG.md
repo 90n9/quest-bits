@@ -17,7 +17,7 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
-## [1.5.0] - 2026-10-31
+## [1.4.3] - 2026-10-31
 
 ### Added
 
@@ -49,6 +49,10 @@ _Nothing yet._
   the existing task codes, so references to them stay valid; new tasks take
   the new code. MCP `create_project` takes `code`, and `update_project`
   takes `new_code`.
+- **Archived page.** Archived in the sidebar lists your archived projects,
+  newest first, with a search by name or code: open one, or unarchive it.
+  A project's Detail tab has Archive… (or Unarchive) too, so neither needs
+  the right-click menu.
 
 ### Fixed
 

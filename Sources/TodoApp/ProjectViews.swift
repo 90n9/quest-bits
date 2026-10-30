@@ -93,6 +93,7 @@ struct ProjectOverview: View {
     @EnvironmentObject var model: AppModel
     let project: Project
     @State private var editing = false
+    @State private var archiving = false
 
     var body: some View {
         ScrollView {
@@ -119,8 +120,17 @@ struct ProjectOverview: View {
                 }
                 Text("Created \(fmtDateTime(project.createdAt))")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
-                Button("Edit name & code…") { editing = true }
-                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                HStack(spacing: 8) {
+                    Button("Edit name & code…") { editing = true }
+                        .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                    if project.isArchived {
+                        Button("Unarchive") { model.setArchived(project.id, false) }
+                            .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                    } else {
+                        Button("Archive…") { archiving = true }
+                            .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(Theme.Spacing.lg)
@@ -131,6 +141,11 @@ struct ProjectOverview: View {
             ProjectSheet(title: "Edit Project", projectId: project.id, name: project.name, code: project.code,
                          showsDescription: false) { v in
                 model.editProject(project.id, name: v.name, detail: nil, code: v.code)
+            }
+        }
+        .sheet(isPresented: $archiving) {
+            ArchiveProjectSheet(project: project, openCount: model.projectCounts[project.id]?.open ?? 0) {
+                model.setArchived(project.id, true)
             }
         }
     }
@@ -253,5 +268,62 @@ struct GuideContextView: View {
             Text(title).font(Theme.Fonts.captionBold).foregroundStyle(Theme.Colors.ink)
             content()
         }
+    }
+}
+
+// MARK: - Archived page
+
+/// The Archived page's content column: archived projects, searchable by name or code,
+/// each with its task counts, to open (an archived project is still viewable) or unarchive.
+struct ArchivedProjectsView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var query = ""
+
+    private var shown: [Project] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        let all = model.archivedProjects.sorted { ($0.archivedAt ?? .distantPast) > ($1.archivedAt ?? .distantPast) }
+        guard !q.isEmpty else { return all }
+        return all.filter { $0.name.localizedCaseInsensitiveContains(q) || $0.code.localizedCaseInsensitiveContains(q) }
+    }
+
+    var body: some View {
+        Group {
+            if model.archivedProjects.isEmpty {
+                ContentUnavailableViewCompat(text: "No archived projects.\nArchive one from its Detail tab or the sidebar menu.")
+            } else if shown.isEmpty {
+                ContentUnavailableViewCompat(text: "No archived project matches \"\(query)\"")
+            } else {
+                List(shown) { p in row(p) }
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            TextField("Search archived projects", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .padding(10)
+                .background(alignment: .bottom) { Divider() }
+        }
+        .navigationTitle("Archived")
+        .qbParchment()
+    }
+
+    private func row(_ p: Project) -> some View {
+        let c = model.projectCounts[p.id] ?? ProjectCounts()
+        // Name and buttons on separate lines: the column can be narrow.
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                CodeBadge(code: p.code)
+                Text(p.name).font(Theme.Fonts.bodySmMedium).foregroundStyle(Theme.Colors.ink).lineLimit(2)
+            }
+            Text("\(c.open) open · \(c.done) done" + (p.archivedAt.map { " · archived \(fmtDateTime($0))" } ?? ""))
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel).lineLimit(1)
+            HStack(spacing: 8) {
+                Button("Open") { model.selectProject(p.id) }
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                Button("Unarchive") { model.setArchived(p.id, false) }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                    .fixedSize()
+            }
+        }
+        .padding(.vertical, 6)
     }
 }
