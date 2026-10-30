@@ -1354,42 +1354,7 @@ struct TaskDetailView: View {
     var body: some View {
         Group {
             if let task = currentTask {
-                sectionsScroll(task)
-                .onAppear { load(task) }
-                // Selection change or a store write (app or MCP): resync the editor.
-                .onChange(of: currentTask) { _, new in if let new { sync(new) } }
-                // Auto-save: any field change persists immediately (no Save button).
-                .onChange(of: title) { _, _ in autosave() }
-                .onChange(of: detail) { _, _ in autosave() }
-                .onChange(of: link) { _, _ in autosave() }
-                .onChange(of: status) { old, new in
-                    // Moving a blocked task to In Progress requires confirmation. Uses the
-                    // shared guard decision; keeps a local alert so the picker can revert
-                    // on cancel (the segmented control's binding is view-local state).
-                    // Only a user edit (status off the snapshot) is checked: a load or
-                    // resync never raises the alert or queries the store.
-                    if let t = currentTask, new != base?.status,
-                       model.blockedConfirmNeeded(forIds: [t.id], to: new) {
-                        statusBeforeBlock = old
-                        showBlockedAlert = true
-                    } else {
-                        autosave()
-                    }
-                }
-                .onChange(of: waitingOn) { _, _ in autosave() }
-                .onChange(of: waitingReason) { _, _ in autosave() }
-                .onChange(of: priority) { _, _ in autosave() }
-                .onChange(of: hasDue) { _, _ in autosave() }
-                .onChange(of: dueDate) { _, _ in autosave() }
-                .onChange(of: tagsText) { _, _ in autosave() }
-                .onChange(of: recurrence) { _, _ in autosave() }
-                .onChange(of: estimateMinutes) { _, _ in autosave() }
-                .alert("Task is blocked", isPresented: $showBlockedAlert) {
-                    Button("Cancel", role: .cancel) { status = statusBeforeBlock }
-                    Button("Start anyway") { autosave() }
-                } message: {
-                    Text("This task is blocked by an unfinished dependency. Move it to In Progress anyway?")
-                }
+                editor(task)
             } else {
                 ContentUnavailableViewCompat(text: model.selectedTaskIds.count >= 2
                     ? "\(model.selectedTaskIds.count) tasks selected — use the bulk bar above"
@@ -1400,6 +1365,58 @@ struct TaskDetailView: View {
         .padding(10)
         .qbQuestFrame()
         .padding(6)
+    }
+
+    // MARK: editor modifiers (split into steps — one long modifier chain stalls the
+    // type checker on slower machines, e.g. the CI runner)
+
+    private func editor(_ task: TodoTask) -> some View {
+        let content = sectionsScroll(task)
+            .onAppear { load(task) }
+            // Selection change or a store write (app or MCP): resync the editor.
+            .onChange(of: currentTask) { _, new in if let new { sync(new) } }
+        return blockedGuard(fieldAutosave(content))
+    }
+
+    /// Auto-save: any field change persists immediately (no Save button).
+    private func fieldAutosave(_ content: some View) -> some View {
+        let text = content
+            .onChange(of: title) { _, _ in autosave() }
+            .onChange(of: detail) { _, _ in autosave() }
+            .onChange(of: link) { _, _ in autosave() }
+            .onChange(of: waitingOn) { _, _ in autosave() }
+            .onChange(of: waitingReason) { _, _ in autosave() }
+        return text
+            .onChange(of: priority) { _, _ in autosave() }
+            .onChange(of: hasDue) { _, _ in autosave() }
+            .onChange(of: dueDate) { _, _ in autosave() }
+            .onChange(of: tagsText) { _, _ in autosave() }
+            .onChange(of: recurrence) { _, _ in autosave() }
+            .onChange(of: estimateMinutes) { _, _ in autosave() }
+    }
+
+    private func blockedGuard(_ content: some View) -> some View {
+        content
+            .onChange(of: status) { old, new in
+                // Moving a blocked task to In Progress requires confirmation. Uses the
+                // shared guard decision; keeps a local alert so the picker can revert
+                // on cancel (the segmented control's binding is view-local state).
+                // Only a user edit (status off the snapshot) is checked: a load or
+                // resync never raises the alert or queries the store.
+                if let t = currentTask, new != base?.status,
+                   model.blockedConfirmNeeded(forIds: [t.id], to: new) {
+                    statusBeforeBlock = old
+                    showBlockedAlert = true
+                } else {
+                    autosave()
+                }
+            }
+            .alert("Task is blocked", isPresented: $showBlockedAlert) {
+                Button("Cancel", role: .cancel) { status = statusBeforeBlock }
+                Button("Start anyway") { autosave() }
+            } message: {
+                Text("This task is blocked by an unfinished dependency. Move it to In Progress anyway?")
+            }
     }
 
     private var parsedTags: [String] {
