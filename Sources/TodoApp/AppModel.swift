@@ -185,6 +185,7 @@ final class AppModel: ObservableObject {
         templates = (try? store.listTemplates()) ?? []
         if let sel = selectedProjectId, !projects.contains(where: { $0.id == sel }) {
             selectedProjectId = (activeProjects.first ?? projects.first)?.id
+            projectTab = .tasks
         }
         reloadTasks()
         reloadStats()
@@ -305,9 +306,15 @@ final class AppModel: ObservableObject {
     /// New Task (⌘N): on another tab of a project page, back to Tasks first, where the
     /// new-task field is; it opens once the list is showing again.
     func requestNewTask() {
-        guard shownProjectTab != nil, projectTab != .tasks else { pendingNewTask = true; return }
-        projectTab = .tasks
-        DispatchQueue.main.async { self.pendingNewTask = true }
+        if shownProjectTab != nil, projectTab != .tasks {
+            projectTab = .tasks
+            DispatchQueue.main.async { self.pendingNewTask = true }
+            return
+        }
+        // Only where a task list shows (a project or a smart view): on the Dashboard,
+        // Questions or Archived page the flag would wait for the next list instead.
+        guard smartView != nil || selectedProject != nil else { return }
+        pendingNewTask = true
     }
 
     /// Show a tab of the selected project's page; the Questions tab selects its first question.
@@ -491,7 +498,7 @@ final class AppModel: ObservableObject {
 
     /// Save the project sheet: the code first (it may be refused, e.g. taken since the
     /// sheet checked it), then the name and description. `detail` nil leaves it as is.
-    func editProject(_ id: Int64, name: String, detail: String?, code: String?) {
+    func editProject(_ id: Int64, name: String?, detail: String?, code: String?) {
         if let code, code.uppercased() != projects.first(where: { $0.id == id })?.code {
             do {
                 try store.setProjectCode(id: id, code: code)
@@ -509,6 +516,10 @@ final class AppModel: ObservableObject {
     /// checks again when it saves.
     func projectCodeProblem(_ raw: String, for id: Int64?) -> String? {
         if raw.trimmingCharacters(in: .whitespaces).isEmpty { return id == nil ? nil : "Enter a code" }
+        // An unchanged code is fine even if it predates these rules (e.g. one made from
+        // a name starting with a digit), so the rest of the project stays editable.
+        if let id, let stored = projects.first(where: { $0.id == id })?.code,
+           raw.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare(stored) == .orderedSame { return nil }
         guard let code = Store.normalizedProjectCode(raw) else {
             return "1–10 letters A–Z or digits, starting with a letter"
         }

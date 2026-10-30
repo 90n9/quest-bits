@@ -293,7 +293,7 @@ struct ProjectSidebar: View {
         }
         .sheet(isPresented: $showNew) {
             ProjectSheet(title: "New Project", picksTemplate: true) { v in
-                model.addProject(name: v.name, detail: v.detail, code: v.code, guideTemplate: v.template)
+                model.addProject(name: v.name ?? "", detail: v.detail ?? "", code: v.code, guideTemplate: v.template)
             }
         }
         .sheet(item: $editing) { p in
@@ -469,9 +469,11 @@ struct ArchiveProjectSheet: View {
 /// markdown; `showsDescription` false leaves it out (the Detail tab edits it in place).
 /// The code is checked as it is typed; empty on a new project means one made from the name.
 struct ProjectSheet: View {
+    /// What to save. Editing a project, `name` and `detail` are nil when unchanged since
+    /// the sheet opened, so an agent's write in the meantime is not reverted.
     struct Values {
-        var name: String
-        var detail: String
+        var name: String?
+        var detail: String?
         var code: String?       // nil: left empty (a new project gets one from its name)
         var template: GuideTemplate?
     }
@@ -487,6 +489,7 @@ struct ProjectSheet: View {
     @State private var template: GuideTemplate?
     @State private var detailHeight: CGFloat = 120
     @State private var flush = EditorFlush()
+    @State private var opened: (name: String, detail: String)?
     let onSave: (Values) -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -514,6 +517,7 @@ struct ProjectSheet: View {
         .padding(Theme.Spacing.lg)
         .frame(width: 560)
         .qbParchment()
+        .onAppear { if opened == nil { opened = (name, detail) } }
     }
 
     private var codeField: some View {
@@ -555,7 +559,10 @@ struct ProjectSheet: View {
             let n = name.trimmingCharacters(in: .whitespaces)
             let c = code.trimmingCharacters(in: .whitespaces)
             if !n.isEmpty, codeProblem == nil {
-                onSave(Values(name: n, detail: detail, code: c.isEmpty ? nil : c, template: template))
+                let editing = projectId != nil
+                onSave(Values(name: editing && n == opened?.name ? nil : n,
+                              detail: editing && detail == opened?.detail ? nil : detail,
+                              code: c.isEmpty ? nil : c, template: template))
             }
             dismiss()
         }

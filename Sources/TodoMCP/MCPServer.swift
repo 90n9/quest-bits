@@ -270,7 +270,12 @@ final class MCPServer: @unchecked Sendable {
                 }
                 template = t
             }
-            let p = try store.createProject(name: name, detail: desc, code: args["code"] as? String,
+            var code: String?
+            if let raw = args["code"], !(raw is NSNull) {
+                guard let s = raw as? String else { throw MCPError.invalidArg("code must be a string") }
+                code = s
+            }
+            let p = try store.createProject(name: name, detail: desc, code: code,
                                             guideTemplate: template,
                                             author: .agent, sessionId: try sessionArg(args))
             var d = projectDict(p)
