@@ -15,24 +15,37 @@ struct ContentView: View {
                 ProjectSidebar()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
             } content: {
-                if model.showQuestions {
+                if model.showArchived {
+                    ArchivedProjectsView()
+                        .navigationSplitViewColumnWidth(min: 320, ideal: 420)
+                } else if model.showQuestions {
                     QuestionListView()
                         .navigationSplitViewColumnWidth(min: 260, ideal: 320)
                 } else if model.showDashboard {
                     DashboardView()
                         .navigationSplitViewColumnWidth(min: 420, ideal: 560)
+                } else if let p = model.selectedProject, model.projectTab != .tasks {
+                    ProjectTabColumn(project: p, tab: model.projectTab)
+                        .modifier(ProjectTabsInset())
+                        .navigationSplitViewColumnWidth(min: 280, ideal: 360)
                 } else if model.boardView && model.boardAvailable {
                     BoardView()
+                        .modifier(ProjectTabsInset())
                         .navigationSplitViewColumnWidth(min: 520, ideal: 820)
                 } else {
                     TaskListView()
+                        .modifier(ProjectTabsInset())
                         .navigationSplitViewColumnWidth(min: 280, ideal: 360)
                 }
             } detail: {
-                if model.showQuestions {
+                if model.showArchived {
+                    ContentUnavailableViewCompat(text: "Find an archived project to open or unarchive it")
+                } else if model.showQuestions {
                     QuestionDetailView()
                 } else if model.showDashboard {
                     ContentUnavailableViewCompat(text: "Your activity at a glance")
+                } else if let p = model.selectedProject, model.projectTab != .tasks {
+                    ProjectTabDetail(project: p, tab: model.projectTab)
                 } else {
                     TaskDetailView()
                 }
@@ -227,6 +240,13 @@ struct ProjectSidebar: View {
                     .contentShape(Rectangle())
                     .onTapGesture { showTemplates = true }
                     .help("Manage reusable task templates")
+                Label { Text("Archived") } icon: { QBIcon(name: "tabler-barrel") }
+                    .font(Theme.Fonts.bodySmMedium)
+                    .foregroundStyle(model.showArchived ? Theme.Colors.brandBlue : Theme.Colors.ink)
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.selectArchived() }
+                    .listRowBackground(sidebarRowCard(model.showArchived))
+                    .help("Find archived projects and unarchive them")
             } header: {
                 sidebarHeader("Quests")
             }
@@ -272,13 +292,13 @@ struct ProjectSidebar: View {
             }
         }
         .sheet(isPresented: $showNew) {
-            ProjectSheet(title: "New Project") { name, detail in
-                model.addProject(name: name, detail: detail)
+            ProjectSheet(title: "New Project", picksTemplate: true) { v in
+                model.addProject(name: v.name ?? "", detail: v.detail ?? "", code: v.code, guideTemplate: v.template)
             }
         }
         .sheet(item: $editing) { p in
-            ProjectSheet(title: "Edit Project", name: p.name, detail: p.detail) { name, detail in
-                model.updateProject(p.id, name: name, detail: detail)
+            ProjectSheet(title: "Edit Project", projectId: p.id, name: p.name, detail: p.detail, code: p.code) { v in
+                model.editProject(p.id, name: v.name, detail: v.detail, code: v.code)
             }
         }
         .sheet(isPresented: $showTemplates) { TemplatesSheet() }
@@ -300,7 +320,7 @@ struct ProjectSidebar: View {
 
     /// True while the selected sidebar item is an archived project.
     private var selectedIsArchived: Bool {
-        guard model.smartView == nil, !model.showDashboard, !model.showQuestions,
+        guard model.smartView == nil, !model.showDashboard, !model.showQuestions, !model.showArchived,
               let sel = model.selectedProjectId else { return false }
         return model.archivedProjects.contains { $0.id == sel }
     }
@@ -339,7 +359,8 @@ struct ProjectSidebar: View {
         .opacity(p.isArchived ? 0.6 : 1)
         .tag(p.id)
         .listRowBackground(sidebarRowCard(
-            model.smartView == nil && !model.showDashboard && !model.showQuestions && model.selectedProjectId == p.id))
+            model.smartView == nil && !model.showDashboard && !model.showQuestions && !model.showArchived
+                && model.selectedProjectId == p.id))
         .help(p.detail.isEmpty ? p.name : p.detail)
         .contextMenu {
             Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
@@ -420,7 +441,7 @@ struct ArchiveProjectSheet: View {
             Text("Archive \(project.name)?").font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
             Text("\(openCount) open task\(openCount == 1 ? "" : "s") will stay open. "
                  + "Archived projects leave All Tasks, In Progress and the menu bar, "
-                 + "but you can still open them from the Archived group.")
+                 + "but you can still open them from Archived in the sidebar, and unarchive them there.")
                 .font(Theme.Fonts.bodySm)
                 .foregroundStyle(Theme.Colors.slate)
                 .fixedSize(horizontal: false, vertical: true)
@@ -442,40 +463,120 @@ struct ArchiveProjectSheet: View {
     }
 }
 
-/// Create/edit sheet for a project: name + description.
+/// Create/edit sheet for a project: name, code and description, and when creating
+/// (`picksTemplate`) the kind of project, whose template starts its agent guide. The
+/// description uses the task Detail editor (blocks, bold, links, images), stored as
+/// markdown; `showsDescription` false leaves it out (the Detail tab edits it in place).
+/// The code is checked as it is typed; empty on a new project means one made from the name.
 struct ProjectSheet: View {
+    /// What to save. Editing a project, `name` and `detail` are nil when unchanged since
+    /// the sheet opened, so an agent's write in the meantime is not reverted.
+    struct Values {
+        var name: String?
+        var detail: String?
+        var code: String?       // nil: left empty (a new project gets one from its name)
+        var template: GuideTemplate?
+    }
+
+    @EnvironmentObject var model: AppModel
     let title: String
+    var projectId: Int64? = nil   // nil: a new project
     @State var name: String = ""
     @State var detail: String = ""
-    let onSave: (String, String) -> Void
+    @State var code: String = ""
+    var picksTemplate = false
+    var showsDescription = true
+    @State private var template: GuideTemplate?
+    @State private var detailHeight: CGFloat = 120
+    @State private var flush = EditorFlush()
+    @State private var opened: (name: String, detail: String)?
+    let onSave: (Values) -> Void
     @Environment(\.dismiss) private var dismiss
+
+    private var codeProblem: String? { model.projectCodeProblem(code, for: projectId) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(title).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
             TextField("Project name", text: $name)
                 .textFieldStyle(.roundedBorder)
-            Text("Description").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
-            TextEditor(text: $detail)
-                .frame(height: 90)
-                .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
+            codeField
+            if showsDescription { descriptionEditor }
+            if picksTemplate { templatePicker }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
-                Button("Save") {
-                    let n = name.trimmingCharacters(in: .whitespaces)
-                    if !n.isEmpty { onSave(n, detail) }
-                    dismiss()
-                }
-                .buttonStyle(QBPrimaryButtonStyle(compact: true))
-                .keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                // ⌘Return, not Return: Return belongs to the editor.
+                Button("Save") { save() }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || codeProblem != nil)
             }
         }
         .padding(Theme.Spacing.lg)
-        .frame(width: 380)
+        .frame(width: 560)
         .qbParchment()
+        .onAppear { if opened == nil { opened = (name, detail) } }
+    }
+
+    private var codeField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Code").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+                TextField("Code", text: $code, prompt: Text(projectId == nil ? "From the name" : "Code"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 140)
+            }
+            if let codeProblem {
+                Text(codeProblem).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+            } else if projectId != nil {
+                Text("Its tasks keep their codes; new tasks take the new one.")
+                    .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+        }
+    }
+
+    private var descriptionEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Description").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+            ScrollView {
+                // One document, so docId is fixed; an edit flushed as the sheet closes
+                // without Save is dropped, like the rest of the sheet.
+                MarkdownEditor(docId: 0, markdown: $detail, height: $detailHeight, store: model.store,
+                               onOtherDoc: { _, _ in }, onError: { model.flashToast($0) }, flush: flush)
+                    .frame(height: max(140, detailHeight + 8))
+            }
+            .frame(height: 240)
+            .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
+        }
+    }
+
+    /// Take the editor's last keystrokes (it sends edits 150 ms late), then save.
+    private func save() {
+        flush { md in
+            if let md { detail = md }
+            let n = name.trimmingCharacters(in: .whitespaces)
+            let c = code.trimmingCharacters(in: .whitespaces)
+            if !n.isEmpty, codeProblem == nil {
+                let editing = projectId != nil
+                onSave(Values(name: editing && n == opened?.name ? nil : n,
+                              detail: editing && detail == opened?.detail ? nil : detail,
+                              code: c.isEmpty ? nil : c, template: template))
+            }
+            dismiss()
+        }
+    }
+
+    private var templatePicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("Kind", selection: $template) {
+                Text("None").tag(GuideTemplate?.none)
+                ForEach(GuideTemplate.allCases) { t in Text(t.label).tag(GuideTemplate?.some(t)) }
+            }
+            Text("Starts the project's agent guide from a template you can edit.")
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+        }
     }
 }
 

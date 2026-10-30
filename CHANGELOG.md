@@ -17,6 +17,48 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.4.3] - 2026-10-31
+
+### Added
+
+- **Guide templates by kind of project.** New Project has a Kind picker
+  (Web app, App, Research, Animation, or None) that starts the project's
+  agent guide from a short template you then edit. A project whose guide is
+  still empty gets a **Start from template** menu in its guide sheet. The
+  template is saved as an ordinary guide version, so History shows it and
+  can restore past it. The templates are first drafts and will be rewritten
+  from the guides you actually keep.
+- MCP `create_project` takes an optional `guide_template` (`web_app`, `app`,
+  `research` or `animation`) and `session`.
+- **Project descriptions use the Notion-style editor** of a task's Detail:
+  headings, lists, bold and italic, links and pasted or dropped images. The
+  text is still markdown. In the project sheet, Save is ⌘Return, because
+  Return belongs to the editor.
+- MCP project results (`list_projects`, `create_project`) list the files of
+  images in the description as `attachments`, as tasks already do.
+- **Project tabs.** A project's page has tabs: Tasks (as before, and still
+  what opens first), Detail (the project at a glance, and its description
+  edited in place), Guide (the project's guide edited in place, beside the
+  built-in rules and your guide for all projects) and Questions (that
+  project's questions, answered in place). No popup or right-click needed;
+  the sidebar menu still works. ⌘N from another tab goes back to Tasks.
+- **Choose a project's code.** New Project and Edit Project (also on the
+  Detail tab) have a Code field: 1–10 letters A–Z or digits, starting with a
+  letter, and not another project's code (checked as you type). Leave it
+  empty on a new project to get one from the name. Changing a code keeps
+  the existing task codes, so references to them stay valid; new tasks take
+  the new code. MCP `create_project` takes `code`, and `update_project`
+  takes `new_code`.
+- **Archived page.** Archived in the sidebar lists your archived projects,
+  newest first, with a search by name or code: open one, or unarchive it.
+  A project's Detail tab has Archive… (or Unarchive) too, so neither needs
+  the right-click menu.
+
+### Fixed
+
+- A new task never gets a code another task already has (possible once
+  codes can change).
+
 ## [1.4.2] - 2026-10-30
 
 ### Added

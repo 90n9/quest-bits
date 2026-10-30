@@ -262,19 +262,40 @@ final class MCPServer: @unchecked Sendable {
         case "create_project":
             let name = try requireString(args, "name")
             let desc = args["description"] as? String ?? ""
-            return try jsonString(projectDict(store.createProject(name: name, detail: desc)))
+            var template: GuideTemplate?
+            if let raw = args["guide_template"], !(raw is NSNull) {
+                guard let s = raw as? String, let t = GuideTemplate(rawValue: s) else {
+                    throw MCPError.invalidArg("guide_template must be one of: "
+                        + GuideTemplate.allCases.map(\.rawValue).joined(separator: ", "))
+                }
+                template = t
+            }
+            var code: String?
+            if let raw = args["code"], !(raw is NSNull) {
+                guard let s = raw as? String else { throw MCPError.invalidArg("code must be a string") }
+                code = s
+            }
+            let p = try store.createProject(name: name, detail: desc, code: code,
+                                            guideTemplate: template,
+                                            author: .agent, sessionId: try sessionArg(args))
+            var d = projectDict(p)
+            if let template { d["guide_template"] = template.rawValue }
+            return try jsonString(d)
 
         case "rename_project":
             try store.renameProject(id: try resolveProjectId(args, idKey: "id", codeKey: "code"), name: try requireString(args, "name"))
             return "renamed"
 
         case "update_project":
-            try store.updateProject(
-                id: try resolveProjectId(args, idKey: "id", codeKey: "code"),
-                name: args["name"] as? String,
-                detail: args["description"] as? String
-            )
-            return "updated"
+            let pid = try resolveProjectId(args, idKey: "id", codeKey: "code")
+            // The code first: a refused code leaves the name and description unchanged too.
+            var newCode: String?
+            if let raw = args["new_code"], !(raw is NSNull) {
+                guard let s = raw as? String else { throw MCPError.invalidArg("new_code must be a string") }
+                newCode = try store.setProjectCode(id: pid, code: s)
+            }
+            try store.updateProject(id: pid, name: args["name"] as? String, detail: args["description"] as? String)
+            return newCode.map { "updated; the project's code is now \($0) (its tasks keep their codes)" } ?? "updated"
 
         case "archive_project", "unarchive_project":
             let archive = tool == "archive_project"
@@ -622,6 +643,9 @@ final class MCPServer: @unchecked Sendable {
         var d: [String: Any] = ["id": p.id, "code": p.code, "name": p.name, "description": p.detail,
                                 "created_at": iso(p.createdAt)]
         if let a = p.archivedAt { d["archived_at"] = iso(a) }
+        // Images in the description, as for a task's detail.
+        let files = attachmentFiles(in: p.detail)
+        if !files.isEmpty { d["attachments"] = files }
         return d
     }
 

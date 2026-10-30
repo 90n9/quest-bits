@@ -69,14 +69,36 @@ final class AppModel: ObservableObject {
     // the detail column answers the selected one.
     @Published var showQuestions = false
     @Published var selectedQuestionId: Int64?
+    /// Archived page: the content column lists archived projects to find and unarchive.
+    @Published var showArchived = false
     /// Open questions in projects not archived, longest waiting first; refreshed with the
     /// tasks (so with every poll), republished only when they changed.
     @Published private(set) var openQuestions: [Question] = []
+    /// The tab shown for the selected project; back to Tasks when another project is picked.
+    @Published var projectTab: ProjectTab = .tasks
     @Published var daySeries: [DayStat] = []
     @Published var projectEfforts: [ProjectEffort] = []
 
     /// The single selected task id, or nil when zero or multiple are selected.
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
+
+    /// The project page is shown (not a smart view, the dashboard or the Questions page),
+    /// so its tabs are.
+    var selectedProject: Project? {
+        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, let id = selectedProjectId else { return nil }
+        return projects.first { $0.id == id }
+    }
+
+    /// The tab of the project page, or nil when no project page is shown.
+    var shownProjectTab: ProjectTab? { selectedProject == nil ? nil : projectTab }
+
+    /// The questions the Questions page, or the project's Questions tab, lists.
+    var shownQuestions: [Question] { questionsShown(in: openQuestions) }
+
+    private func questionsShown(in open: [Question]) -> [Question] {
+        guard shownProjectTab == .questions, let code = selectedProject?.code else { return open }
+        return open.filter { $0.projectCode == code }
+    }
 
     /// Whether the kanban board is offered for the current view. The board needs all
     /// its status columns to be meaningful, so it is suppressed in single-status
@@ -163,6 +185,7 @@ final class AppModel: ObservableObject {
         templates = (try? store.listTemplates()) ?? []
         if let sel = selectedProjectId, !projects.contains(where: { $0.id == sel }) {
             selectedProjectId = (activeProjects.first ?? projects.first)?.id
+            projectTab = .tasks
         }
         reloadTasks()
         reloadStats()
@@ -213,8 +236,10 @@ final class AppModel: ObservableObject {
     func reloadQuestions() {
         let open = (try? store.questions(statuses: [.open], activeOnly: true)) ?? openQuestions
         if open != openQuestions { openQuestions = open }
-        if showQuestions, selectedQuestionId.map({ id in !open.contains { $0.id == id } }) ?? true {
-            selectedQuestionId = open.first?.id
+        let shown = questionsShown(in: open)
+        if showQuestions || shownProjectTab == .questions,
+           selectedQuestionId.map({ id in !shown.contains { $0.id == id } }) ?? true {
+            selectedQuestionId = shown.first?.id
         }
     }
 
@@ -233,8 +258,10 @@ final class AppModel: ObservableObject {
     }
 
     func selectProject(_ id: Int64?) {
+        if id != selectedProjectId { projectTab = .tasks }
         showDashboard = false
         showQuestions = false
+        showArchived = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -245,6 +272,7 @@ final class AppModel: ObservableObject {
     func selectSmartView(_ v: SmartView) {
         showDashboard = false
         showQuestions = false
+        showArchived = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
@@ -255,6 +283,7 @@ final class AppModel: ObservableObject {
     func selectDashboard() {
         showDashboard = true
         showQuestions = false
+        showArchived = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -265,6 +294,7 @@ final class AppModel: ObservableObject {
     func selectQuestions() {
         showQuestions = true
         showDashboard = false
+        showArchived = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -273,10 +303,42 @@ final class AppModel: ObservableObject {
         reloadQuestions()
     }
 
-    /// The question after `id` in the list (wrapping), or nil when it is the only one.
+    /// New Task (⌘N): on another tab of a project page, back to Tasks first, where the
+    /// new-task field is; it opens once the list is showing again.
+    func requestNewTask() {
+        if shownProjectTab != nil, projectTab != .tasks {
+            projectTab = .tasks
+            DispatchQueue.main.async { self.pendingNewTask = true }
+            return
+        }
+        // Only where a task list shows (a project or a smart view): on the Dashboard,
+        // Questions or Archived page the flag would wait for the next list instead.
+        guard smartView != nil || selectedProject != nil else { return }
+        pendingNewTask = true
+    }
+
+    /// Show a tab of the selected project's page; the Questions tab selects its first question.
+    func selectProjectTab(_ tab: ProjectTab) {
+        projectTab = tab
+        if tab == .questions { selectedQuestionId = nil; reloadQuestions() }
+    }
+
+    func selectArchived() {
+        showArchived = true
+        showQuestions = false
+        showDashboard = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        reloadTasks()
+    }
+
+    /// The question after `id` in the list shown (wrapping), or nil when it is the only one.
     func questionAfter(_ id: Int64) -> Int64? {
-        guard let i = openQuestions.firstIndex(where: { $0.id == id }), openQuestions.count > 1 else { return nil }
-        return openQuestions[(i + 1) % openQuestions.count].id
+        let shown = shownQuestions
+        guard let i = shown.firstIndex(where: { $0.id == id }), shown.count > 1 else { return nil }
+        return shown[(i + 1) % shown.count].id
     }
 
     /// Answer a question from the Questions page; on success select the next one.
@@ -424,10 +486,47 @@ final class AppModel: ObservableObject {
 
     // MARK: - Project CRUD
 
-    func addProject(name: String, detail: String = "") {
-        guard let p = try? store.createProject(name: name, detail: detail) else { return }
-        reloadAll()
-        selectProject(p.id)
+    func addProject(name: String, detail: String = "", code: String? = nil, guideTemplate: GuideTemplate? = nil) {
+        do {
+            let p = try store.createProject(name: name, detail: detail, code: code, guideTemplate: guideTemplate)
+            reloadAll()
+            selectProject(p.id)
+        } catch {
+            flashToast("Couldn't create the project: \(error)")
+        }
+    }
+
+    /// Save the project sheet: the code first (it may be refused, e.g. taken since the
+    /// sheet checked it), then the name and description. `detail` nil leaves it as is.
+    func editProject(_ id: Int64, name: String?, detail: String?, code: String?) {
+        if let code, code.uppercased() != projects.first(where: { $0.id == id })?.code {
+            do {
+                try store.setProjectCode(id: id, code: code)
+            } catch {
+                flashToast("Couldn't change the code: \(error)")
+                reloadAll()
+                return
+            }
+        }
+        updateProject(id, name: name, detail: detail)
+    }
+
+    /// Why `raw` can't be the code of project `id` (nil: a new project), or nil when it
+    /// can. Empty is fine for a new project (a code is made from its name). The store
+    /// checks again when it saves.
+    func projectCodeProblem(_ raw: String, for id: Int64?) -> String? {
+        if raw.trimmingCharacters(in: .whitespaces).isEmpty { return id == nil ? nil : "Enter a code" }
+        // An unchanged code is fine even if it predates these rules (e.g. one made from
+        // a name starting with a digit), so the rest of the project stays editable.
+        if let id, let stored = projects.first(where: { $0.id == id })?.code,
+           raw.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare(stored) == .orderedSame { return nil }
+        guard let code = Store.normalizedProjectCode(raw) else {
+            return "1–10 letters A–Z or digits, starting with a letter"
+        }
+        if let other = projects.first(where: { $0.id != id && $0.code.caseInsensitiveCompare(code) == .orderedSame }) {
+            return "\(code) is already the code of \(other.name)"
+        }
+        return nil
     }
 
     func renameProject(_ id: Int64, to name: String) {
@@ -438,6 +537,18 @@ final class AppModel: ObservableObject {
     func updateProject(_ id: Int64, name: String? = nil, detail: String? = nil) {
         try? store.updateProject(id: id, name: name, detail: detail)
         reloadAll()
+    }
+
+    /// Save a project's description as it is typed (the Detail tab): rereads only the
+    /// projects, not everything reloadAll does.
+    func saveProjectDetail(_ id: Int64, markdown: String) {
+        do {
+            try store.updateProject(id: id, detail: markdown)
+        } catch {
+            flashToast("Couldn't save the description: \(error)")
+            return
+        }
+        projects = (try? store.listProjects()) ?? projects
     }
 
     // MARK: - Agent guides

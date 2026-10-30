@@ -45,15 +45,39 @@ struct CommandRow: View {
 
 // MARK: - Guides
 
+/// The guide editor in a sheet (the user's guide for every project, or a project's from
+/// its sidebar menu). A project's Guide tab shows the same GuideEditor in place.
+struct GuideSheet: View {
+    let project: Project?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            GuideEditor(project: project)
+            HStack {
+                Spacer()
+                // No Return shortcut: Return belongs to the editor.
+                Button("Done") { dismiss() }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: 620, height: 640)
+        .qbParchment()
+    }
+}
+
 /// Edit an agent guide: the user's guide for every project (`project` nil) or one
 /// project's. get_guide gives agents QuestBits' built-in guide, then the user's, then the
 /// project's. Saved as you type; History lists every version (the user's and agents') and
 /// restores one. Each save names the version it was edited from: if an agent saved in
-/// between, the sheet shows the agent's version instead of overwriting it. After any
+/// between, the editor shows the agent's version instead of overwriting it. After any
 /// other failed save it stops saving and says so, rather than failing on every keystroke.
-struct GuideSheet: View {
+/// `showsBuiltIn` false leaves out the built-in rules, for a page that shows them beside it.
+struct GuideEditor: View {
     @EnvironmentObject var model: AppModel
     let project: Project?
+    var showsBuiltIn = true
     @State private var markdown = ""
     @State private var height: CGFloat = 200
     @State private var latest: GuideVersion?
@@ -61,7 +85,6 @@ struct GuideSheet: View {
     @State private var showHistory = false
     @State private var showBuiltIn = false
     @State private var saveError: String?
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -69,6 +92,9 @@ struct GuideSheet: View {
                 Text(project.map { "Guide · \($0.name)" } ?? "Guide · All projects")
                     .font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
                 Spacer()
+                if project != nil, loaded, markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    templateMenu
+                }
                 Button("History…") { showHistory = true }
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
             }
@@ -76,7 +102,10 @@ struct GuideSheet: View {
                  ? "How agents should work on your tasks in every project. They read it with get_guide, after QuestBits' built-in rules."
                  : "How agents should work on this project's tasks, e.g. what to check before asking and what \"done\" means. They read it with get_guide, after your guide for all projects.")
                 .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
-                .fixedSize(horizontal: false, vertical: true)
+                // No fixedSize: in a project's Guide tab the split view measures this column
+                // at tiny widths, and a text fixed to its full height there would stretch
+                // the whole window's content.
+                .lineLimit(3)
             if let saveError {
                 Text(saveError).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
             } else if let latest {
@@ -91,24 +120,17 @@ struct GuideSheet: View {
                 }
             }
             .frame(maxHeight: .infinity)
-            DisclosureGroup("QuestBits' built-in rules (\(AgentGuide.version))", isExpanded: $showBuiltIn) {
-                ScrollView {
-                    GuideMarkdownView(markdown: AgentGuide.builtIn)
-                        .padding(.vertical, 4)
+            if showsBuiltIn {
+                DisclosureGroup("QuestBits' built-in rules (\(AgentGuide.version))", isExpanded: $showBuiltIn) {
+                    ScrollView {
+                        GuideMarkdownView(markdown: AgentGuide.builtIn)
+                            .padding(.vertical, 4)
+                    }
+                    .frame(height: 220)
                 }
-                .frame(height: 220)
-            }
-            .font(Theme.Fonts.caption)
-            HStack {
-                Spacer()
-                // No Return shortcut: Return belongs to the editor.
-                Button("Done") { dismiss() }
-                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                .font(Theme.Fonts.caption)
             }
         }
-        .padding(Theme.Spacing.lg)
-        .frame(width: 620, height: 640)
-        .qbParchment()
         .onAppear {
             latest = model.guide(projectId: project?.id)
             markdown = latest?.markdown ?? ""
@@ -138,6 +160,16 @@ struct GuideSheet: View {
     /// Save an earlier version's text as a new version, and show it.
     private func restore(_ v: GuideVersion) {
         save(v.markdown, reason: "Restored version \(v.id)")
+    }
+
+    /// Fill a still-empty project guide from a template, as a version of its own.
+    private var templateMenu: some View {
+        Menu("Start from template") {
+            ForEach(GuideTemplate.allCases) { t in
+                Button(t.label) { save(t.markdown, reason: t.reason) }
+            }
+        }
+        .menuStyle(.button).buttonStyle(QBSecondaryButtonStyle(compact: true)).fixedSize()
     }
 
     static func changedLabel(_ v: GuideVersion) -> String {
@@ -183,7 +215,7 @@ struct GuideHistoryView: View {
     private func row(_ v: GuideVersion, current: Bool) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(GuideSheet.changedLabel(v)).font(Theme.Fonts.captionBold).foregroundStyle(Theme.Colors.ink)
+                Text(GuideEditor.changedLabel(v)).font(Theme.Fonts.captionBold).foregroundStyle(Theme.Colors.ink)
                     .lineLimit(1)
                 Spacer()
                 if current {
