@@ -153,7 +153,7 @@ final class AppModel: ObservableObject {
         let ids = (try? store.inProgressTaskIds()) ?? []
         guard !ids.isEmpty else { return }
         for id in ids { try? store.addEffort(toTaskId: id, seconds: seconds) }
-        reloadTasks()
+        reloadTasks(timeline: false)   // effort is not on the timeline
     }
 
     // MARK: - Reload
@@ -174,7 +174,9 @@ final class AppModel: ObservableObject {
         projectEfforts = (try? store.effortByProject()) ?? []
     }
 
-    func reloadTasks() {
+    /// `timeline` false skips the selected task's notes / history / questions, for a write
+    /// that cannot change them (the effort flush every few seconds while a timer runs).
+    func reloadTasks(timeline: Bool = true) {
         let all = (try? store.listTasks(projectId: nil)) ?? []
         // Cross-project views (smart views, menu bar) leave out archived projects; a
         // selected project shows in full, archived or not. Due-date reminders still cover
@@ -203,7 +205,7 @@ final class AppModel: ObservableObject {
         if counts != projectCounts { projectCounts = counts }
         syncDueReminders(all)
         reloadQuestions()
-        reloadNotes()
+        if timeline { reloadNotes() }
     }
 
     /// Refresh the open questions; drop a selection that is no longer open (answered

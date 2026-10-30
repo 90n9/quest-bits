@@ -53,6 +53,7 @@ final class MCPServer: @unchecked Sendable {
         QuestBits is the user's task tracker. Tasks have codes (QUE-3); every tool that takes an id also takes a code.
         Ask loop — when you need the user to decide:
         - Call ask_user with 2–4 options, the one you recommend, and a one-line reason; then move straight on to other work. Never end your turn just to wait.
+        - Pick a short session label (e.g. the repo and ticket) and pass it as `session` to ask_user, get_answers and wait_for_answers, so you only pick up answers to your own questions.
         - Before starting new work, call get_answers and finish answered questions first (resume_question, then act on the answer).
         - With nothing else to do but questions still open, call wait_for_answers; when it returns with no answers, call it again or stop with a summary.
         - Push, release, posting, or anything irreversible: always ask and wait for the answer.
@@ -144,14 +145,7 @@ final class MCPServer: @unchecked Sendable {
         let minutes: Int
         do {
             filter = try questionFilterArgs(args)
-            if given(args, "max_minutes") {
-                guard let n = try? requireInt(args, "max_minutes"), (1...Int64(Self.maxWaitMinutes)).contains(n) else {
-                    throw MCPError.invalidArg("max_minutes must be an integer from 1 to \(Self.maxWaitMinutes)")
-                }
-                minutes = Int(n)
-            } else {
-                minutes = Self.defaultWaitMinutes
-            }
+            minutes = try limitArg(args, "max_minutes", default: Self.defaultWaitMinutes, max: Self.maxWaitMinutes)
         } catch {
             respondToolError(id: id, error)
             return
@@ -192,8 +186,7 @@ final class MCPServer: @unchecked Sendable {
             waitLock.lock(); let cancelled = cancelledWaits.contains(waitId); waitLock.unlock()
             if cancelled { return }
             do {
-                let answered = try store.questionCount(statuses: [.answered], projectId: projectId, sessionId: sessionId)
-                let open = try store.questionCount(statuses: [.open], projectId: projectId, sessionId: sessionId)
+                let (open, answered) = try store.questionCounts(projectId: projectId, sessionId: sessionId)
                 // Done: an answer is in, nothing is left to wait for, or the time is up.
                 if answered > 0 || open == 0 || Date() >= deadline {
                     respondText(id: id, try answersJSON(projectId: projectId, sessionId: sessionId,
@@ -217,10 +210,12 @@ final class MCPServer: @unchecked Sendable {
     }
 
     /// get_answers / wait_for_answers output: the answered questions (oldest first) and
-    /// how many are still open, for the same project / session filter.
+    /// how many are still open, for the same project / session filter. Only active projects
+    /// count, as in the app: a question in an archived project cannot be answered there.
     private func answersJSON(projectId: Int64?, sessionId: String?, waitedSeconds: Int? = nil) throws -> String {
-        let answered = try store.questions(statuses: [.answered], projectId: projectId, sessionId: sessionId)
-        let open = try store.questionCount(statuses: [.open], projectId: projectId, sessionId: sessionId)
+        let answered = try store.questions(statuses: [.answered], projectId: projectId, sessionId: sessionId,
+                                           activeOnly: true)
+        let open = try store.questionCounts(projectId: projectId, sessionId: sessionId).open
         var d: [String: Any] = ["answered": answered.map(questionDict), "open": open]
         if let waitedSeconds { d["waited_minutes"] = waitedSeconds / 60 }
         return try jsonString(d)

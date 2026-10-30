@@ -99,10 +99,10 @@ struct QuestionCard: View {
             .frame(maxWidth: 640, alignment: .leading)
         }
         .qbParchment()
+        .background(WindowReader(window: $cardWindow))
         // 1–4 pick an option. A local monitor, not keyboardShortcut: the question list
         // keeps the focus and swallows plain keys before a shortcut sees them.
         .onAppear {
-            cardWindow = NSApp.keyWindow
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 pickOption(event) ? nil : event
             }
@@ -269,5 +269,29 @@ struct QuestionCard: View {
         guard let pid = model.task(byId: question.taskId)?.projectId else { return }
         model.selectProject(pid)
         model.selectedTaskIds = [question.taskId]
+    }
+}
+
+/// Reports the window a view is in (nil until it is in one), for code that must tell
+/// that window's events from others'.
+struct WindowReader: NSViewRepresentable {
+    @Binding var window: NSWindow?
+
+    func makeNSView(context: Context) -> NSView { Reader(window: $window) }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    private final class Reader: NSView {
+        @Binding var target: NSWindow?
+        init(window: Binding<NSWindow?>) {
+            _target = window
+            super.init(frame: .zero)
+        }
+        required init?(coder: NSCoder) { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let w = window
+            // Not during the view update that moved it: set the state on the next turn.
+            DispatchQueue.main.async { [weak self] in self?.target = w }
+        }
     }
 }

@@ -1873,27 +1873,37 @@ struct HistoryRow: View {
 }
 
 /// What the task timeline shows: everything, the change history, or one kind of note.
-enum TimelineFilter: String, CaseIterable {
-    case all, changes, note, progress, decision, summary, review, question
+/// One filter per NoteKind, so a new kind is filterable without touching this. Stored by
+/// raw value ("all", "changes", or the kind's) in @AppStorage.
+struct TimelineFilter: RawRepresentable, Hashable {
+    let rawValue: String
+
+    init(rawValue: String) { self.rawValue = rawValue }
+
+    static let all = TimelineFilter(rawValue: "all")
+    static let changes = TimelineFilter(rawValue: "changes")
+    static var allCases: [TimelineFilter] {
+        [.all, .changes] + NoteKind.allCases.map { TimelineFilter(rawValue: $0.rawValue) }
+    }
+
+    var kind: NoteKind? { NoteKind(rawValue: rawValue) }
 
     var title: String {
         switch self {
         case .all: return "Everything"
         case .changes: return "Changes"
-        default: return NoteKind(rawValue: rawValue)?.display ?? rawValue
+        default: return kind?.display ?? rawValue
         }
     }
 
     var includesNotes: Bool { self != .changes }
 
-    /// Does the note show? Questions also show the decision each answer became.
+    /// Does the note show? Questions also show the decision each answer became. An unknown
+    /// stored value (a kind since removed) shows everything.
     func matches(_ note: TaskNote) -> Bool {
-        switch self {
-        case .all: return true
-        case .changes: return false
-        case .question: return note.kind == .question || note.questionId != nil
-        default: return note.kind.rawValue == rawValue
-        }
+        if self == .changes { return false }
+        guard let kind else { return true }
+        return kind == .question ? note.kind == .question || note.questionId != nil : note.kind == kind
     }
 }
 

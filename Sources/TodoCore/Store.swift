@@ -246,7 +246,7 @@ public final class Store: @unchecked Sendable {
         // The kind list is fixed in the table's CHECK: a new NoteKind needs a table rebuild
         // (see migrateNotesV2, which rebuilt it for 1.4.0).
         exec(Self.notesTableSQL("task_notes"))
-        migrateNotesV2()
+        try migrateNotesV2()
         exec("CREATE INDEX IF NOT EXISTS idx_notes_task_ts ON task_notes(task_id, ts);")
         // Earlier text of a note the user edited (newest edit = highest id).
         exec("""
@@ -280,9 +280,14 @@ public final class Store: @unchecked Sendable {
             cancel_reason TEXT,
             asked_at      REAL NOT NULL,
             answered_at   REAL,
-            resumed_at    REAL
+            resumed_at    REAL,
+            parked        INTEGER NOT NULL DEFAULT 0
         );
         """)
+        // parked = 1: asking this question is what moved the task to waiting on the user.
+        if !columnExists("questions", "parked") {
+            exec("ALTER TABLE questions ADD COLUMN parked INTEGER NOT NULL DEFAULT 0;")
+        }
         exec("CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status, asked_at);")
         exec("CREATE INDEX IF NOT EXISTS idx_questions_task ON questions(task_id);")
 
@@ -314,24 +319,32 @@ public final class Store: @unchecked Sendable {
     /// review) as `notesTableSQL`, keeping every row and id. One BEGIN IMMEDIATE, re-checked
     /// inside it, so the app and MCP server opening together rebuild it once. Older
     /// binaries keep working on the new table: their INSERT names only the old columns.
-    /// On failure it rolls back and logs; the old table stays and the next open retries.
-    private func migrateNotesV2() {
-        guard !columnExists("task_notes", "author") else { return }
-        do {
-            try beginImmediate()
-            if !columnExists("task_notes", "author") {
-                exec("DROP TABLE IF EXISTS task_notes_v2;")
-                try runWrite(Self.notesTableSQL("task_notes_v2"), [])
-                try runWrite("INSERT INTO task_notes_v2 (id, task_id, ts, kind, text) "
-                             + "SELECT id, task_id, ts, kind, text FROM task_notes;", [])
-                try runWrite("DROP TABLE task_notes;", [])
-                try runWrite("ALTER TABLE task_notes_v2 RENAME TO task_notes;", [])
+    /// A failed attempt rolls back (the old table stays) and is retried; if every attempt
+    /// fails the open fails, since every notes query needs the new columns.
+    private func migrateNotesV2() throws {
+        var lastError: Error?
+        for attempt in 1...3 {
+            guard !columnExists("task_notes", "author") else { return }
+            do {
+                try beginImmediate()
+                if !columnExists("task_notes", "author") {
+                    exec("DROP TABLE IF EXISTS task_notes_v2;")
+                    try runWrite(Self.notesTableSQL("task_notes_v2"), [])
+                    try runWrite("INSERT INTO task_notes_v2 (id, task_id, ts, kind, text) "
+                                 + "SELECT id, task_id, ts, kind, text FROM task_notes;", [])
+                    try runWrite("DROP TABLE task_notes;", [])
+                    try runWrite("ALTER TABLE task_notes_v2 RENAME TO task_notes;", [])
+                }
+                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+                return
+            } catch {
+                exec("ROLLBACK;")
+                lastError = error
+                NSLog("QuestBits: notes migration attempt \(attempt) failed: \(error)")
+                Thread.sleep(forTimeInterval: 1)
             }
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-        } catch {
-            exec("ROLLBACK;")
-            NSLog("QuestBits: notes migration failed, will retry on next open: \(error)")
         }
+        throw StoreError.open("notes migration failed: \(lastError.map { "\($0)" } ?? "unknown error")")
     }
 
     /// Repair the fields that follow a task's status, on every open: rows written before
@@ -1627,8 +1640,8 @@ public final class Store: @unchecked Sendable {
     /// choice needs 2–4 options, text takes 0–4 (suggestions), approve none (the draft to
     /// approve goes in `context`). In one BEGIN IMMEDIATE: the task must exist and be open;
     /// the question is inserted with a kind=question note; a blocking question moves the
-    /// task to waiting on the user, its reason the question — except a task already
-    /// waiting on a third party, which keeps that wait (and so is not released on answer).
+    /// task to waiting on the user, its reason the question — except a task already waiting
+    /// (on anyone), which keeps that wait and its reason. The task's project must be active.
     public func askQuestion(taskId: Int64, kind: QuestionKind, prompt: String, context: String = "",
                             options: [QuestionOption] = [], blocksTask: Bool = true,
                             sessionId: String? = nil) throws -> Question {
@@ -1659,25 +1672,28 @@ public final class Store: @unchecked Sendable {
             try beginImmediate()
             guard let task = getTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
             guard !task.status.isClosed else { throw StoreError.invalid("\(task.code) is \(task.status.rawValue); reopen it first") }
+            // The app lists questions of active projects only: one asked here could not be answered.
+            try requireActiveProjectUnlocked(task.projectId)
+            // A blocking question parks the task on the user — unless it already waits
+            // (on the user, or a third party): that wait, and its reason, stay as they are.
+            let parks = blocksTask && task.status != .waiting
             try runWrite(
-                "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at) "
-                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at, parked) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 [.int(taskId), session.map(SQLValue.text) ?? .null, .text(kind.rawValue), .text(prompt),
                  .text(context.trimmingCharacters(in: .whitespacesAndNewlines)), .text(optionsJSON),
                  .int(blocksTask ? 1 : 0), .text(QuestionStatus.open.rawValue),
-                 .double(Date().timeIntervalSince1970)])
+                 .double(Date().timeIntervalSince1970), .int(parks ? 1 : 0)])
             let qid = lastInsertId()
             var eventId: Int64?
-            if blocksTask, !(task.status == .waiting && task.waitingOn == .external) {
-                let reason = "Question: " + (prompt.count > 200 ? String(prompt.prefix(199)) + "…" : prompt)
+            if parks {
                 eventId = try applyTaskUpdateUnlocked(id: taskId, status: .waiting, waitingOn: .user,
-                                                      waitingReason: .some(reason), spawnRecurrence: false)
+                                                      waitingReason: .some(Self.questionReason(prompt)),
+                                                      spawnRecurrence: false)
             }
             _ = try insertNoteUnlocked(taskId: taskId, text: prompt, kind: .question, author: .agent,
                                        sessionId: session, statusEventId: eventId, questionId: qid)
-            guard let q = try readQuestionsUnlocked("WHERE q.id=?", [.int(qid)]).first else {
-                throw StoreError.notFound("question \(qid)")
-            }
+            let q = try questionUnlocked(qid)
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return q
         } catch {
@@ -1695,9 +1711,7 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         do {
             try beginImmediate()
-            guard let q = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
-                throw StoreError.notFound("question \(id)")
-            }
+            let q = try questionUnlocked(id)
             guard q.status == .open else { throw StoreError.invalid("question \(id) is already \(q.status.rawValue)") }
             if let choice, !q.options.indices.contains(choice) {
                 throw StoreError.invalid("question \(id) has no option \(choice + 1)")
@@ -1708,10 +1722,8 @@ public final class Store: @unchecked Sendable {
             try runWrite("UPDATE questions SET status=?, answer=?, answer_choice=?, answered_at=? WHERE id=?;",
                          [.text(QuestionStatus.answered.rawValue), .text(text),
                           choice.map { .int(Int64($0)) } ?? .null, .double(Date().timeIntervalSince1970), .int(id)])
-            if q.blocksTask { try releaseTaskUnlocked(q.taskId, to: .todo) }
-            guard let saved = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
-                throw StoreError.notFound("question \(id)")
-            }
+            if q.blocksTask { try releaseTaskUnlocked(q.taskId) }
+            let saved = try questionUnlocked(id)
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return saved
         } catch {
@@ -1727,9 +1739,7 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         do {
             try beginImmediate()
-            guard let q = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
-                throw StoreError.notFound("question \(id)")
-            }
+            let q = try questionUnlocked(id)
             switch q.status {
             case .answered: break
             case .open: throw StoreError.invalid("question \(id) is not answered yet")
@@ -1740,8 +1750,8 @@ public final class Store: @unchecked Sendable {
             _ = try insertNoteUnlocked(taskId: q.taskId, text: "\(q.prompt)\n→ \(q.answer ?? "")", kind: .decision,
                                        author: .user, sessionId: sessionId ?? q.sessionId, questionId: id)
             try startTaskUnlocked(q.taskId)
-            guard let saved = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first,
-                  let task = getTaskUnlocked(q.taskId) else { throw StoreError.notFound("question \(id)") }
+            let saved = try questionUnlocked(id)
+            guard let task = getTaskUnlocked(q.taskId) else { throw StoreError.notFound("task \(q.taskId)") }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return (saved, task)
         } catch {
@@ -1759,9 +1769,7 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         do {
             try beginImmediate()
-            guard let q = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
-                throw StoreError.notFound("question \(id)")
-            }
+            let q = try questionUnlocked(id)
             guard q.status == .open || q.status == .answered else {
                 throw StoreError.invalid("question \(id) is already \(q.status.rawValue)")
             }
@@ -1770,10 +1778,11 @@ public final class Store: @unchecked Sendable {
             let text = "Withdrew question: \(q.prompt)" + (reason.isEmpty ? "" : "\nReason: \(reason)")
             _ = try insertNoteUnlocked(taskId: q.taskId, text: text, kind: .decision, author: .agent,
                                        sessionId: sessionId ?? q.sessionId, questionId: id)
-            if q.blocksTask { try startTaskUnlocked(q.taskId) }
-            guard let saved = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
-                throw StoreError.notFound("question \(id)")
+            if q.blocksTask {
+                try releaseTaskUnlocked(q.taskId)
+                try startTaskUnlocked(q.taskId)
             }
+            let saved = try questionUnlocked(id)
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return saved
         } catch {
@@ -1792,23 +1801,29 @@ public final class Store: @unchecked Sendable {
         return try readQuestionsUnlocked(whereSQL + " ORDER BY q.asked_at, q.id", binds)
     }
 
-    /// How many questions match, by status — the cheap poll behind wait_for_answers.
-    public func questionCount(statuses: [QuestionStatus], projectId: Int64? = nil,
-                              sessionId: String? = nil) throws -> Int {
+    /// How many open and answered questions match, in active projects (the ones the app
+    /// shows, so the ones that can be answered) — the cheap poll behind wait_for_answers.
+    public func questionCounts(projectId: Int64? = nil, sessionId: String? = nil) throws
+        -> (open: Int, answered: Int) {
         lock.lock(); defer { lock.unlock() }
-        let (whereSQL, binds) = Self.questionFilter(statuses: statuses, projectId: projectId, taskId: nil,
-                                                    sessionId: sessionId, activeOnly: false)
-        let stmt = try prepare("SELECT COUNT(*) \(Self.questionFrom) \(whereSQL);", binds)
+        let (whereSQL, binds) = Self.questionFilter(statuses: [.open, .answered], projectId: projectId, taskId: nil,
+                                                    sessionId: sessionId, activeOnly: true)
+        let stmt = try prepare("SELECT q.status, COUNT(*) \(Self.questionFrom) \(whereSQL) GROUP BY q.status;", binds)
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.step(errmsg()) }
-        return Int(sqlite3_column_int64(stmt, 0))
+        var counts = (open: 0, answered: 0)
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            let n = Int(sqlite3_column_int64(stmt, 1))
+            if colText(stmt, 0) == QuestionStatus.open.rawValue { counts.open = n } else { counts.answered = n }
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return counts
     }
 
     public func question(id: Int64) throws -> Question {
         lock.lock(); defer { lock.unlock() }
-        guard let q = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
-            throw StoreError.notFound("question \(id)")
-        }
+        let q = try questionUnlocked(id)
         return q
     }
 
@@ -1819,7 +1834,8 @@ public final class Store: @unchecked Sendable {
         if let projectId { conds.append("t.project_id=?"); binds.append(.int(projectId)) }
         if let taskId { conds.append("q.task_id=?"); binds.append(.int(taskId)) }
         if let sessionId { conds.append("q.session_id=?"); binds.append(.text(sessionId)) }
-        if activeOnly { conds.append("p.archived_at IS NULL") }
+        // Same rule as the task views (Store.activeProjectSQL; project_id is the task's).
+        if activeOnly { conds.append(activeProjectSQL) }
         return ("WHERE " + conds.joined(separator: " AND "), binds)
     }
 
@@ -1829,21 +1845,47 @@ public final class Store: @unchecked Sendable {
                  [.int(taskId)]) == 1
     }
 
-    /// After a blocking question is answered: a task with no open blocking question left,
-    /// still waiting on the user, moves to `status`. A task someone moved on is left alone.
-    private func releaseTaskUnlocked(_ taskId: Int64, to status: TaskStatus) throws {
-        guard !hasOpenBlockingQuestionUnlocked(taskId), let t = getTaskUnlocked(taskId),
-              t.status == .waiting, t.waitingOn == .user else { return }
-        try applyTaskUpdateUnlocked(id: taskId, status: status, spawnRecurrence: false)
+    static func questionReason(_ prompt: String) -> String {
+        "Question: " + (prompt.count > 200 ? String(prompt.prefix(199)) + "…" : prompt)
     }
 
-    /// The agent is back on the task (resume / withdraw): a task still where the question
-    /// left it — waiting on the user, or released to todo — moves to in progress, unless
-    /// another open blocking question still holds it. A task someone moved on is left alone.
+    /// Is the task waiting on the user because a question parked it — in this wait, not an
+    /// earlier one? A wait the user set by hand (or set again after the question) is theirs.
+    private func parkedByQuestionUnlocked(_ t: TodoTask) -> Bool {
+        guard t.status == .waiting, t.waitingOn == .user, let since = t.waitingSince else { return false }
+        // waiting_since is whole seconds, asked_at is not: compare from the start of that second.
+        return queryInt("SELECT EXISTS(SELECT 1 FROM questions WHERE task_id=? AND parked=1 AND asked_at >= ?);",
+                        [.int(t.id), .double(since.timeIntervalSince1970.rounded(.down))]) == 1
+    }
+
+    /// After a blocking question is answered or withdrawn, for a task a question parked:
+    /// with no open blocking question left it goes back to todo; otherwise its reason names
+    /// the oldest question still open. A wait someone else set is left alone.
+    private func releaseTaskUnlocked(_ taskId: Int64) throws {
+        guard let t = getTaskUnlocked(taskId), parkedByQuestionUnlocked(t) else { return }
+        if let next = queryString(
+            "SELECT prompt FROM questions WHERE task_id=? AND status='open' AND blocks_task=1 ORDER BY asked_at, id LIMIT 1;",
+            [.int(taskId)]) {
+            try runWrite("UPDATE tasks SET waiting_reason=? WHERE id=?;", [.text(Self.questionReason(next)), .int(taskId)])
+        } else {
+            try applyTaskUpdateUnlocked(id: taskId, status: .todo, spawnRecurrence: false)
+        }
+    }
+
+    /// The agent is back on the task (resume / withdraw): a task still where a question left
+    /// it — released to todo, or parked on the user by one — moves to in progress, unless an
+    /// open blocking question still holds it. A task someone moved on is left alone.
     private func startTaskUnlocked(_ taskId: Int64) throws {
         guard !hasOpenBlockingQuestionUnlocked(taskId), let t = getTaskUnlocked(taskId),
-              t.status == .todo || (t.status == .waiting && t.waitingOn == .user) else { return }
+              t.status == .todo || parkedByQuestionUnlocked(t) else { return }
         try applyTaskUpdateUnlocked(id: taskId, status: .inProgress, spawnRecurrence: false)
+    }
+
+    private func questionUnlocked(_ id: Int64) throws -> Question {
+        guard let q = try readQuestionsUnlocked("WHERE q.id=?", [.int(id)]).first else {
+            throw StoreError.notFound("question \(id)")
+        }
+        return q
     }
 
     private func readQuestionsUnlocked(_ whereSQL: String, _ binds: [SQLValue]) throws -> [Question] {
