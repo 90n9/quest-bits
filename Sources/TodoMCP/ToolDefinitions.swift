@@ -31,8 +31,8 @@ extension MCPServer {
              "inputSchema": obj(["include_archived": ["type": "boolean", "description": "also list archived projects (default false)"] as [String: Any]])],
 
             ["name": "create_project",
-             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned. Optional `guide_template` starts the project's guide (see get_guide) from a template for that kind of project, for the user to edit; pass it only when the user picked the kind.",
-             "inputSchema": obj(["name": str, "description": str,
+             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned, or give `code` (1–10 letters A–Z or digits, starting with a letter, not another project's). Optional `guide_template` starts the project's guide (see get_guide) from a template for that kind of project, for the user to edit; pass it only when the user picked the kind.",
+             "inputSchema": obj(["name": str, "description": str, "code": str,
                                  "guide_template": ["type": "string", "enum": GuideTemplate.allCases.map(\.rawValue),
                                                     "description": "web_app, app, research or animation; omit for an empty guide"] as [String: Any],
                                  "session": sessionStr], required: ["name"])],
@@ -42,8 +42,8 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str, "name": str], required: ["name"])],
 
             ["name": "update_project",
-             "description": "Update a project's `name` and/or `description` (identify by `id` or `code`).",
-             "inputSchema": obj(["id": int, "code": str, "name": str, "description": str])],
+             "description": "Update a project's `name`, `description` and/or code (identify it by `id` or `code`; `new_code` sets the code: 1–10 letters A–Z or digits, starting with a letter, not another project's). Its tasks keep their codes; new tasks take the new one.",
+             "inputSchema": obj(["id": int, "code": str, "name": str, "description": str, "new_code": str])],
 
             ["name": "archive_project",
              "description": "Archive a finished project (identify by `id` or `code`). Its tasks are kept, and it stays usable by id/code, but list_projects and list_tasks without a project leave it out. Its code stays reserved. Returns the project, with `open_tasks` when some are still open. Idempotent.",

@@ -270,7 +270,8 @@ final class MCPServer: @unchecked Sendable {
                 }
                 template = t
             }
-            let p = try store.createProject(name: name, detail: desc, guideTemplate: template,
+            let p = try store.createProject(name: name, detail: desc, code: args["code"] as? String,
+                                            guideTemplate: template,
                                             author: .agent, sessionId: try sessionArg(args))
             var d = projectDict(p)
             if let template { d["guide_template"] = template.rawValue }
@@ -281,12 +282,15 @@ final class MCPServer: @unchecked Sendable {
             return "renamed"
 
         case "update_project":
-            try store.updateProject(
-                id: try resolveProjectId(args, idKey: "id", codeKey: "code"),
-                name: args["name"] as? String,
-                detail: args["description"] as? String
-            )
-            return "updated"
+            let pid = try resolveProjectId(args, idKey: "id", codeKey: "code")
+            // The code first: a refused code leaves the name and description unchanged too.
+            var newCode: String?
+            if let raw = args["new_code"], !(raw is NSNull) {
+                guard let s = raw as? String else { throw MCPError.invalidArg("new_code must be a string") }
+                newCode = try store.setProjectCode(id: pid, code: s)
+            }
+            try store.updateProject(id: pid, name: args["name"] as? String, detail: args["description"] as? String)
+            return newCode.map { "updated; the project's code is now \($0) (its tasks keep their codes)" } ?? "updated"
 
         case "archive_project", "unarchive_project":
             let archive = tool == "archive_project"

@@ -280,13 +280,13 @@ struct ProjectSidebar: View {
             }
         }
         .sheet(isPresented: $showNew) {
-            ProjectSheet(title: "New Project", picksTemplate: true) { name, detail, template in
-                model.addProject(name: name, detail: detail, guideTemplate: template)
+            ProjectSheet(title: "New Project", picksTemplate: true) { v in
+                model.addProject(name: v.name, detail: v.detail, code: v.code, guideTemplate: v.template)
             }
         }
         .sheet(item: $editing) { p in
-            ProjectSheet(title: "Edit Project", name: p.name, detail: p.detail) { name, detail, _ in
-                model.updateProject(p.id, name: name, detail: detail)
+            ProjectSheet(title: "Edit Project", projectId: p.id, name: p.name, detail: p.detail, code: p.code) { v in
+                model.editProject(p.id, name: v.name, detail: v.detail, code: v.code)
             }
         }
         .sheet(isPresented: $showTemplates) { TemplatesSheet() }
@@ -450,26 +450,78 @@ struct ArchiveProjectSheet: View {
     }
 }
 
-/// Create/edit sheet for a project: name + description, and when creating
+/// Create/edit sheet for a project: name, code and description, and when creating
 /// (`picksTemplate`) the kind of project, whose template starts its agent guide. The
-/// description uses the task Detail editor (blocks, bold, links, images), stored as markdown.
+/// description uses the task Detail editor (blocks, bold, links, images), stored as
+/// markdown; `showsDescription` false leaves it out (the Detail tab edits it in place).
+/// The code is checked as it is typed; empty on a new project means one made from the name.
 struct ProjectSheet: View {
+    struct Values {
+        var name: String
+        var detail: String
+        var code: String?       // nil: left empty (a new project gets one from its name)
+        var template: GuideTemplate?
+    }
+
     @EnvironmentObject var model: AppModel
     let title: String
+    var projectId: Int64? = nil   // nil: a new project
     @State var name: String = ""
     @State var detail: String = ""
+    @State var code: String = ""
     var picksTemplate = false
+    var showsDescription = true
     @State private var template: GuideTemplate?
     @State private var detailHeight: CGFloat = 120
     @State private var flush = EditorFlush()
-    let onSave: (String, String, GuideTemplate?) -> Void
+    let onSave: (Values) -> Void
     @Environment(\.dismiss) private var dismiss
+
+    private var codeProblem: String? { model.projectCodeProblem(code, for: projectId) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(title).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
             TextField("Project name", text: $name)
                 .textFieldStyle(.roundedBorder)
+            codeField
+            if showsDescription { descriptionEditor }
+            if picksTemplate { templatePicker }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                // ⌘Return, not Return: Return belongs to the editor.
+                Button("Save") { save() }
+                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || codeProblem != nil)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: 560)
+        .qbParchment()
+    }
+
+    private var codeField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Code").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+                TextField("Code", text: $code, prompt: Text(projectId == nil ? "From the name" : "Code"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 140)
+            }
+            if let codeProblem {
+                Text(codeProblem).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+            } else if projectId != nil {
+                Text("Its tasks keep their codes; new tasks take the new one.")
+                    .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+        }
+    }
+
+    private var descriptionEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
             Text("Description").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
             ScrollView {
                 // One document, so docId is fixed; an edit flushed as the sheet closes
@@ -480,21 +532,7 @@ struct ProjectSheet: View {
             }
             .frame(height: 240)
             .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
-            if picksTemplate { templatePicker }
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
-                // ⌘Return, not Return: Return belongs to the editor.
-                Button("Save") { save() }
-                    .buttonStyle(QBPrimaryButtonStyle(compact: true))
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
         }
-        .padding(Theme.Spacing.lg)
-        .frame(width: 560)
-        .qbParchment()
     }
 
     /// Take the editor's last keystrokes (it sends edits 150 ms late), then save.
@@ -502,7 +540,10 @@ struct ProjectSheet: View {
         flush { md in
             if let md { detail = md }
             let n = name.trimmingCharacters(in: .whitespaces)
-            if !n.isEmpty { onSave(n, detail, template) }
+            let c = code.trimmingCharacters(in: .whitespaces)
+            if !n.isEmpty, codeProblem == nil {
+                onSave(Values(name: n, detail: detail, code: c.isEmpty ? nil : c, template: template))
+            }
             dismiss()
         }
     }

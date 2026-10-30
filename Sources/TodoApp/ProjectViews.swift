@@ -93,7 +93,6 @@ struct ProjectOverview: View {
     @EnvironmentObject var model: AppModel
     let project: Project
     @State private var editing = false
-    @State private var newName = ""
 
     var body: some View {
         ScrollView {
@@ -120,7 +119,7 @@ struct ProjectOverview: View {
                 }
                 Text("Created \(fmtDateTime(project.createdAt))")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
-                Button("Rename…") { newName = project.name; editing = true }
+                Button("Edit name & code…") { editing = true }
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -129,9 +128,9 @@ struct ProjectOverview: View {
         .navigationTitle(project.name)
         .qbParchment()
         .sheet(isPresented: $editing) {
-            NameSheet(title: "Rename Project", placeholder: "Project name", text: $newName) {
-                let n = newName.trimmingCharacters(in: .whitespaces)
-                if !n.isEmpty { model.renameProject(project.id, to: n) }
+            ProjectSheet(title: "Edit Project", projectId: project.id, name: project.name, code: project.code,
+                         showsDescription: false) { v in
+                model.editProject(project.id, name: v.name, detail: nil, code: v.code)
             }
         }
     }

@@ -462,10 +462,43 @@ final class AppModel: ObservableObject {
 
     // MARK: - Project CRUD
 
-    func addProject(name: String, detail: String = "", guideTemplate: GuideTemplate? = nil) {
-        guard let p = try? store.createProject(name: name, detail: detail, guideTemplate: guideTemplate) else { return }
-        reloadAll()
-        selectProject(p.id)
+    func addProject(name: String, detail: String = "", code: String? = nil, guideTemplate: GuideTemplate? = nil) {
+        do {
+            let p = try store.createProject(name: name, detail: detail, code: code, guideTemplate: guideTemplate)
+            reloadAll()
+            selectProject(p.id)
+        } catch {
+            flashToast("Couldn't create the project: \(error)")
+        }
+    }
+
+    /// Save the project sheet: the code first (it may be refused, e.g. taken since the
+    /// sheet checked it), then the name and description. `detail` nil leaves it as is.
+    func editProject(_ id: Int64, name: String, detail: String?, code: String?) {
+        if let code, code.uppercased() != projects.first(where: { $0.id == id })?.code {
+            do {
+                try store.setProjectCode(id: id, code: code)
+            } catch {
+                flashToast("Couldn't change the code: \(error)")
+                reloadAll()
+                return
+            }
+        }
+        updateProject(id, name: name, detail: detail)
+    }
+
+    /// Why `raw` can't be the code of project `id` (nil: a new project), or nil when it
+    /// can. Empty is fine for a new project (a code is made from its name). The store
+    /// checks again when it saves.
+    func projectCodeProblem(_ raw: String, for id: Int64?) -> String? {
+        if raw.trimmingCharacters(in: .whitespaces).isEmpty { return id == nil ? nil : "Enter a code" }
+        guard let code = Store.normalizedProjectCode(raw) else {
+            return "1–10 letters A–Z or digits, starting with a letter"
+        }
+        if let other = projects.first(where: { $0.id != id && $0.code.caseInsensitiveCompare(code) == .orderedSame }) {
+            return "\(code) is already the code of \(other.name)"
+        }
+        return nil
     }
 
     func renameProject(_ id: Int64, to name: String) {

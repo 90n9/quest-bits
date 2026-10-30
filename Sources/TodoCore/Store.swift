@@ -521,6 +521,29 @@ public final class Store: @unchecked Sendable {
         return base
     }
 
+    /// A project code as typed, trimmed and upper-cased; nil unless it is 1–10 ASCII
+    /// letters and digits starting with a letter (task codes are "<code>-<n>").
+    public static func normalizedProjectCode(_ raw: String) -> String? {
+        let code = raw.trimmingCharacters(in: .whitespaces).uppercased()
+        let letter: (Unicode.Scalar) -> Bool = { ("A"..."Z").contains($0) }
+        guard (1...10).contains(code.unicodeScalars.count), let first = code.unicodeScalars.first, letter(first),
+              code.unicodeScalars.allSatisfy({ letter($0) || ("0"..."9").contains($0) }) else { return nil }
+        return code
+    }
+
+    /// `raw` checked as the code of project `id` (nil: a new project): well formed and not
+    /// another project's code, archived ones included. Called inside the write transaction.
+    private func validProjectCodeUnlocked(_ raw: String, for id: Int64?) throws -> String {
+        guard let code = Self.normalizedProjectCode(raw) else {
+            throw StoreError.invalid("a project code is 1–10 letters A–Z or digits, starting with a letter")
+        }
+        if let other = queryString("SELECT name FROM projects WHERE code=? COLLATE NOCASE AND id IS NOT ?;",
+                                   [.text(code), id.map(SQLValue.int) ?? .null]) {
+            throw StoreError.invalid("\(code) is already the code of project \(other)")
+        }
+        return code
+    }
+
     /// A project code unique among existing projects, archived ones included so their
     /// codes stay reserved (appends 2, 3, … on clash).
     private func uniqueProjectCode(from name: String) -> String {
@@ -539,7 +562,10 @@ public final class Store: @unchecked Sendable {
     @discardableResult
     /// `guideTemplate` starts the project's guide from that template, as its first version
     /// (by `author`, in the same transaction).
-    public func createProject(name: String, detail: String = "", guideTemplate: GuideTemplate? = nil,
+    /// `code` sets the project's code (checked as setProjectCode does); nil or empty
+    /// derives one from the name.
+    public func createProject(name: String, detail: String = "", code customCode: String? = nil,
+                              guideTemplate: GuideTemplate? = nil,
                               author: NoteAuthor = .user, sessionId: String? = nil) throws -> Project {
         lock.lock(); defer { lock.unlock() }
         // The code pick, the end-of-list sort_order and the INSERT are one read-modify-write
@@ -547,7 +573,8 @@ public final class Store: @unchecked Sendable {
         do {
             try beginImmediate()
             let now = Date()
-            let code = uniqueProjectCode(from: name)
+            let code = try customCode.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
+                .map { try validProjectCodeUnlocked($0, for: nil) } ?? uniqueProjectCode(from: name)
             guard let sortOrder = queryInt("SELECT \(Self.nextProjectSortOrderSQL);", []) else { throw StoreError.step(errmsg()) }
             try runWrite(
                 "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order) VALUES (?, ?, ?, 0, ?, ?);",
@@ -720,6 +747,27 @@ public final class Store: @unchecked Sendable {
         try runWrite("UPDATE projects SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
     }
 
+    /// Change a project's code and return it as stored (upper-cased). Its tasks keep
+    /// their codes, as a moved task does, so references to them stay valid; new tasks
+    /// take the new code. Checked and written in one BEGIN IMMEDIATE.
+    @discardableResult
+    public func setProjectCode(id: Int64, code raw: String) throws -> String {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            guard queryInt("SELECT id FROM projects WHERE id=?;", [.int(id)]) != nil else {
+                throw StoreError.notFound("project \(id)")
+            }
+            let code = try validProjectCodeUnlocked(raw, for: id)
+            try runWrite("UPDATE projects SET code=? WHERE id=?;", [.text(code), .int(id)])
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return code
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
     public func renameProject(id: Int64, name: String) throws {
         try updateProject(id: id, name: name)
     }
@@ -805,10 +853,15 @@ public final class Store: @unchecked Sendable {
         // Force recurrence to nil whenever this task has a parent.
         let effectiveRecurrence = parentId == nil ? recurrence : nil
         // Next per-project sequence number → task code.
-        try runWrite("UPDATE projects SET task_seq = task_seq + 1 WHERE id=?;", [.int(projectId)])
-        let seq = queryInt("SELECT task_seq FROM projects WHERE id=?;", [.int(projectId)]) ?? 1
+        // A code already taken is skipped: tasks keep their codes when they move or their
+        // project's code changes, so another task may hold "<code>-<n>".
         let pcode = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "PRJ"
-        let code = "\(pcode)-\(seq)"
+        var code: String
+        repeat {
+            try runWrite("UPDATE projects SET task_seq = task_seq + 1 WHERE id=?;", [.int(projectId)])
+            let seq = queryInt("SELECT task_seq FROM projects WHERE id=?;", [.int(projectId)]) ?? 1
+            code = "\(pcode)-\(seq)"
+        } while (queryInt("SELECT COUNT(*) FROM tasks WHERE code=? COLLATE NOCASE;", [.text(code)]) ?? 0) > 0
         let due: SQLValue = dueDate.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null
         let nowSecs = Int64(now.timeIntervalSince1970)
         let secs: (Date?) -> SQLValue = { $0.map { .int(Int64($0.timeIntervalSince1970)) } ?? .null }

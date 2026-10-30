@@ -42,6 +42,18 @@ _Nothing yet._
   built-in rules and your guide for all projects) and Questions (that
   project's questions, answered in place). No popup or right-click needed;
   the sidebar menu still works. ⌘N from another tab goes back to Tasks.
+- **Choose a project's code.** New Project and Edit Project (also on the
+  Detail tab) have a Code field: 1–10 letters A–Z or digits, starting with a
+  letter, and not another project's code (checked as you type). Leave it
+  empty on a new project to get one from the name. Changing a code keeps
+  the existing task codes, so references to them stay valid; new tasks take
+  the new code. MCP `create_project` takes `code`, and `update_project`
+  takes `new_code`.
+
+### Fixed
+
+- A new task never gets a code another task already has (possible once
+  codes can change).
 
 ## [1.4.2] - 2026-10-30
 
