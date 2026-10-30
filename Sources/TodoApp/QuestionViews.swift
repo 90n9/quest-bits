@@ -4,24 +4,27 @@ import AppKit
 // MARK: - Questions page (ask loop)
 
 /// The content column of the Questions page: every open question in projects not
-/// archived, longest waiting first. Selecting one opens its card in the detail column.
+/// archived, longest waiting first (on a project's Questions tab, that project's only).
+/// Selecting one opens its card in the detail column.
 struct QuestionListView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
         Group {
-            if model.openQuestions.isEmpty {
-                ContentUnavailableViewCompat(text: "No questions waiting.\nWhen an agent needs you to decide, it asks here.")
+            if model.shownQuestions.isEmpty {
+                ContentUnavailableViewCompat(text: model.selectedProject == nil
+                    ? "No questions waiting.\nWhen an agent needs you to decide, it asks here."
+                    : "No questions waiting in this project.")
             } else {
                 List(selection: $model.selectedQuestionId) {
-                    ForEach(model.openQuestions) { q in
+                    ForEach(model.shownQuestions) { q in
                         QuestionRow(question: q).tag(q.id)
                     }
                 }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { resumeCommands }
-        .navigationTitle("Questions")
+        .navigationTitle(model.selectedProject?.name ?? "Questions")
         .qbParchment()
     }
 }
@@ -68,11 +71,11 @@ struct QuestionDetailView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        if let id = model.selectedQuestionId, let q = model.openQuestions.first(where: { $0.id == id }) {
+        if let id = model.selectedQuestionId, let q = model.shownQuestions.first(where: { $0.id == id }) {
             // A fresh card per question, so a draft answer never carries over.
             QuestionCard(question: q).id(q.id)
         } else {
-            ContentUnavailableViewCompat(text: model.openQuestions.isEmpty
+            ContentUnavailableViewCompat(text: model.shownQuestions.isEmpty
                 ? "Nothing to answer" : "Pick a question to answer")
         }
     }

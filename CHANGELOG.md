@@ -36,6 +36,12 @@ _Nothing yet._
   Return belongs to the editor.
 - MCP project results (`list_projects`, `create_project`) list the files of
   images in the description as `attachments`, as tasks already do.
+- **Project tabs.** A project's page has tabs: Tasks (as before, and still
+  what opens first), Detail (the project at a glance, and its description
+  edited in place), Guide (the project's guide edited in place, beside the
+  built-in rules and your guide for all projects) and Questions (that
+  project's questions, answered in place). No popup or right-click needed;
+  the sidebar menu still works. ⌘N from another tab goes back to Tasks.
 
 ## [1.4.2] - 2026-10-30
 

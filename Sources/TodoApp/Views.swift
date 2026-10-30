@@ -21,11 +21,17 @@ struct ContentView: View {
                 } else if model.showDashboard {
                     DashboardView()
                         .navigationSplitViewColumnWidth(min: 420, ideal: 560)
+                } else if let p = model.selectedProject, model.projectTab != .tasks {
+                    ProjectTabColumn(project: p, tab: model.projectTab)
+                        .modifier(ProjectTabsInset())
+                        .navigationSplitViewColumnWidth(min: 280, ideal: 360)
                 } else if model.boardView && model.boardAvailable {
                     BoardView()
+                        .modifier(ProjectTabsInset())
                         .navigationSplitViewColumnWidth(min: 520, ideal: 820)
                 } else {
                     TaskListView()
+                        .modifier(ProjectTabsInset())
                         .navigationSplitViewColumnWidth(min: 280, ideal: 360)
                 }
             } detail: {
@@ -33,6 +39,8 @@ struct ContentView: View {
                     QuestionDetailView()
                 } else if model.showDashboard {
                     ContentUnavailableViewCompat(text: "Your activity at a glance")
+                } else if let p = model.selectedProject, model.projectTab != .tasks {
+                    ProjectTabDetail(project: p, tab: model.projectTab)
                 } else {
                     TaskDetailView()
                 }

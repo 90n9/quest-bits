@@ -65,7 +65,7 @@ struct TodoCommands: Commands {
         // two ⌘N bindings and New Window wins, so the shortcut never creates a task.
         // Replacing the group drops New Window and lets New Task own ⌘N.
         CommandGroup(replacing: .newItem) {
-            Button("New Task") { model.pendingNewTask = true }
+            Button("New Task") { model.requestNewTask() }
                 .keyboardShortcut(sc(.newTask))
             Button("New Project") { model.pendingNewProject = true }
                 .keyboardShortcut(sc(.newProject))
