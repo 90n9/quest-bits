@@ -8,12 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases (signed `.dmg`) are published to the public
 [`90n9/quest-bits-releases`](https://github.com/90n9/quest-bits-releases/releases)
-repo by CI on every `v*` tag. Source history and tags live in the private
+repo by CI on every `v*` tag. Source history and tags live in the public
 `90n9/quest-bits` repo.
 
 ## [Unreleased]
 
 _Nothing yet._
+
+## [1.3.1] - 2026-10-30
+
+### Fixed
+
+- **Duplicate** on a selection (⌘D or the Task menu) is now one all-or-nothing
+  write: if any task can't be copied, no copy is made and a toast says why.
+  It used to skip failures silently. A toast now confirms how many tasks were
+  duplicated. Copies (and **Copy to project** on a selection) are made in the
+  order the list shows, so their codes follow that order.
+- **Delete** on a selection is now one all-or-nothing write. If the delete
+  fails (for example, the database is locked by the MCP server), no task is
+  deleted, the selection is kept and a toast says why. It used to report
+  "Deleted N tasks" even when nothing was deleted. Deleting one task from its
+  context menu also shows a toast when it fails.
+- Setting priority on a selection is now one all-or-nothing write with an
+  error toast. It used to report success even when nothing changed.
+- A selected task that is deleted elsewhere (for example over MCP) leaves the
+  selection on the next reload, so the bulk actions on the rest of the
+  selection no longer fail on it.
+- MCP `bulk_delete_tasks` checks every task before it deletes any. An unknown
+  numeric id is now an error (`not found: task N`) and no task is deleted,
+  like an unknown code already was and like the other bulk tools. It used to
+  report success. The reply counts the tasks actually deleted, subtasks
+  included.
+- The MCP bulk tools act once on a task named twice (by `id` and `code`, or
+  repeated). `bulk_move_tasks` with `copy: true` used to copy it twice.
+
+### Docs
+
+- CLAUDE.md and the README say clearly that only the MCP server reads
+  `TODO_DB_PATH`. The app and a bare `Store()` always open the real database,
+  so test scripts must use `Store(url:)` with a throwaway path. The MCP smoke
+  test example now sets `TODO_DB_PATH` on the `todo-mcp` process, not on
+  `echo`.
 
 ## [1.3.0] - 2026-10-30
 

@@ -40,11 +40,12 @@ There is no test suite. Verify by exercising the real binaries:
 ```bash
 # MCP smoke test — no app restart needed. Point at a throwaway DB.
 MCP="build/QuestBits Dev.app/Contents/Resources/mcp-server/todo-mcp"
-TODO_DB_PATH=/tmp/qb-test.sqlite \
-  echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}' | "$MCP"
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}' \
+  | TODO_DB_PATH=/tmp/qb-test.sqlite "$MCP"
 ```
 
-- `TODO_DB_PATH` overrides the DB location — always use it for tests so you don't touch real data.
+- **Only `todo-mcp` reads `TODO_DB_PATH`** (`TodoMCP/MCPServer.swift`), and only when it is set on the `todo-mcp` process itself — put it after the `|`, not before `echo`. Always set it for MCP tests so you don't touch real data.
+- **The app and a bare `Store()` ignore `TODO_DB_PATH`** and always open the real DB: `~/Library/Application Support/TodoApp/db.sqlite`, or `TodoAppDev/` when compiled with `-D DEV_BUILD`. Opening it runs migrations on it. A test script or harness that compiles `TodoCore` must call `Store(url:)` with a throwaway path (e.g. under `/tmp`), never `Store()`.
 - The live app registers its MCP server on launch; a Claude Code session started **before** launch won't see it — start a fresh session to pick up MCP changes.
 
 ## Architecture

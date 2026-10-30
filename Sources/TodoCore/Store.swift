@@ -1158,6 +1158,27 @@ public final class Store: @unchecked Sendable {
         try runWrite("DELETE FROM tasks WHERE id=?;", [.int(id)])
     }
 
+    /// Delete many tasks in a single BEGIN IMMEDIATE, all or nothing: every id is
+    /// checked before any delete, so one missing task leaves every task in place.
+    /// A selected subtask already removed by its parent's cascade is not an error.
+    /// Returns how many tasks are gone, subtasks removed by the cascade included.
+    @discardableResult
+    public func bulkDeleteTasks(ids: [Int64]) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            for id in ids where getTaskUnlocked(id) == nil { throw StoreError.notFound("task \(id)") }
+            let before = queryInt("SELECT COUNT(*) FROM tasks;", []) ?? 0
+            for id in ids { try runWrite("DELETE FROM tasks WHERE id=?;", [.int(id)]) }
+            let after = queryInt("SELECT COUNT(*) FROM tasks;", []) ?? 0
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return Int(before - after)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
     /// Duplicate a task. With no target it clones into the same project; with a
     /// target project id it copies there (original kept). The copy gets a fresh code.
     /// A duplicate within the same project is for reuse: a fresh todo with no
@@ -1174,6 +1195,23 @@ public final class Store: @unchecked Sendable {
             let copy = try duplicateTaskUnlocked(id: id, toProjectId: toProjectId)
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return copy
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Duplicate many tasks, each within its own project, in a single BEGIN IMMEDIATE,
+    /// all or nothing: a missing task leaves no copy behind. Same rule as `duplicateTask`
+    /// with no target; the copies are returned in `ids` order.
+    @discardableResult
+    public func bulkDuplicateTasks(ids: [Int64]) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let copies = try ids.map { try duplicateTaskUnlocked(id: $0, toProjectId: nil) }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return copies
         } catch {
             exec("ROLLBACK;")
             throw error

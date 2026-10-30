@@ -179,6 +179,11 @@ final class AppModel: ObservableObject {
         } else {
             tasks = []
         }
+        // Drop selected tasks that are gone (e.g. deleted over MCP), so the all-or-nothing
+        // bulk actions don't keep failing on a task the user can no longer see.
+        let shown = Set(tasks.map(\.id))
+        let kept = selectedTaskIds.filter(shown.contains)
+        if kept != selectedTaskIds { selectedTaskIds = kept }
         inProgressTasks = active.filter { $0.status == .inProgress }
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
         // Publish only on a change: most polls and effort flushes leave the counts as
@@ -461,7 +466,11 @@ final class AppModel: ObservableObject {
     }
 
     func deleteTask(_ id: Int64) {
-        try? store.deleteTask(id: id)
+        do {
+            try store.deleteTask(id: id)
+        } catch {
+            flashToast("Couldn't delete: \(error)")
+        }
         reloadTasks()
     }
 
@@ -600,8 +609,15 @@ final class AppModel: ObservableObject {
         bulkSetStatus(status, waitingOn: waitingOn)
     }
 
+    /// One all-or-nothing store write: on failure no copy is made and the toast says why.
     func duplicateSelected() {
-        for id in selectedTaskIds { _ = try? store.duplicateTask(id: id) }
+        guard !selectedTaskIds.isEmpty else { return }
+        do {
+            try store.bulkDuplicateTasks(ids: orderedSelection)
+            flashToast("Duplicated \(selectionCount) \(selectionCount == 1 ? "task" : "tasks")")
+        } catch {
+            flashToast("Couldn't duplicate: \(error)")
+        }
         reloadTasks()
     }
 
@@ -610,6 +626,11 @@ final class AppModel: ObservableObject {
     // MARK: - Bulk actions (operate on selectedTaskIds)
 
     private var selectionCount: Int { selectedTaskIds.count }
+
+    /// The selection in list order, so copies get codes and positions in the order shown.
+    private var orderedSelection: [Int64] {
+        tasks.map(\.id).filter(selectedTaskIds.contains)
+    }
 
     /// `waitingOn` applies only to Waiting; without it each task keeps whom it waits on,
     /// and a task waiting on no one waits on the user.
@@ -642,10 +663,15 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
+    /// One all-or-nothing store write, like bulkAddTags.
     func bulkSetPriority(_ priority: Priority) {
-        for id in selectedTaskIds { try? store.updateTask(id: id, priority: priority) }
+        do {
+            try store.bulkUpdateTasks(ids: Array(selectedTaskIds), priority: priority)
+            flashToast("Set \(selectionCount) to \(priority.display) priority")
+        } catch {
+            flashToast("Couldn't set priority: \(error)")
+        }
         reloadTasks()
-        flashToast("Set \(selectionCount) to \(priority.display) priority")
     }
 
     func bulkAddTags(_ tags: [String]) {
@@ -675,7 +701,7 @@ final class AppModel: ObservableObject {
     /// One all-or-nothing store write, like bulkMove.
     func bulkCopy(toProject pid: Int64) {
         do {
-            try store.bulkMoveTasks(ids: Array(selectedTaskIds), toProjectId: pid, copy: true)
+            try store.bulkMoveTasks(ids: orderedSelection, toProjectId: pid, copy: true)
             flashToast("Copied \(selectionCount) tasks")
         } catch {
             flashToast("Couldn't copy: \(error)")
@@ -683,12 +709,19 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
+    /// One all-or-nothing store write: on failure no task is deleted, the selection is
+    /// kept and the toast says why (e.g. the MCP server holding the write lock).
     func bulkDelete() {
+        guard !selectedTaskIds.isEmpty else { return }
         let n = selectionCount
-        for id in selectedTaskIds { try? store.deleteTask(id: id) }
-        selectedTaskIds = []
+        do {
+            try store.bulkDeleteTasks(ids: Array(selectedTaskIds))
+            selectedTaskIds = []
+            flashToast("Deleted \(n) \(n == 1 ? "task" : "tasks")")
+        } catch {
+            flashToast("Couldn't delete: \(error)")
+        }
         reloadTasks()
-        flashToast("Deleted \(n) tasks")
     }
 
     // MARK: - Settings
