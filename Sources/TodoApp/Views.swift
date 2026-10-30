@@ -148,6 +148,7 @@ struct ProjectSidebar: View {
     @EnvironmentObject var model: AppModel
     @State private var showNew = false
     @State private var editing: Project?      // non-nil → edit sheet open
+    @State private var guideProject: Project?  // non-nil → its guide sheet open
     @State private var showTemplates = false
     @State private var archiving: ArchiveRequest?   // non-nil → archive confirm sheet open
     @AppStorage("qbArchivedExpanded") private var archivedExpanded = false
@@ -281,6 +282,7 @@ struct ProjectSidebar: View {
             }
         }
         .sheet(isPresented: $showTemplates) { TemplatesSheet() }
+        .sheet(item: $guideProject) { p in GuideSheet(project: p) }
         // The selected project just got archived (here or by an agent): open the Archived
         // group so its row, and the selection, stay visible.
         .onChange(of: selectedIsArchived) { _, archived in
@@ -342,6 +344,7 @@ struct ProjectSidebar: View {
         .contextMenu {
             Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
             Button("Edit…") { editing = p }
+            Button("Edit Guide…") { guideProject = p }
             // No new tasks in an archived project (the store refuses them too).
             if !p.isArchived {
                 if model.templates.isEmpty {
@@ -1586,6 +1589,7 @@ struct TaskDetailView: View {
                 Spacer()
                 CopyCodeButton(code: task.code)
             }
+            CommandRow(command: AgentCommand.work(task.code), note: "Paste into Claude Code to start on this task")
         }
     }
 
@@ -2381,6 +2385,7 @@ struct SettingsView: View {
     @State private var autoAdvance = true
     @State private var breaksEffort = false
     @State private var mcpStatus = ""
+    @State private var showGuide = false
 
     var body: some View {
         Form {
@@ -2418,6 +2423,14 @@ struct SettingsView: View {
                 }
             }
             Section {
+                Button("Edit Guide for All Projects…") { showGuide = true }
+            } header: {
+                Text("Agent Guide")
+            } footer: {
+                Text("How agents work on your tasks. A project's own guide is in its menu in the sidebar (Edit Guide…).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
                 ForEach(ShortcutAction.allCases) { a in
                     HStack {
                         Text(a.title)
@@ -2451,6 +2464,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 460, height: 640)
+        .sheet(isPresented: $showGuide) { GuideSheet(project: nil) }
         .onAppear { loadValues() }
         .onChange(of: focusMin) { _, _ in save() }
         .onChange(of: shortMin) { _, _ in save() }

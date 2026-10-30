@@ -440,6 +440,27 @@ final class AppModel: ObservableObject {
         reloadAll()
     }
 
+    // MARK: - Agent guides
+
+    /// The current guide of a scope (`projectId` nil = every project); nil if never saved
+    /// or unreadable.
+    func guide(projectId: Int64?) -> GuideVersion? {
+        (try? store.guide(projectId: projectId)) ?? nil
+    }
+
+    func guideHistory(projectId: Int64?) -> [GuideVersion] {
+        (try? store.guideHistory(projectId: projectId, limit: 50)) ?? []
+    }
+
+    /// Save the user's edit of a guide, made from version `basedOn` (nil: the scope had
+    /// none). Edits within 10 minutes of the user's last save stay one version (the editor
+    /// saves as you type). Throws GuideConflict when another save (an agent's) came first.
+    @discardableResult
+    func saveGuide(projectId: Int64?, markdown: String, basedOn: Int64?, reason: String? = nil) throws -> GuideVersion {
+        try store.saveGuide(projectId: projectId, markdown: markdown, author: .user, reason: reason,
+                            mergeWindow: reason == nil ? 600 : nil, basedOn: .some(basedOn))
+    }
+
     /// Archive or unarchive a project. It stays selected (an archived project is still
     /// viewable); a failed write surfaces as a toast.
     func setArchived(_ id: Int64, _ archived: Bool) {

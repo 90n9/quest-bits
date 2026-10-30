@@ -47,20 +47,9 @@ final class MCPServer: @unchecked Sendable {
 
     // MARK: - Dispatch
 
-    /// What the server tells the client's model up front (MCP `instructions`): the ask
-    /// loop rules, so every session gets them with the tools.
-    static let instructions = """
-        QuestBits is the user's task tracker. Tasks have codes (QUE-3); every tool that takes an id also takes a code.
-        Ask loop — when you need the user to decide:
-        - Call ask_user with 2–4 options, the one you recommend, and a one-line reason; then move straight on to other work. Never end your turn just to wait.
-        - Pick a short session label (e.g. the repo and ticket) and pass it as `session` to ask_user, get_answers and wait_for_answers, so you only pick up answers to your own questions.
-        - Before starting new work, call get_answers and finish answered questions first (resume_question, then act on the answer).
-        - With nothing else to do but questions still open, call wait_for_answers; when it returns with no answers, call it again or stop with a summary.
-        - Push, release, posting, or anything irreversible: always ask and wait for the answer.
-        - When you decide something yourself, record it with add_note kind decision (what, why, the options not taken).
-        - If you find the answer yourself, withdraw the question with cancel_question.
-        Closing a task: a summary note is optional (update_task note), never required.
-        """
+    /// What the server tells the client's model up front (MCP `instructions`): when to use
+    /// QuestBits at all, and to call get_guide for the rest (AgentGuide).
+    static let instructions = AgentGuide.instructions
 
     private func handle(_ msg: [String: Any]) {
         let method = msg["method"] as? String ?? ""
@@ -69,8 +58,8 @@ final class MCPServer: @unchecked Sendable {
         case "initialize":
             respond(id: id, result: [
                 "protocolVersion": "2024-11-05",
-                "capabilities": ["tools": [:] as [String: Any]],
-                "serverInfo": ["name": "todo-mcp", "version": "1.0.0"],
+                "capabilities": ["tools": [:] as [String: Any], "prompts": [:] as [String: Any]],
+                "serverInfo": ["name": "todo-mcp", "version": AgentGuide.version],
                 "instructions": Self.instructions
             ])
         case "notifications/initialized":
@@ -86,6 +75,22 @@ final class MCPServer: @unchecked Sendable {
             }
         case "tools/list":
             respond(id: id, result: ["tools": Self.toolDefinitions])
+        case "prompts/list":
+            respond(id: id, result: ["prompts": Self.promptDefinitions])
+        case "prompts/get":
+            let params = msg["params"] as? [String: Any] ?? [:]
+            let args = params["arguments"] as? [String: Any] ?? [:]
+            switch params["name"] as? String {
+            case AgentGuide.workPrompt:
+                guard let code = (args["code"] as? String)?.trimmingCharacters(in: .whitespaces), !code.isEmpty else {
+                    return respondError(id: id, code: -32602, message: "missing argument: code (the task's code, e.g. QUE-3)")
+                }
+                respondPrompt(id: id, description: "Work on QuestBits task \(code)", text: AgentGuide.workPromptText(code: code))
+            case AgentGuide.resumePrompt:
+                respondPrompt(id: id, description: "Pick up answers to your QuestBits questions", text: AgentGuide.resumePromptText)
+            default:
+                respondError(id: id, code: -32602, message: "unknown prompt: \(params["name"] as? String ?? "")")
+            }
         case "tools/call":
             let params = msg["params"] as? [String: Any] ?? [:]
             if params["name"] as? String == "wait_for_answers" {
@@ -109,6 +114,24 @@ final class MCPServer: @unchecked Sendable {
         } catch {
             respondToolError(id: id, error)
         }
+    }
+
+    /// MCP prompts advertised via prompts/list; Claude Code offers them as
+    /// /mcp__<server>__<name> commands (the app shows them with a copy button).
+    static let promptDefinitions: [[String: Any]] = [
+        ["name": AgentGuide.workPrompt,
+         "description": "Work on a QuestBits task: read its guide and the task, pick up answers, then do it.",
+         "arguments": [["name": "code", "description": "the task's code, e.g. QUE-3", "required": true]]],
+        ["name": AgentGuide.resumePrompt,
+         "description": "Pick up the user's answers to your QuestBits questions and carry on.",
+         "arguments": [] as [[String: Any]]],
+    ]
+
+    private func respondPrompt(id: Any?, description: String, text: String) {
+        respond(id: id, result: [
+            "description": description,
+            "messages": [["role": "user", "content": ["type": "text", "text": text]]],
+        ])
     }
 
     private func respondText(id: Any?, _ text: String) {
@@ -404,9 +427,11 @@ final class MCPServer: @unchecked Sendable {
             } else {
                 recurArg = .none
             }
-            // A subtask must not recur — reject a non-nil recurrence on a subtask.
+            // A subtask must not recur — reject a non-nil recurrence on a task that is a
+            // subtask after this update (a parent_code null in it makes it top-level).
+            let parent = try parentArg(args)
             if let rec = args["recurrence"] as? String, !rec.isEmpty,
-               try store.getTask(id: id).parentId != nil {
+               try parent ?? store.getTask(id: id).parentId != nil {
                 throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
             }
             let status = try statusArg(args)
@@ -424,6 +449,7 @@ final class MCPServer: @unchecked Sendable {
                 estimateSeconds: parseMinutes(args["estimate_minutes"]).map { $0 * 60 },
                 waitingOn: try parseWaitingOn(args["waiting_on"]),
                 waitingReason: try waitingReasonArg(args),
+                parentId: parent,
                 note: note
             )
             return try jsonString(taskDict(store.getTask(id: id)))
@@ -455,7 +481,8 @@ final class MCPServer: @unchecked Sendable {
             try store.bulkUpdateTasks(
                 ids: ids, status: try statusArg(args), priority: parsePriority(args["priority"]),
                 dueDate: dueArg, addTags: parseTags(args["add_tags"]),
-                waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args))
+                waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args),
+                parentId: try parentArg(args))
             return "updated \(ids.count) tasks"
 
         case "bulk_move_tasks":
@@ -559,6 +586,22 @@ final class MCPServer: @unchecked Sendable {
             let q = try store.cancelQuestion(id: try requireInt(args, "id"), reason: args["reason"] as? String ?? "",
                                              sessionId: try sessionArg(args))
             return try jsonString(questionDict(q))
+
+        case "get_guide":
+            return try guideText(projectId: try guideProjectArg(args))
+
+        case "update_guide":
+            let pid = try guideScopeArg(args)
+            // "" is a valid guide: it clears it (requireString would refuse it).
+            guard let markdown = args["markdown"] as? String else { throw MCPError.missingArg("markdown") }
+            let saved = try store.saveGuide(projectId: pid, markdown: markdown, author: .agent,
+                                            sessionId: try sessionArg(args), reason: args["reason"] as? String)
+            return try jsonString(["version": saved.id, "scope": try scopeName(pid), "ts": iso(saved.timestamp)])
+
+        case "get_guide_history":
+            let pid = try guideScopeArg(args)
+            let versions = try store.guideHistory(projectId: pid, limit: Int(try limitArg(args, "limit", default: 5, max: 50)))
+            return try jsonString(["scope": try scopeName(pid), "versions": versions.map(guideVersionDict)])
 
         case "daily_stats":
             let stats = try store.dailyStats()
@@ -759,6 +802,69 @@ final class MCPServer: @unchecked Sendable {
     private func parsePriority(_ v: Any?) -> Priority? {
         guard let s = v as? String else { return nil }
         return Priority(rawValue: s)
+    }
+
+    // MARK: - Guides
+
+    /// get_guide's markdown: the built-in guide, the user's guide for every project, and
+    /// the project's guide when `projectId` is given; a part never saved is left out.
+    private func guideText(projectId: Int64?) throws -> String {
+        var parts = ["# QuestBits guide (built-in, \(AgentGuide.version))\n\n\(AgentGuide.builtIn)"]
+        func add(_ title: String, _ v: GuideVersion?) {
+            guard let v, !v.markdown.isEmpty else { return }
+            var by = v.author == .user ? "the user" : "an agent"
+            if let s = v.sessionId { by += " (session \(s))" }
+            parts.append("# \(title) (version \(v.id), \(iso(v.timestamp)) by \(by))\n\n\(v.markdown)")
+        }
+        add("The user's guide, all projects", try store.guide(projectId: nil))
+        if let projectId { add("Project \(try scopeName(projectId)) guide", try store.guide(projectId: projectId)) }
+        return parts.joined(separator: "\n\n")
+    }
+
+    /// get_guide's project: from a task (`id`, or `code` naming a task) or a project
+    /// (`project_id`/`project_code`, or `code` naming a project); none = no project part.
+    private func guideProjectArg(_ args: [String: Any]) throws -> Int64? {
+        if given(args, "project_id", "project_code") {
+            return try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+        }
+        if let code = args["code"] as? String, !given(args, "id"),
+           store.taskId(forCode: code) == nil, let pid = store.projectId(forCode: code) {
+            return pid
+        }
+        guard given(args, "id", "code") else { return nil }
+        return try store.getTask(id: try resolveTaskId(args)).projectId
+    }
+
+    /// update_guide / get_guide_history scope: `global` true (nil) or one project, not both.
+    private func guideScopeArg(_ args: [String: Any]) throws -> Int64? {
+        let global = try boolArg(args, "global") ?? false
+        let project = given(args, "project_id", "project_code")
+        guard global != project else {
+            throw MCPError.invalidArg("give either global: true or project_id/project_code")
+        }
+        return project ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+    }
+
+    private func scopeName(_ projectId: Int64?) throws -> String {
+        guard let projectId else { return "global" }
+        guard let code = store.projectCode(id: projectId) else { throw StoreError.notFound("project \(projectId)") }
+        return code
+    }
+
+    private func guideVersionDict(_ v: GuideVersion) -> [String: Any] {
+        var d: [String: Any] = ["version": v.id, "ts": iso(v.timestamp), "author": v.author.rawValue, "markdown": v.markdown]
+        if let s = v.sessionId { d["session"] = s }
+        if let r = v.reason { d["reason"] = r }
+        return d
+    }
+
+    /// update_task / bulk_update_tasks `parent_code` / `parent_id`: absent = leave alone,
+    /// null = make it a top-level task, a task = make it a subtask of that task.
+    private func parentArg(_ args: [String: Any]) throws -> Int64?? {
+        let present = ["parent_id", "parent_code"].filter { args.keys.contains($0) }
+        guard !present.isEmpty else { return .none }
+        if present.allSatisfy({ args[$0] is NSNull }) { return .some(nil) }
+        return .some(try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code"))
     }
 
     /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).
