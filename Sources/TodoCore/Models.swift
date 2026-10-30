@@ -284,6 +284,24 @@ public enum NoteAuthor: String, Codable, CaseIterable, Sendable {
     public var display: String { self == .user ? "You" : "Agent" }
 }
 
+/// One saved version of an agent guide (Store.saveGuide). `projectId` nil is the guide
+/// for every project. The newest version of a scope is its guide.
+public struct GuideVersion: Identifiable, Equatable, Sendable {
+    public let id: Int64
+    public let projectId: Int64?
+    public var timestamp: Date
+    public var markdown: String
+    public let author: NoteAuthor
+    public let sessionId: String?
+    public let reason: String?
+
+    public init(id: Int64, projectId: Int64?, timestamp: Date, markdown: String, author: NoteAuthor,
+                sessionId: String?, reason: String?) {
+        self.id = id; self.projectId = projectId; self.timestamp = timestamp; self.markdown = markdown
+        self.author = author; self.sessionId = sessionId; self.reason = reason
+    }
+}
+
 /// A timestamped entry in a task's log. Notes are inserted, never rewritten by
 /// another writer, so concurrent writers never overwrite each other (unlike appending
 /// to `detail`). The one exception: the user may edit their own note in the app, and

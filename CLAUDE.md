@@ -66,6 +66,9 @@ SwiftUI app (window + menu bar)  ─┐                        ┌─ todo-mcp (
 - **Self-registration:** on first launch the app writes itself into `~/.claude.json` under `mcpServers.quest-bits` — `mcpServers.quest-bits-dev` for dev-flavor builds (`TodoApp/MCPRegistration.swift`). Each flavor auto-migrates its own legacy key name (`todo` / `todo-dev`) when it points at a QuestBits binary.
 - **App scene** is a `WindowGroup` + `MenuBarExtra` (`TodoApp/TodoApp.swift`) — the menu-bar countdown is the real `MenuBarExtra`, not a hand-rolled `NSStatusItem`. Pomodoro logic in `PomodoroEngine.swift`, local notifications in `NotificationScheduler.swift`, key commands in `Shortcuts.swift`. Nearly all UI is in `Views.swift`.
 
+### Agent guide, instructions and prompts
+What agents are told ships in the binary (`TodoCore/AgentGuide.swift`), so it updates with the app: the MCP `instructions` (short and scoped: ignore QuestBits unless the session works on a QuestBits task), the built-in guide that `get_guide` returns first, and the MCP prompts (`work`, `resume`; Claude Code shows them as `/mcp__quest-bits__<name>`, which the app offers to copy). Bump `AgentGuide.version` when that text changes. The user's guide and each project's guide are append-only versions in `guide_versions` (`Store.saveGuide`); `get_guide` returns built-in, then the user's guide, then the project's.
+
 ### id-or-code duality
 Projects have a short code (`GEN`), tasks have one too (`GEN-3`). **Every MCP tool that takes an `id` also accepts a `code`** — this is a core convenience (`move_task {code:"GEN-3", to_project_code:"DFC"}`). When adding or changing a tool, keep both lookup paths working.
 

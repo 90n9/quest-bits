@@ -9,10 +9,10 @@ enum MCPRegistration {
     /// `legacyKey` is the name older builds used; each flavor migrates only
     /// its own legacy entry so it never touches the other flavor's config.
     #if DEV_BUILD
-    private static let serverKey = "quest-bits-dev"
+    static let serverKey = "quest-bits-dev"
     private static let legacyKey = "todo-dev"
     #else
-    private static let serverKey = "quest-bits"
+    static let serverKey = "quest-bits"
     private static let legacyKey = "todo"
     #endif
 

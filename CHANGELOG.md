@@ -17,6 +17,35 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.4.2] - 2026-10-30
+
+### Added
+
+- **Agent guides.** Agents get QuestBits' built-in rules with `get_guide`,
+  then your guide for every project, then the project's own guide (for
+  example "render a preview before exporting" for an animation project).
+  Edit your guide in Settings → Agent Guide, and a project's guide from its
+  menu in the sidebar (Edit Guide…). History lists every version, yours and
+  agents', and can restore one.
+- MCP `update_guide` lets an agent change a guide, but only when you asked it
+  to or said yes to its question. Every change is a new version with its
+  reason. `get_guide_history` lists the versions.
+- **Commands to paste into Claude Code.** A task's Detail shows
+  `/mcp__quest-bits__work <code>` with a copy button: it starts a session on
+  that task. The Questions page shows `/mcp__quest-bits__resume` (and a
+  `/loop` form) for a session that stopped waiting for your answers.
+- MCP `update_task` and `bulk_update_tasks` take `parent_code` (or
+  `parent_id`) to move a task under another top-level task of the same
+  project, or `null` to make it top-level again. The change is in the task's
+  history.
+
+### Changed
+
+- The rules QuestBits gives every Claude Code session are shorter and say
+  when they apply: only while the session works on a QuestBits task. A quick
+  question or routine work in another repo no longer brings in the ask loop.
+  The full rules moved to `get_guide`.
+
 ## [1.4.1] - 2026-10-30
 
 ### Changed

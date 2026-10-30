@@ -18,6 +18,10 @@ extension MCPServer {
         let estimateInt: [String: Any] = ["type": "integer", "description": "planned effort in minutes (0 = unset). Compared against actual tracked effort_minutes."]
         let noteKindEnum: [String: Any] = ["type": "string", "enum": NoteKind.writable.map(\.rawValue)]
         let sessionStr: [String: Any] = ["type": "string", "description": "optional label for your agent session, recorded with what you write; questions asked with one can be filtered by it"]
+        let parentStr: [String: Any] = ["type": ["string", "null"], "description": "code of a top-level task in the same project to make this a subtask of; null makes it a top-level task again"]
+        let parentInt: [String: Any] = ["type": ["integer", "null"], "description": "id form of parent_code"]
+        let guideScope: [String: Any] = ["global": ["type": "boolean", "description": "true: the user's guide for every project"] as [String: Any],
+                                         "project_id": int, "project_code": str]
         let questionFilter: [String: Any] = ["project_id": int, "project_code": str,
                                              "session": ["type": "string", "description": "only questions asked with this session label"] as [String: Any]]
 
@@ -80,12 +84,12 @@ extension MCPServer {
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Optional `note` adds a note in the same write, linked to the status change: its `note_kind` defaults to summary when the update closes the task (done/dropped) and to note otherwise. A summary is never required to close a task. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Optional `note` adds a note in the same write, linked to the status change: its `note_kind` defaults to summary when the update closes the task (done/dropped) and to note otherwise. A summary is never required to close a task. `parent_code`/`parent_id` moves the task under a top-level task of the same project (one level of nesting: a task with subtasks, or a recurring one, cannot become a subtask); null makes it top-level again. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
                 "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
-                "estimate_minutes": estimateInt,
+                "estimate_minutes": estimateInt, "parent_code": parentStr, "parent_id": parentInt,
                 "note": ["type": "string", "description": "optional note to add with this update, e.g. a closing summary: what was done, files/PRs, what is left"] as [String: Any],
                 "note_kind": noteKindEnum, "session": sessionStr
              ])],
@@ -103,11 +107,12 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "bulk_update_tasks",
-             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, waiting_on, waiting_reason, priority, due_date, add_tags to all. add_tags merges (keeps existing). Waiting rules match update_task. All or nothing: if any task fails (e.g. the waiting rule), no task changes.",
+             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, waiting_on, waiting_reason, priority, due_date, add_tags, parent_code/parent_id to all. add_tags merges (keeps existing). Waiting and parent rules match update_task. All or nothing: if any task fails (e.g. the waiting rule), no task changes.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
-                "priority": priorityEnum, "due_date": dateStr, "add_tags": tagsArr
+                "priority": priorityEnum, "due_date": dateStr, "add_tags": tagsArr,
+                "parent_code": parentStr, "parent_id": parentInt
              ])],
 
             ["name": "bulk_move_tasks",
@@ -205,6 +210,24 @@ extension MCPServer {
              "inputSchema": obj([
                 "template_id": int, "project_id": int, "project_code": str
              ], required: ["template_id"])],
+
+            ["name": "get_guide",
+             "description": "How to work on the user's tasks, as markdown: QuestBits' built-in rules, then the user's guide for every project, then the project's guide (each later part adds to or tightens the earlier ones). Call it before you start on a task: `code` is the task's code (or a project's code); `id` (task) or `project_id`/`project_code` also work. With none, the project part is left out. Each part's header gives its version.",
+             "inputSchema": obj(["code": str, "id": int, "project_id": int, "project_code": str])],
+
+            ["name": "update_guide",
+             "description": "Replace a guide with `markdown`: the user's guide for every project (`global` true) or a project's (`project_id`/`project_code`); give exactly one. Only when the user asked for it, or after ask_user got a yes. Saves a new version (get_guide_history keeps the earlier ones; an unchanged text saves nothing). `reason` says why. Returns {version, scope, ts}.",
+             "inputSchema": obj(guideScope.merging([
+                "markdown": str,
+                "reason": ["type": "string", "description": "why the guide changes (shown in its history)"] as [String: Any],
+                "session": sessionStr
+             ]) { a, _ in a }, required: ["markdown"])],
+
+            ["name": "get_guide_history",
+             "description": "Versions of a guide, newest first (the first is the current one): the user's guide for every project (`global` true) or a project's (`project_id`/`project_code`). Each has version, ts, author (user|agent), session and reason when known, and markdown. `limit` default 5, max 50.",
+             "inputSchema": obj(guideScope.merging([
+                "limit": ["type": "integer", "minimum": 1, "maximum": 50] as [String: Any]
+             ]) { a, _ in a })],
 
             ["name": "daily_stats",
              "description": "Today's pomodoro stats: completed count and total focus minutes.",

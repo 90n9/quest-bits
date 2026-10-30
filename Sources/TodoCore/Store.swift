@@ -318,6 +318,22 @@ public final class Store: @unchecked Sendable {
         exec("CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status, asked_at);")
         exec("CREATE INDEX IF NOT EXISTS idx_questions_task ON questions(task_id);")
 
+        // --- Additive migration: agent guides (1.4.2) ---
+        // Append-only versions: the newest row of a scope is its guide, and a restore writes
+        // the old text as a new version. project_id NULL is the guide for every project.
+        exec("""
+        CREATE TABLE IF NOT EXISTS guide_versions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            ts          REAL NOT NULL,
+            markdown    TEXT NOT NULL,
+            author      TEXT NOT NULL CHECK(author IN \(Self.sqlList(NoteAuthor.allCases.map(\.rawValue)))),
+            session_id  TEXT,
+            reason      TEXT
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_guide_versions_project ON guide_versions(project_id, id);")
+
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
         repairStatusFields()
     }
@@ -1074,6 +1090,7 @@ public final class Store: @unchecked Sendable {
                            dueDate: Date?? = nil, tags: [String]? = nil, recurrence: String?? = nil,
                            estimateSeconds: Int? = nil,
                            waitingOn: WaitingOn? = nil, waitingReason: String?? = nil,
+                           parentId: Int64?? = nil,
                            note: NoteDraft? = nil) throws {
         let noteText = try note.map { try Self.noteBody($0.text) }
         lock.lock(); defer { lock.unlock() }
@@ -1081,7 +1098,8 @@ public final class Store: @unchecked Sendable {
             let eventId = try applyTaskUpdateUnlocked(
                 id: id, title: title, detail: detail, link: link, status: status, priority: priority,
                 dueDate: dueDate, tags: tags, recurrence: recurrence, estimateSeconds: estimateSeconds,
-                waitingOn: waitingOn, waitingReason: waitingReason, spawnRecurrence: spawnRecurrence)
+                waitingOn: waitingOn, waitingReason: waitingReason, parentId: parentId,
+                spawnRecurrence: spawnRecurrence)
             if let note, let noteText {
                 _ = try insertNoteUnlocked(taskId: id, text: noteText, kind: note.kind, author: note.author,
                                            sessionId: note.sessionId, statusEventId: eventId)
@@ -1092,7 +1110,9 @@ public final class Store: @unchecked Sendable {
         // may spawn the next occurrence — two processes could each spawn one), and the
         // waiting rule depends on whether the task is already waiting. A note rides along
         // in the same transaction, so the update and its note land together or not at all.
+        // A new parent is checked against the parent's row and the task's subtasks.
         let needsTransaction = status != nil || Self.setsWaitingFields(waitingOn, waitingReason) || note != nil
+            || parentId != nil
         guard needsTransaction else { return try apply(true) }
         do {
             try beginImmediate()
@@ -1122,7 +1142,7 @@ public final class Store: @unchecked Sendable {
     public func bulkUpdateTasks(ids: [Int64], status: TaskStatus? = nil, priority: Priority? = nil,
                                 dueDate: Date?? = nil, addTags: [String]? = nil,
                                 waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
-                                waitingReason: String?? = nil) throws {
+                                waitingReason: String?? = nil, parentId: Int64?? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         let apply = { [self] (spawnRecurrence: Bool) in
             try beginImmediate()
@@ -1130,7 +1150,8 @@ public final class Store: @unchecked Sendable {
                 do {
                     try applyTaskUpdateUnlocked(id: id, status: status, priority: priority, dueDate: dueDate,
                                                 addTags: addTags, waitingOn: waitingOn, waitingOnDefault: waitingOnDefault,
-                                                waitingReason: waitingReason, spawnRecurrence: spawnRecurrence)
+                                                waitingReason: waitingReason, parentId: parentId,
+                                                spawnRecurrence: spawnRecurrence)
                 } catch StoreError.invalid(let msg) {
                     // Name the task that failed the batch.
                     let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(id)]) ?? "task \(id)"
@@ -1168,8 +1189,15 @@ public final class Store: @unchecked Sendable {
                                          dueDate: Date?? = nil, tags: [String]? = nil, addTags: [String]? = nil,
                                          recurrence: String?? = nil, estimateSeconds: Int? = nil,
                                          waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
-                                         waitingReason: String?? = nil, spawnRecurrence: Bool) throws -> Int64? {
+                                         waitingReason: String?? = nil, parentId: Int64?? = nil,
+                                         spawnRecurrence: Bool) throws -> Int64? {
         guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        // parentId .some(id): make it a subtask of that task; .some(nil): a top-level task.
+        var newParent: Int64?? = nil
+        if let parentId, parentId != old.parentId {
+            if let pid = parentId { try checkNewParentUnlocked(old, pid, recurrence: recurrence) }
+            newParent = .some(parentId)
+        }
         // A move to waiting with no who keeps the task's own, else takes the default.
         let waitingOn = waitingOn ?? (status == .waiting && old.waitingOn == nil ? waitingOnDefault : nil)
         if let msg = Self.waitingViolation(status: status ?? old.status, waitingOn: waitingOn ?? old.waitingOn,
@@ -1213,6 +1241,12 @@ public final class Store: @unchecked Sendable {
             }
         }
         if let estimateSeconds { sets.append("estimate_seconds=?"); binds.append(.int(Int64(max(0, estimateSeconds)))) }
+        if let newParent {
+            sets.append("parent_id=?"); binds.append(newParent.map(SQLValue.int) ?? .null)
+            // Last among its new siblings (sort_order runs across the whole project).
+            sets.append("sort_order=(SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)")
+            binds.append(.int(old.projectId))
+        }
         guard !sets.isEmpty else { return nil }
         sets.append("updated_at=?"); binds.append(.int(now))
         binds.append(.int(id))
@@ -1275,7 +1309,34 @@ public final class Store: @unchecked Sendable {
             let fmt: (Int) -> String = { $0 == 0 ? "none" : "\($0 / 60)m" }
             logEvent(id, "estimate", fmt(old.estimateSeconds), fmt(max(0, estimateSeconds)))
         }
+        if let newParent {
+            let code: (Int64?) -> String = { [self] in
+                $0.flatMap { queryString("SELECT code FROM tasks WHERE id=?;", [.int($0)]) } ?? ""
+            }
+            logEvent(id, "parent", code(old.parentId), code(newParent))
+        }
         return statusEventId
+    }
+
+    /// Can `task` become a subtask of `parentId`? One level of nesting: the parent is a
+    /// top-level task and the task has no subtasks of its own. Same project (move_task
+    /// first), never itself, and the task must not recur: a recurring subtask would spawn
+    /// a detached top-level copy. `recurrence` is the same update's recurrence write.
+    private func checkNewParentUnlocked(_ task: TodoTask, _ parentId: Int64, recurrence: String??) throws {
+        guard parentId != task.id else { throw StoreError.invalid("a task cannot be its own parent") }
+        guard let parent = getTaskUnlocked(parentId) else { throw StoreError.notFound("task \(parentId)") }
+        guard parent.parentId == nil else {
+            throw StoreError.invalid("\(parent.code) is a subtask; the parent must be a top-level task (one level of nesting)")
+        }
+        guard parent.projectId == task.projectId else {
+            throw StoreError.invalid("\(parent.code) is in another project; move the task there first (move_task)")
+        }
+        guard subtasksUnlocked(task.id).isEmpty else {
+            throw StoreError.invalid("\(task.code) has subtasks of its own, so it cannot become a subtask")
+        }
+        if let rule = recurrence ?? task.recurrence, !rule.isEmpty {
+            throw StoreError.invalid("\(task.code) recurs and a subtask cannot; clear its recurrence first (recurrence null)")
+        }
     }
 
     static func shortDate(_ d: Date) -> String {
@@ -1653,6 +1714,91 @@ public final class Store: @unchecked Sendable {
             questionId: int64Opt(8),
             editedAt: sqlite3_column_type(stmt, 9) == SQLITE_NULL ? nil
                 : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9)))
+    }
+
+    // MARK: - Agent guides
+
+    /// The current guide of a scope (`projectId` nil = the guide for every project): its
+    /// newest version, or nil when none was ever saved.
+    public func guide(projectId: Int64?) throws -> GuideVersion? {
+        lock.lock(); defer { lock.unlock() }
+        return try readGuides("SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT 1;",
+                              [projectId.map(SQLValue.int) ?? .null]).first
+    }
+
+    /// A scope's versions, newest first (the first is the current guide).
+    public func guideHistory(projectId: Int64?, limit: Int = 20) throws -> [GuideVersion] {
+        lock.lock(); defer { lock.unlock() }
+        return try readGuides("SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT ?;",
+                              [projectId.map(SQLValue.int) ?? .null, .int(Int64(max(0, limit)))])
+    }
+
+    /// Save a scope's guide as a new version; an unchanged text saves nothing and returns
+    /// the current version. `mergeWindow` (the app's autosave): when the current version
+    /// is the user's own and was saved less than that long ago, it is updated in place, so
+    /// one sitting of typing is one version. Agent saves are always a new version. Read and
+    /// written in one BEGIN IMMEDIATE, so a concurrent save is never lost or merged into.
+    @discardableResult
+    public func saveGuide(projectId: Int64?, markdown: String, author: NoteAuthor, sessionId: String? = nil,
+                          reason: String? = nil, mergeWindow: TimeInterval? = nil) throws -> GuideVersion {
+        let text = markdown.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+        let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
+        let why = reason.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        let scope: SQLValue = projectId.map(SQLValue.int) ?? .null
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            if let projectId, queryInt("SELECT id FROM projects WHERE id=?;", [.int(projectId)]) == nil {
+                throw StoreError.notFound("project \(projectId)")
+            }
+            let current = try readGuides(
+                "SELECT \(Self.guideCols) FROM guide_versions WHERE project_id IS ? ORDER BY id DESC LIMIT 1;", [scope]).first
+            let now = Date()
+            var saved: GuideVersion
+            if let current, current.markdown == text {
+                saved = current
+            } else if var current, let mergeWindow, author == .user, current.author == .user,
+                      now.timeIntervalSince(current.timestamp) < mergeWindow {
+                try runWrite("UPDATE guide_versions SET markdown=?, ts=? WHERE id=?;",
+                             [.text(text), .double(now.timeIntervalSince1970), .int(current.id)])
+                current.markdown = text
+                current.timestamp = now
+                saved = current
+            } else {
+                try runWrite(
+                    "INSERT INTO guide_versions (project_id, ts, markdown, author, session_id, reason) VALUES (?, ?, ?, ?, ?, ?);",
+                    [scope, .double(now.timeIntervalSince1970), .text(text), .text(author.rawValue),
+                     session.map(SQLValue.text) ?? .null, why.map(SQLValue.text) ?? .null])
+                saved = GuideVersion(id: lastInsertId(), projectId: projectId, timestamp: now, markdown: text,
+                                     author: author, sessionId: session, reason: why)
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return saved
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private static let guideCols = "id, project_id, ts, markdown, author, session_id, reason"
+
+    private func readGuides(_ sql: String, _ binds: [SQLValue]) throws -> [GuideVersion] {
+        let stmt = try prepare(sql, binds)
+        defer { sqlite3_finalize(stmt) }
+        var out: [GuideVersion] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(GuideVersion(
+                id: sqlite3_column_int64(stmt, 0),
+                projectId: sqlite3_column_type(stmt, 1) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 1),
+                timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                markdown: colText(stmt, 3),
+                author: NoteAuthor(rawValue: colText(stmt, 4)) ?? .user,
+                sessionId: colTextOpt(stmt, 5), reason: colTextOpt(stmt, 6)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
     }
 
     // MARK: - Questions (ask loop)

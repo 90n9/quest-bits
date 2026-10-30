@@ -440,6 +440,31 @@ final class AppModel: ObservableObject {
         reloadAll()
     }
 
+    // MARK: - Agent guides
+
+    /// The current guide of a scope (`projectId` nil = every project); nil if never saved
+    /// or unreadable.
+    func guide(projectId: Int64?) -> GuideVersion? {
+        (try? store.guide(projectId: projectId)) ?? nil
+    }
+
+    func guideHistory(projectId: Int64?) -> [GuideVersion] {
+        (try? store.guideHistory(projectId: projectId, limit: 50)) ?? []
+    }
+
+    /// Save the user's edit of a guide. Edits within 10 minutes of the user's last save
+    /// stay one version (the editor saves as you type). Toasts on failure.
+    @discardableResult
+    func saveGuide(projectId: Int64?, markdown: String, reason: String? = nil) -> GuideVersion? {
+        do {
+            return try store.saveGuide(projectId: projectId, markdown: markdown, author: .user, reason: reason,
+                                       mergeWindow: reason == nil ? 600 : nil)
+        } catch {
+            flashToast("Couldn't save the guide: \(error)")
+            return nil
+        }
+    }
+
     /// Archive or unarchive a project. It stays selected (an archived project is still
     /// viewable); a failed write surfaces as a toast.
     func setArchived(_ id: Int64, _ archived: Bool) {
