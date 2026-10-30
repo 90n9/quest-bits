@@ -16,6 +16,10 @@ extension MCPServer {
         let tagsArr: [String: Any] = ["type": "array", "items": str]
         let recurrenceEnum: [String: Any] = ["type": "string", "enum": ["daily", "weekly", "monthly"], "description": "repeat interval; null to clear. On completion, spawns the next occurrence with the due date advanced."]
         let estimateInt: [String: Any] = ["type": "integer", "description": "planned effort in minutes (0 = unset). Compared against actual tracked effort_minutes."]
+        let noteKindEnum: [String: Any] = ["type": "string", "enum": NoteKind.writable.map(\.rawValue)]
+        let sessionStr: [String: Any] = ["type": "string", "description": "optional label for your agent session, recorded with what you write; questions asked with one can be filtered by it"]
+        let questionFilter: [String: Any] = ["project_id": int, "project_code": str,
+                                             "session": ["type": "string", "description": "only questions asked with this session label"] as [String: Any]]
 
         return [
             ["name": "list_projects",
@@ -60,7 +64,7 @@ extension MCPServer {
              ])],
 
             ["name": "get_task",
-             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{ts, text, kind}] (kind omitted when \"note\"; no `notes` key when there are none), and `more_notes: true` when older notes were left out.",
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, due_date, detail, effort or estimate; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{id, ts, text, kind, author, session, edited_at, question_id}] (kind omitted when \"note\"; author user|agent, absent on notes from before 1.4.0; no `notes` key when there are none), and `more_notes: true` when older notes were left out. Questions still open or answered-but-not-resumed (see ask_user) are in `questions`.",
              "inputSchema": obj([
                 "id": int, "code": str,
                 "notes_limit": ["type": "integer", "minimum": 0, "maximum": 100, "description": "how many latest notes to include (default 5, 0 = none, max 100)"] as [String: Any]
@@ -76,12 +80,14 @@ extension MCPServer {
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, due_date:null, or recurrence:null to clear them. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Optional `note` adds a note in the same write, linked to the status change: its `note_kind` defaults to summary when the update closes the task (done/dropped) and to note otherwise. A summary is never required to close a task. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
                 "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
-                "estimate_minutes": estimateInt
+                "estimate_minutes": estimateInt,
+                "note": ["type": "string", "description": "optional note to add with this update, e.g. a closing summary: what was done, files/PRs, what is left"] as [String: Any],
+                "note_kind": noteKindEnum, "session": sessionStr
              ])],
 
             ["name": "delete_task",
@@ -118,15 +124,58 @@ extension MCPServer {
              ])],
 
             ["name": "inbox",
-             "description": "Your inbox: tasks an agent is waiting on you to answer — status waiting with waiting_on user — across all projects that are not archived. Check it to see what needs your decision or action. Longest waiting first. Each item: code, title, project (project code), waiting_since (when it entered waiting), and waiting_reason when set. With `include_external` true, tasks waiting on a third party are included too, and each item has waiting_on. Returns [] when nothing is waiting.",
+             "description": "Your inbox: tasks an agent is waiting on you to answer — status waiting with waiting_on user — across all projects that are not archived. Check it to see what needs your decision or action. Longest waiting first. Each item: code, title, project (project code), waiting_since (when it entered waiting), waiting_reason when set, and `questions` [{id, question}] when an agent asked something open on it (ask_user). With `include_external` true, tasks waiting on a third party are included too, and each item has waiting_on. Returns [] when nothing is waiting.",
              "inputSchema": obj(["include_external": ["type": "boolean", "description": "also include tasks waiting on external (default false)"] as [String: Any]])],
 
             ["name": "add_note",
-             "description": "Append a note to a task (`id` or `code`): progress, findings, decisions or review results. Use this instead of appending to the task's detail, which stays the spec. Insert only: nothing is read or rewritten, so concurrent sessions never lose each other's notes. `kind` is note (default), decision or review. Bumps the task's updated_at. Notes are newest first in get_task, not in list_tasks; they stay with the task when it moves, are not copied by duplicate_task, and are deleted with the task. Returns {note_id, task, ts} plus kind when not note.",
+             "description": "Append a note (comment) to a task (`id` or `code`). Use this instead of appending to the task's detail, which stays the spec. Insert only: you cannot edit or delete a note, and concurrent sessions never lose each other's notes (the user may edit their own notes in the app; get_note_history shows earlier versions). `kind`: note (default), progress (an update while working), decision (what you decided, why, and the options not taken — always record decisions you made yourself), summary (closing: what was done, files/PRs, what is left; optional), review (review or test results). Notes are recorded as written by the agent. Bumps the task's updated_at. Notes are newest first in get_task, not in list_tasks; they stay with the task when it moves, are not copied by duplicate_task, and are deleted with the task. Returns {note_id, task, ts} plus kind when not note.",
              "inputSchema": obj([
-                "id": int, "code": str, "text": str,
-                "kind": ["type": "string", "enum": NoteKind.allCases.map(\.rawValue)] as [String: Any]
+                "id": int, "code": str, "text": str, "kind": noteKindEnum, "session": sessionStr
              ], required: ["text"])],
+
+            ["name": "search_notes",
+             "description": "Search notes across tasks for text (`query`, case-insensitive substring), e.g. \"how did we decide X\". Optional `project_id`/`project_code`, `kind` (e.g. decision), and `limit` (default 20, max 100). Archived projects are searched too. Newest first; each hit is a note (as in get_task) plus task, title and project.",
+             "inputSchema": obj([
+                "query": str, "project_id": int, "project_code": str,
+                "kind": ["type": "string", "enum": NoteKind.allCases.map(\.rawValue)] as [String: Any],
+                "limit": ["type": "integer", "minimum": 1, "maximum": 100] as [String: Any]
+             ], required: ["query"])],
+
+            ["name": "get_note_history",
+             "description": "A note (`note_id`, the `id` in get_task notes) with `edits`: its earlier texts, newest first, each with when it was replaced. Only the user edits notes, in the app.",
+             "inputSchema": obj(["note_id": int], required: ["note_id"])],
+
+            ["name": "ask_user",
+             "description": "Leave a question for the user on a task (`id` or `code`) and keep working on something else — do not end your turn to wait. The user answers in the QuestBits app when convenient. `kind`: choice (default; 2–4 `options`), text (free answer; up to 4 suggested options) or approve (approve or edit a draft given in `context`; no options). Options are strings or {label, note}; `recommended` is the option number (from 1) or label you recommend — give one, with the reason in its note or the context. `context`: short markdown the user needs to decide. By default the question blocks the task: it moves to waiting on the user until every blocking question is answered, then back to todo. `blocks_task` false asks without blocking. Also logs a question note. Returns the question with its `id`. Later: get_answers / wait_for_answers, then resume_question.",
+             "inputSchema": obj([
+                "id": int, "code": str, "question": str,
+                "kind": ["type": "string", "enum": QuestionKind.allCases.map(\.rawValue)] as [String: Any],
+                "options": ["type": "array", "maxItems": 4, "items": ["anyOf": [
+                    str, obj(["label": str, "note": str], required: ["label"])
+                ]] as [String: Any]] as [String: Any],
+                "recommended": ["anyOf": [int, str], "description": "option number (from 1) or label"] as [String: Any],
+                "context": str,
+                "blocks_task": ["type": "boolean", "description": "default true: the task waits on the user until answered"] as [String: Any],
+                "session": sessionStr
+             ], required: ["question"])],
+
+            ["name": "get_answers",
+             "description": "Questions the user has answered that are not resumed yet, oldest first, plus how many are still `open`: {answered: [question...], open: N}. Each answered question has `answer` (and `choice`, the option number, when an option was picked). Call it before starting new work and act on answers first: resume_question, then continue the task. Optional project and session filters.",
+             "inputSchema": obj(questionFilter)],
+
+            ["name": "wait_for_answers",
+             "description": "Wait until the user answers a question, then return like get_answers. Use it only when you have no other work you can do and questions are still open. Returns at once if an answer is already in or nothing is open; otherwise checks every few seconds, for up to `max_minutes` (default 240, max 1440), and returns {answered: [], open: N} when the time is up — then call it again or stop with a summary. Keeps the Mac awake while waiting (not with the lid closed). Cancelling the call stops it. Optional project and session filters.",
+             "inputSchema": obj(questionFilter.merging([
+                "max_minutes": ["type": "integer", "minimum": 1, "maximum": 1440] as [String: Any]
+             ]) { a, _ in a })],
+
+            ["name": "resume_question",
+             "description": "Take an answered question (`id`) back up: marks it resumed, records the answer as a decision note by the user, and moves the task to in_progress (unless it is closed, or another open blocking question still holds it). Returns the question, with `answer`, and task_status. Then act on the answer.",
+             "inputSchema": obj(["id": int, "session": sessionStr], required: ["id"])],
+
+            ["name": "cancel_question",
+             "description": "Withdraw a question (`id`) that is open or answered but no longer needed, e.g. you found the answer yourself. `reason` says why (recorded as a decision note by the agent). A blocking question releases its task as resume_question does.",
+             "inputSchema": obj(["id": int, "reason": str, "session": sessionStr], required: ["id"])],
 
             ["name": "get_task_history",
              "description": "Get the change history (status changes, etc.) for a task by `id` or `code`, newest first.",

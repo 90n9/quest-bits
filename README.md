@@ -123,8 +123,30 @@ Claude writes to the shared database; the open app updates within ~1.5 s.
 | `move_task` | transfer a task to another project |
 | `delete_task` | remove a task |
 | `daily_stats` | today's completed pomodoros + total focus minutes |
+| `add_note`, `search_notes`, `get_note_history` | add a note (progress, decision, summary, review…), search notes, see a note's earlier versions |
+| `inbox` | tasks waiting on you, with their open questions |
+| `ask_user`, `get_answers`, `resume_question`, `cancel_question`, `wait_for_answers` | the ask loop (below) |
 
-Status values: `todo`, `in_progress`, `done`.
+Status values: `todo`, `in_progress`, `waiting`, `done`, `dropped`.
+
+**Ask loop: start a long job and walk away.** When an agent needs you to
+decide, it leaves a question in QuestBits (`ask_user`) and keeps working on
+something else. Answer it on the **Questions** page when you have time: pick
+an option (1–4), type an answer, or approve. The agent checks `get_answers`
+before new work and picks up each answer with `resume_question`. With nothing
+left to do, it waits in `wait_for_answers`, which uses no tokens while it
+waits. The MCP server sends Claude Code these rules itself. The Mac must stay
+awake: QuestBits prevents idle sleep while it waits, but a closed lid still
+sleeps.
+
+If a long wait does not suit your setup, run the agent in a self-paced loop
+instead, for example:
+
+```
+/loop Check QuestBits get_answers. For each answer, resume_question and continue
+that task. Then keep working on open tasks; ask_user when you need me to decide.
+Stop when nothing is left and no questions are open.
+```
 
 **Codes everywhere:** any tool that takes an `id` also accepts a `code` (task code
 like `GEN-3`, project code like `GEN`). So you can say "move GEN-3 to DFC" and

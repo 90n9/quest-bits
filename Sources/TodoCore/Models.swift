@@ -255,34 +255,177 @@ public struct TaskEvent: Identifiable, Codable, Hashable, Sendable {
 /// What a task note records. Persisted as the raw string value (the `task_notes.kind`
 /// CHECK constraint lists the same values).
 public enum NoteKind: String, Codable, CaseIterable, Sendable {
-    case note       // progress, findings — the default
-    case decision   // a choice made, and why
+    case note       // findings, anything else — the default
+    case progress   // an update while the work is under way
+    case decision   // a choice made, why, and the options not taken
+    case summary    // closing a task: what was done, files/PRs, what is left
     case review     // review feedback or a verification result
+    case question   // written by ask_user only; the question itself lives in `questions`
 
     public var display: String {
         switch self {
         case .note: return "Note"
+        case .progress: return "Progress"
         case .decision: return "Decision"
+        case .summary: return "Summary"
         case .review: return "Review"
+        case .question: return "Question"
         }
     }
+
+    /// Kinds a person or agent may write directly (question comes from ask_user).
+    public static var writable: [NoteKind] { allCases.filter { $0 != .question } }
 }
 
-/// A timestamped entry in a task's append-only log. Notes are only ever inserted,
-/// so concurrent writers never overwrite each other (unlike appending to `detail`).
+/// Who wrote a note. nil on notes from before 1.4.0, which did not record it.
+public enum NoteAuthor: String, Codable, CaseIterable, Sendable {
+    case user, agent
+
+    public var display: String { self == .user ? "You" : "Agent" }
+}
+
+/// A timestamped entry in a task's log. Notes are inserted, never rewritten by
+/// another writer, so concurrent writers never overwrite each other (unlike appending
+/// to `detail`). The one exception: the user may edit their own note in the app, and
+/// every replaced text is kept as a `NoteEdit`.
 public struct TaskNote: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64
     public var taskId: Int64
     public var timestamp: Date
     public var kind: NoteKind
     public var text: String
+    public var author: NoteAuthor?
+    public var sessionId: String?
+    public var statusEventId: Int64?   // the task_history row of the status change it came with
+    public var questionId: Int64?      // the question it records (kind question, or its answer)
+    public var editedAt: Date?         // last edit; nil = never edited
 
-    public init(id: Int64, taskId: Int64, timestamp: Date, kind: NoteKind, text: String) {
+    public init(id: Int64, taskId: Int64, timestamp: Date, kind: NoteKind, text: String,
+                author: NoteAuthor? = nil, sessionId: String? = nil, statusEventId: Int64? = nil,
+                questionId: Int64? = nil, editedAt: Date? = nil) {
         self.id = id
         self.taskId = taskId
         self.timestamp = timestamp
         self.kind = kind
         self.text = text
+        self.author = author
+        self.sessionId = sessionId
+        self.statusEventId = statusEventId
+        self.questionId = questionId
+        self.editedAt = editedAt
+    }
+}
+
+/// A note's earlier text, kept when the user edited it: `text` was replaced at `timestamp`.
+public struct NoteEdit: Identifiable, Codable, Hashable, Sendable {
+    public var id: Int64
+    public var noteId: Int64
+    public var timestamp: Date
+    public var text: String
+
+    public init(id: Int64, noteId: Int64, timestamp: Date, text: String) {
+        self.id = id
+        self.noteId = noteId
+        self.timestamp = timestamp
+        self.text = text
+    }
+}
+
+/// A note to write together with a task update (in the same transaction), e.g. the
+/// optional summary when closing a task.
+public struct NoteDraft: Sendable {
+    public var text: String
+    public var kind: NoteKind
+    public var author: NoteAuthor
+    public var sessionId: String?
+
+    public init(text: String, kind: NoteKind, author: NoteAuthor, sessionId: String? = nil) {
+        self.text = text
+        self.kind = kind
+        self.author = author
+        self.sessionId = sessionId
+    }
+}
+
+/// A search hit: the note plus where it lives.
+public struct NoteSearchHit: Hashable, Sendable {
+    public var note: TaskNote
+    public var taskCode: String
+    public var taskTitle: String
+    public var projectCode: String
+}
+
+// MARK: - Questions (ask loop)
+
+/// How a question is answered: pick an option, type text, or approve / edit a draft.
+public enum QuestionKind: String, Codable, CaseIterable, Sendable {
+    case choice, text, approve
+}
+
+/// open → answered (in the app) → resumed (the agent picked the answer up);
+/// open or answered → cancelled (the agent no longer needs it).
+public enum QuestionStatus: String, Codable, CaseIterable, Sendable {
+    case open, answered, resumed, cancelled
+}
+
+public struct QuestionOption: Codable, Hashable, Sendable {
+    public var label: String
+    public var note: String
+    public var recommended: Bool
+
+    public init(label: String, note: String = "", recommended: Bool = false) {
+        self.label = label
+        self.note = note
+        self.recommended = recommended
+    }
+}
+
+/// A question an agent left on a task for the user. `taskCode`, `taskTitle` and
+/// `projectCode` are read from the task and its project (a moved task keeps its
+/// questions); they are not stored on the question.
+public struct Question: Identifiable, Codable, Hashable, Sendable {
+    public var id: Int64
+    public var taskId: Int64
+    public var taskCode: String
+    public var taskTitle: String
+    public var projectCode: String
+    public var sessionId: String?
+    public var kind: QuestionKind
+    public var prompt: String
+    public var context: String
+    public var options: [QuestionOption]
+    public var blocksTask: Bool
+    public var status: QuestionStatus
+    public var answer: String?
+    public var answerChoice: Int?       // 0-based option index, when an option was picked
+    public var cancelReason: String?
+    public var askedAt: Date
+    public var answeredAt: Date?
+    public var resumedAt: Date?
+
+    public init(id: Int64, taskId: Int64, taskCode: String, taskTitle: String, projectCode: String,
+                sessionId: String?, kind: QuestionKind, prompt: String, context: String,
+                options: [QuestionOption], blocksTask: Bool, status: QuestionStatus,
+                answer: String?, answerChoice: Int?, cancelReason: String?,
+                askedAt: Date, answeredAt: Date?, resumedAt: Date?) {
+        self.id = id
+        self.taskId = taskId
+        self.taskCode = taskCode
+        self.taskTitle = taskTitle
+        self.projectCode = projectCode
+        self.sessionId = sessionId
+        self.kind = kind
+        self.prompt = prompt
+        self.context = context
+        self.options = options
+        self.blocksTask = blocksTask
+        self.status = status
+        self.answer = answer
+        self.answerChoice = answerChoice
+        self.cancelReason = cancelReason
+        self.askedAt = askedAt
+        self.answeredAt = answeredAt
+        self.resumedAt = resumedAt
     }
 }
 
