@@ -65,6 +65,13 @@ final class AppModel: ObservableObject {
 
     // Stats dashboard: when shown, the content column swaps to the dashboard.
     @Published var showDashboard = false
+    // Questions page (ask loop): when shown, the content column lists open questions and
+    // the detail column answers the selected one.
+    @Published var showQuestions = false
+    @Published var selectedQuestionId: Int64?
+    /// Open questions in projects not archived, longest waiting first; refreshed with the
+    /// tasks (so with every poll), republished only when they changed.
+    @Published private(set) var openQuestions: [Question] = []
     @Published var daySeries: [DayStat] = []
     @Published var projectEfforts: [ProjectEffort] = []
 
@@ -87,10 +94,14 @@ final class AppModel: ObservableObject {
     @Published var pendingNewTask = false
 
     // Notes of the single selected task, newest first: the latest `notesLimit` of them.
-    // Loaded on selection change, after addNote and when the poll sees an external write
-    // (not on every task reload); republished only when they changed.
+    // Loaded on selection change and with every task reload (an app edit, or the poll
+    // seeing an external write, may add notes or history); republished only when changed.
     @Published private(set) var selectedTaskNotes: [TaskNote] = []
     @Published private(set) var hasOlderNotes = false
+    // The rest of the selected task's timeline, loaded with its notes: the change history
+    // and every question asked on it (by id, for the question notes).
+    @Published private(set) var selectedTaskEvents: [TaskEvent] = []
+    @Published private(set) var selectedTaskQuestions: [Int64: Question] = [:]
     private var notesTaskId: Int64?
     private var notesLimit = AppModel.notesPage
     static let notesPage = 20
@@ -191,6 +202,18 @@ final class AppModel: ObservableObject {
         let counts = ProjectCounts.byProject(all)
         if counts != projectCounts { projectCounts = counts }
         syncDueReminders(all)
+        reloadQuestions()
+        reloadNotes()
+    }
+
+    /// Refresh the open questions; drop a selection that is no longer open (answered
+    /// here, or withdrawn by the agent) for the next one in line.
+    func reloadQuestions() {
+        let open = (try? store.questions(statuses: [.open], activeOnly: true)) ?? openQuestions
+        if open != openQuestions { openQuestions = open }
+        if showQuestions, selectedQuestionId.map({ id in !open.contains { $0.id == id } }) ?? true {
+            selectedQuestionId = open.first?.id
+        }
     }
 
     /// Keep local due-date notifications in sync with the current task set.
@@ -209,6 +232,7 @@ final class AppModel: ObservableObject {
 
     func selectProject(_ id: Int64?) {
         showDashboard = false
+        showQuestions = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -218,6 +242,7 @@ final class AppModel: ObservableObject {
 
     func selectSmartView(_ v: SmartView) {
         showDashboard = false
+        showQuestions = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
@@ -227,11 +252,47 @@ final class AppModel: ObservableObject {
 
     func selectDashboard() {
         showDashboard = true
+        showQuestions = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
         searchQuery = ""
         reloadDashboard()
+    }
+
+    func selectQuestions() {
+        showQuestions = true
+        showDashboard = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        selectedQuestionId = nil
+        reloadQuestions()
+    }
+
+    /// The question after `id` in the list (wrapping), or nil when it is the only one.
+    func questionAfter(_ id: Int64) -> Int64? {
+        guard let i = openQuestions.firstIndex(where: { $0.id == id }), openQuestions.count > 1 else { return nil }
+        return openQuestions[(i + 1) % openQuestions.count].id
+    }
+
+    /// Answer a question from the Questions page; on success select the next one.
+    /// Returns false (with a toast) if the store rejected it, e.g. the agent withdrew it.
+    @discardableResult
+    func answerQuestion(_ q: Question, answer: String, choice: Int?) -> Bool {
+        let next = questionAfter(q.id)
+        do {
+            try store.answerQuestion(id: q.id, answer: answer, choice: choice)
+        } catch {
+            flashToast("Couldn't answer \(q.taskCode): \(error)")
+            reloadQuestions()
+            return false
+        }
+        selectedQuestionId = next
+        reloadTasks()   // the task may have left waiting; reloads the questions and notes
+        flashToast("Answered \(q.taskCode)")
+        return true
     }
 
     /// Case-insensitive match of a task against the current search query
@@ -268,9 +329,6 @@ final class AppModel: ObservableObject {
         projects.first(where: { $0.id == projectId })?.code ?? ""
     }
 
-    func history(forTask id: Int64) -> [TaskEvent] {
-        (try? store.taskHistory(taskId: id)) ?? []
-    }
 
     /// Refresh `selectedTaskNotes` for the selected task. A different task starts again
     /// from the first page. One extra row tells whether older notes exist. On a read
@@ -283,18 +341,27 @@ final class AppModel: ObservableObject {
         guard let id else {
             if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
             if hasOlderNotes { hasOlderNotes = false }
+            if !selectedTaskEvents.isEmpty { selectedTaskEvents = [] }
+            if !selectedTaskQuestions.isEmpty { selectedTaskQuestions = [:] }
             return
         }
         do {
             let rows = try store.notes(taskId: id, limit: notesLimit + 1)
+            let events = try store.taskHistory(taskId: id)
+            let questions = Dictionary(uniqueKeysWithValues: try store.questions(
+                statuses: QuestionStatus.allCases, taskId: id).map { ($0.id, $0) })
             let page = Array(rows.prefix(notesLimit)), older = rows.count > notesLimit
             if page != selectedTaskNotes { selectedTaskNotes = page }
             if older != hasOlderNotes { hasOlderNotes = older }
+            if events != selectedTaskEvents { selectedTaskEvents = events }
+            if questions != selectedTaskQuestions { selectedTaskQuestions = questions }
             notesErrorShown = nil
         } catch {
             if switched {
                 if !selectedTaskNotes.isEmpty { selectedTaskNotes = [] }
                 if hasOlderNotes { hasOlderNotes = false }
+                if !selectedTaskEvents.isEmpty { selectedTaskEvents = [] }
+                if !selectedTaskQuestions.isEmpty { selectedTaskQuestions = [:] }
             }
             let message = "\(error)"
             guard notesErrorShown?.taskId != id || notesErrorShown?.error != message else { return }
@@ -313,14 +380,32 @@ final class AppModel: ObservableObject {
     @discardableResult
     func addNote(_ task: TodoTask, text: String, kind: NoteKind) -> Bool {
         do {
-            try store.addNote(taskId: task.id, text: text, kind: kind)
+            try store.addNote(taskId: task.id, text: text, kind: kind, author: .user)
         } catch {
             flashToast("Couldn't add a note to \(task.code): \(error)")
             return false
         }
-        reloadTasks()   // the note bumped updated_at
-        reloadNotes()
+        reloadTasks()   // the note bumped updated_at; reloads the notes
         return true
+    }
+
+    /// Replace the text of the user's own note (earlier text is kept). Returns false
+    /// (with a toast) if the store rejected it.
+    @discardableResult
+    func editNote(_ note: TaskNote, text: String) -> Bool {
+        do {
+            try store.editNote(id: note.id, text: text)
+        } catch {
+            flashToast("Couldn't edit the note: \(error)")
+            return false
+        }
+        reloadTasks()   // reloads the notes
+        return true
+    }
+
+    /// A note's earlier texts, newest first (empty on a read error).
+    func noteEdits(_ note: TaskNote) -> [NoteEdit] {
+        (try? store.noteEdits(noteId: note.id)) ?? []
     }
 
     // MARK: - Project CRUD
@@ -764,8 +849,7 @@ final class AppModel: ObservableObject {
         let stamp = currentDBStamp()
         if stamp > lastDBStamp {
             lastDBStamp = stamp
-            reloadAll()
-            reloadNotes()   // an agent may have added a note
+            reloadAll()   // reloads the selected task's notes too: an agent may have added one
         }
     }
 }

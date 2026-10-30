@@ -15,7 +15,10 @@ struct ContentView: View {
                 ProjectSidebar()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
             } content: {
-                if model.showDashboard {
+                if model.showQuestions {
+                    QuestionListView()
+                        .navigationSplitViewColumnWidth(min: 260, ideal: 320)
+                } else if model.showDashboard {
                     DashboardView()
                         .navigationSplitViewColumnWidth(min: 420, ideal: 560)
                 } else if model.boardView && model.boardAvailable {
@@ -26,7 +29,9 @@ struct ContentView: View {
                         .navigationSplitViewColumnWidth(min: 280, ideal: 360)
                 }
             } detail: {
-                if model.showDashboard {
+                if model.showQuestions {
+                    QuestionDetailView()
+                } else if model.showDashboard {
                     ContentUnavailableViewCompat(text: "Your activity at a glance")
                 } else {
                     TaskDetailView()
@@ -167,6 +172,26 @@ struct ProjectSidebar: View {
                     .contentShape(Rectangle())
                     .onTapGesture { model.selectDashboard() }
                     .listRowBackground(sidebarRowCard(model.showDashboard))
+                Label {
+                    HStack {
+                        Text("Questions")
+                        Spacer()
+                        if !model.openQuestions.isEmpty {
+                            Text("\(model.openQuestions.count)")
+                                .font(Theme.Fonts.micro)
+                                .foregroundStyle(Theme.Colors.onDark)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(qbStatusColor(.waiting), in: Capsule())
+                        }
+                    }
+                } icon: { QBIcon(name: "lucide-scroll-text") }
+                    .font(Theme.Fonts.bodySmMedium)
+                    .foregroundStyle(model.showQuestions ? Theme.Colors.brandBlue : Theme.Colors.ink)
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.selectQuestions() }
+                    .listRowBackground(sidebarRowCard(model.showQuestions))
+                    .help("Questions agents left for you")
                 Label { Text("Templates") } icon: { QBIcon(name: "lucide-backpack") }
                     .font(Theme.Fonts.bodySmMedium)
                     .contentShape(Rectangle())
@@ -241,7 +266,8 @@ struct ProjectSidebar: View {
 
     /// True while the selected sidebar item is an archived project.
     private var selectedIsArchived: Bool {
-        guard model.smartView == nil, !model.showDashboard, let sel = model.selectedProjectId else { return false }
+        guard model.smartView == nil, !model.showDashboard, !model.showQuestions,
+              let sel = model.selectedProjectId else { return false }
         return model.archivedProjects.contains { $0.id == sel }
     }
 
@@ -279,7 +305,7 @@ struct ProjectSidebar: View {
         .opacity(p.isArchived ? 0.6 : 1)
         .tag(p.id)
         .listRowBackground(sidebarRowCard(
-            model.smartView == nil && !model.showDashboard && model.selectedProjectId == p.id))
+            model.smartView == nil && !model.showDashboard && !model.showQuestions && model.selectedProjectId == p.id))
         .help(p.detail.isEmpty ? p.name : p.detail)
         .contextMenu {
             Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
@@ -1346,6 +1372,7 @@ struct TaskDetailView: View {
     @State private var noteText = ""
     @State private var noteKind: NoteKind = .note
     @State private var noteDraftTaskId: Int64?
+    @AppStorage("qbTimelineFilter") private var timelineFilter: TimelineFilter = .all
 
     // Blocked-task guard: confirm before moving a blocked task to In Progress.
     @State private var showBlockedAlert = false
@@ -1446,10 +1473,9 @@ struct TaskDetailView: View {
                 blockedSection(task)
                 linkSection
                 detailSection
-                notesSection(task)
+                timelineSection(task)
                 estimateSection(task)
                 timingSection(task)
-                historySection(task)
             }
             .padding(Theme.Spacing.md)
         }
@@ -1596,18 +1622,19 @@ struct TaskDetailView: View {
         }
     }
 
-    /// The task's append-only log: an input to add a note (with its kind), then the
-    /// notes newest first, a page at a time (`AppModel.selectedTaskNotes`, which also
-    /// picks up notes added over MCP on the next poll).
-    private func notesSection(_ task: TodoTask) -> some View {
-        QBDetailSection("Notes") {
+    /// The task's timeline: an input to add a note (with its kind), then the notes, the
+    /// change history and the questions asked, newest first, filtered by kind. Notes come a
+    /// page at a time (`AppModel.selectedTaskNotes`, which also picks up notes added over
+    /// MCP on the next poll); while older notes are left out, so are older changes.
+    private func timelineSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Timeline") {
             HStack(alignment: .top, spacing: 8) {
                 TextField("Add a note…", text: $noteText, axis: .vertical)
                     .lineLimit(1...5)
                     .qbField()
                     .onSubmit { commitNote(task) }
                 Picker("", selection: $noteKind) {
-                    ForEach(NoteKind.allCases, id: \.self) { Text($0.display).tag($0) }
+                    ForEach(NoteKind.writable, id: \.self) { Text($0.display).tag($0) }
                 }
                 .labelsHidden()
                 .fixedSize()
@@ -1615,18 +1642,56 @@ struct TaskDetailView: View {
                     .buttonStyle(QBPrimaryButtonStyle(compact: true))
                     .disabled(noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            if model.selectedTaskNotes.isEmpty {
-                Text("No notes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
+            HStack {
+                Picker("Show", selection: $timelineFilter) {
+                    ForEach(TimelineFilter.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                Spacer()
+            }
+            .font(Theme.Fonts.caption)
+            let entries = timelineEntries()
+            if entries.isEmpty {
+                Text(timelineFilter == .all ? "Nothing yet" : "Nothing of this kind yet")
+                    .foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
             } else {
                 LazyVStack(alignment: .leading, spacing: Theme.Spacing.xxs) {
-                    ForEach(model.selectedTaskNotes) { NoteRow(note: $0) }
-                }
-                if model.hasOlderNotes {
-                    Button("Show older notes") { model.showOlderNotes() }
-                        .buttonStyle(QBLinkButtonStyle())
+                    ForEach(entries) { entry in
+                        switch entry {
+                        case .note(let n):
+                            NoteRow(note: n, statusEvent: n.statusEventId.flatMap { id in
+                                        model.selectedTaskEvents.first { $0.id == id } },
+                                    question: n.questionId.flatMap { model.selectedTaskQuestions[$0] })
+                        case .event(let e):
+                            HistoryRow(event: e)
+                        }
+                    }
                 }
             }
+            if model.hasOlderNotes {
+                Button("Show older") { model.showOlderNotes() }
+                    .buttonStyle(QBLinkButtonStyle())
+            }
         }
+    }
+
+    /// Notes and history merged newest first. A status change that came with a shown note
+    /// appears inside that note, not again on its own.
+    private func timelineEntries() -> [TimelineEntry] {
+        let notes = model.selectedTaskNotes
+        let shown = timelineFilter.includesNotes ? notes.filter(timelineFilter.matches) : []
+        let linked = Set(shown.compactMap(\.statusEventId))
+        // Older notes not loaded yet: leave out the changes from before them too.
+        let floor = model.hasOlderNotes ? notes.last?.timestamp : nil
+        var entries = shown.map(TimelineEntry.note)
+        if timelineFilter == .all || timelineFilter == .changes {
+            entries += model.selectedTaskEvents
+                .filter { e in !linked.contains(e.id) && floor.map { e.timestamp >= $0 } ?? true }
+                .map(TimelineEntry.event)
+        }
+        // History has whole-second times: equal times fall back to the row id, numerically.
+        return entries.sorted { $0.date != $1.date ? $0.date > $1.date : $0.seq > $1.seq }
     }
 
     private func commitNote(_ task: TodoTask) {
@@ -1665,20 +1730,6 @@ struct TaskDetailView: View {
             }
         }
         .font(Theme.Fonts.bodySm)
-    }
-
-    private func historySection(_ task: TodoTask) -> some View {
-        QBDetailSection {
-            DisclosureGroup("History (\(model.history(forTask: task.id).count))") {
-                let events = model.history(forTask: task.id)
-                if events.isEmpty {
-                    Text("No changes yet").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
-                } else {
-                    ForEach(events) { e in HistoryRow(event: e) }
-                }
-            }
-            .font(Theme.Fonts.bodySmMedium)
-        }
     }
 
     /// Tasks eligible to become a blocking dependency: any task other than this one
@@ -1821,27 +1872,178 @@ struct HistoryRow: View {
     }
 }
 
-/// One entry in a task's notes: kind chip and time, then the (selectable) text.
-struct NoteRow: View {
-    let note: TaskNote
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                NoteKindChip(kind: note.kind)
-                Spacer()
-                Text(fmtDateTime(note.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
-            }
-            Text(note.text)
-                .font(Theme.Fonts.bodySm)
-                .foregroundStyle(Theme.Colors.ink)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+/// What the task timeline shows: everything, the change history, or one kind of note.
+enum TimelineFilter: String, CaseIterable {
+    case all, changes, note, progress, decision, summary, review, question
+
+    var title: String {
+        switch self {
+        case .all: return "Everything"
+        case .changes: return "Changes"
+        default: return NoteKind(rawValue: rawValue)?.display ?? rawValue
         }
-        .padding(.vertical, 2)
+    }
+
+    var includesNotes: Bool { self != .changes }
+
+    /// Does the note show? Questions also show the decision each answer became.
+    func matches(_ note: TaskNote) -> Bool {
+        switch self {
+        case .all: return true
+        case .changes: return false
+        case .question: return note.kind == .question || note.questionId != nil
+        default: return note.kind.rawValue == rawValue
+        }
     }
 }
 
-/// Note kind pill: parchment for a note, gold for a decision, herb green for a review.
+/// One row of the task timeline.
+enum TimelineEntry: Identifiable {
+    case note(TaskNote)
+    case event(TaskEvent)
+
+    var id: String {
+        switch self {
+        case .note(let n): return "n\(n.id)"
+        case .event(let e): return "e\(e.id)"
+        }
+    }
+
+    var date: Date {
+        switch self {
+        case .note(let n): return n.timestamp
+        case .event(let e): return e.timestamp
+        }
+    }
+
+    /// The row id in its own table, for ordering entries with the same time.
+    var seq: Int64 {
+        switch self {
+        case .note(let n): return n.id
+        case .event(let e): return e.id
+        }
+    }
+}
+
+/// One note in the timeline: kind chip, who wrote it and when, then the (selectable)
+/// text. The status change it came with and, for a question, its state and answer show
+/// under it. The user's own notes can be edited in place; earlier versions are kept and
+/// listed from the "edited" label.
+struct NoteRow: View {
+    @EnvironmentObject var model: AppModel
+    let note: TaskNote
+    var statusEvent: TaskEvent? = nil
+    var question: Question? = nil
+    @State private var editing = false
+    @State private var draft = ""
+    @State private var showEdits = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                NoteKindChip(kind: note.kind)
+                if let author = note.author {
+                    Text(author.display).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.slate)
+                }
+                if note.editedAt != nil {
+                    Button("edited") { showEdits = true }
+                        .buttonStyle(.plain)
+                        .font(Theme.Fonts.micro)
+                        .foregroundStyle(Theme.Colors.steel)
+                        .underline()
+                        .help("Show earlier versions")
+                        .popover(isPresented: $showEdits) { NoteEditsView(note: note) }
+                }
+                Spacer()
+                if note.author == .user && note.questionId == nil && !editing {
+                    Button { draft = note.text; editing = true } label: { Image(systemName: "pencil") }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Theme.Colors.steel)
+                        .help("Edit your note")
+                }
+                Text(fmtDateTime(note.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+            if editing {
+                TextField("", text: $draft, axis: .vertical)
+                    .lineLimit(1...8)
+                    .qbField()
+                HStack {
+                    Spacer()
+                    Button("Cancel") { editing = false }
+                        .buttonStyle(QBSecondaryButtonStyle(compact: true))
+                        .keyboardShortcut(.cancelAction)
+                    Button("Save") { if model.editNote(note, text: draft) { editing = false } }
+                        .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            } else {
+                Text(note.text)
+                    .font(Theme.Fonts.bodySm)
+                    .foregroundStyle(Theme.Colors.ink)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let e = statusEvent, e.field == "status" {
+                Text("with status \(e.oldValue) → \(e.newValue)")
+                    .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+            if note.kind == .question, let q = question { questionFooter(q) }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// A question note's state: waiting for you (with a link to answer it), or the answer.
+    @ViewBuilder
+    private func questionFooter(_ q: Question) -> some View {
+        switch q.status {
+        case .open:
+            HStack(spacing: 6) {
+                Text("Waiting for your answer").font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+                Button("Answer…") {
+                    model.selectQuestions()
+                    model.selectedQuestionId = q.id
+                }
+                .buttonStyle(QBLinkButtonStyle())
+                .font(Theme.Fonts.micro)
+            }
+        case .answered, .resumed:
+            Text("Answered: \(q.answer ?? "")" + (q.status == .answered ? " · agent has not picked it up yet" : ""))
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.mossDark)
+                .textSelection(.enabled)
+        case .cancelled:
+            Text("Withdrawn" + (q.cancelReason.map { ": \($0)" } ?? ""))
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+        }
+    }
+}
+
+/// A note's earlier versions, newest first (popover from a note's "edited" label).
+struct NoteEditsView: View {
+    @EnvironmentObject var model: AppModel
+    let note: TaskNote
+
+    var body: some View {
+        let edits = model.noteEdits(note)
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            Text("Earlier versions").font(Theme.Fonts.captionBold)
+            if edits.isEmpty {
+                Text("No earlier versions").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+            }
+            ForEach(edits) { e in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Replaced \(fmtDateTime(e.timestamp))").font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+                    Text(e.text).font(Theme.Fonts.bodySm).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(Theme.Spacing.sm)
+        .frame(width: 320, alignment: .leading)
+    }
+}
+
+/// Note kind pill: parchment for a note, gold for a decision, herb green for a review,
+/// blue for progress, coral for a question, charcoal for a summary.
 struct NoteKindChip: View {
     let kind: NoteKind
     var body: some View {
@@ -1855,8 +2057,11 @@ struct NoteKindChip: View {
     private var colors: (fill: Color, text: Color) {
         switch kind {
         case .note: return (Theme.Colors.surface, Theme.Colors.slate)
+        case .progress: return (Theme.Colors.brandBlue.opacity(0.15), Theme.Colors.brandBlue)
         case .decision: return (Theme.Colors.yellowLight, Theme.Colors.yellowDark)
+        case .summary: return (Theme.Colors.charcoal, Theme.Colors.onDark)
         case .review: return (Theme.Colors.tealLight, Theme.Colors.mossDark)
+        case .question: return (Theme.Colors.coralLight, Theme.Colors.coralDark)
         }
     }
 }

@@ -17,6 +17,65 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.4.0] - 2026-10-30
+
+### Added
+
+- **Ask loop: agents can leave you questions and keep working.** An agent
+  calls the new MCP tool `ask_user` with 2–4 options, the one it recommends
+  and why, then moves on to other work. The question shows on the new
+  **Questions** page in the sidebar (with a count). Each card shows the task,
+  the question, its context and the options, with the recommended one in
+  green. Pick an option (click it or press 1–4), type your own answer, or for
+  an approval approve or edit the draft. ⌘↵ sends and goes to the next
+  question; **Skip for now** leaves it open.
+- A question blocks its task by default. The task waits on you until every
+  blocking question is answered, then goes back to todo.
+- New MCP tools for agents:
+  - `get_answers` lists answered questions. Agents check it before new work.
+  - `resume_question` takes an answer back up. It logs the answer as your
+    decision and moves the task to in progress.
+  - `cancel_question` withdraws a question the agent no longer needs.
+  - `wait_for_answers` waits inside the tool call until you answer, for up to
+    4 hours (max 24). It keeps the Mac from idle sleep while it waits, but a
+    closed lid still sleeps. It sends a progress update each minute, so Claude
+    Code's 30-minute idle timeout does not end it. After two minutes Claude
+    Code moves the call to a background task and the agent is woken when it
+    returns. Stopping it (Esc, or stopping the task) ends the wait.
+- The MCP server now gives Claude Code the ask-loop rules up front (MCP
+  `instructions`): ask instead of stopping, check answers first, record your
+  own decisions, and always ask before anything irreversible.
+- **Notes v2.** Notes have new kinds: `progress`, `summary` and `question`
+  (written by `ask_user`), next to note, decision and review. Each note now
+  records who wrote it (you or the agent) and, optionally, the agent session.
+- `update_task` takes an optional `note`, saved in the same write and linked
+  to the status change. When the update closes the task, the note defaults
+  to a summary. A summary is never required to close a task.
+- MCP `search_notes` finds notes by text across projects, optionally by
+  project and kind (for example "how did we decide X").
+- You can edit your own notes in the app (the pencil on a note). Earlier
+  versions are kept: click **edited** to see them, or use MCP
+  `get_note_history`. Agents can only add notes, never edit them.
+
+### Changed
+
+- The task detail's Notes and History sections are now one **Timeline**:
+  notes, status and field changes, and questions, newest first. Filter it by
+  kind with **Show**. A question shows whether it waits for you (with a link
+  to answer it) and its answer. A note saved with a status change shows that
+  change.
+- MCP `get_task` notes now include `id`, `author`, `session`, `edited_at`
+  and `question_id`. `get_task` also lists the task's open and
+  answered-but-not-resumed `questions`. `inbox` items list their open
+  `questions`.
+
+### Upgrade notes
+
+- On first open, 1.4.0 rebuilds the notes table to allow the new kinds. Every
+  note and its id is kept. Notes from before 1.4.0 have no author and cannot
+  be edited. An older app or MCP server still running on the same database
+  keeps working.
+
 ## [1.3.1] - 2026-10-30
 
 ### Fixed

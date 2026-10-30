@@ -1,9 +1,22 @@
 import Foundation
+import IOKit.pwr_mgt
 
 /// Minimal MCP server speaking JSON-RPC 2.0 over stdio (newline-delimited JSON).
-/// Implements: initialize, tools/list, tools/call. No external SDK.
-final class MCPServer {
+/// Implements: initialize, tools/list, tools/call, notifications/cancelled. No external SDK.
+///
+/// Requests are handled one at a time on the reading thread, except wait_for_answers,
+/// which runs on its own thread: it can wait for hours, and meanwhile the client keeps
+/// calling other tools (Claude Code moves a call that runs past two minutes to a
+/// background task) and may cancel it. Output lines are serialized by `writeLock`.
+final class MCPServer: @unchecked Sendable {
     private let store: Store
+    private let writeLock = NSLock()
+    // The latest wait for each request key (`requestKey`), and the waits the client
+    // cancelled. Each wait has its own token, so a request id the client reuses while an
+    // earlier, cancelled wait is still winding down never mixes the two up.
+    private let waitLock = NSLock()
+    private var activeWaits: [String: UUID] = [:]
+    private var cancelledWaits = Set<UUID>()
 
     init() {
         do {
@@ -20,7 +33,8 @@ final class MCPServer {
     }
 
     func run() {
-        // Read newline-delimited JSON-RPC messages from stdin.
+        // Read newline-delimited JSON-RPC messages from stdin. EOF (the client is gone)
+        // ends the process, and with it any wait still running.
         while let line = readLine(strippingNewline: true) {
             if line.isEmpty { continue }
             guard let data = line.data(using: .utf8),
@@ -33,6 +47,20 @@ final class MCPServer {
 
     // MARK: - Dispatch
 
+    /// What the server tells the client's model up front (MCP `instructions`): the ask
+    /// loop rules, so every session gets them with the tools.
+    static let instructions = """
+        QuestBits is the user's task tracker. Tasks have codes (QUE-3); every tool that takes an id also takes a code.
+        Ask loop — when you need the user to decide:
+        - Call ask_user with 2–4 options, the one you recommend, and a one-line reason; then move straight on to other work. Never end your turn just to wait.
+        - Before starting new work, call get_answers and finish answered questions first (resume_question, then act on the answer).
+        - With nothing else to do but questions still open, call wait_for_answers; when it returns with no answers, call it again or stop with a summary.
+        - Push, release, posting, or anything irreversible: always ask and wait for the answer.
+        - When you decide something yourself, record it with add_note kind decision (what, why, the options not taken).
+        - If you find the answer yourself, withdraw the question with cancel_question.
+        Closing a task: a summary note is optional (update_task note), never required.
+        """
+
     private func handle(_ msg: [String: Any]) {
         let method = msg["method"] as? String ?? ""
         let id = msg["id"]
@@ -41,14 +69,29 @@ final class MCPServer {
             respond(id: id, result: [
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [:] as [String: Any]],
-                "serverInfo": ["name": "todo-mcp", "version": "1.0.0"]
+                "serverInfo": ["name": "todo-mcp", "version": "1.0.0"],
+                "instructions": Self.instructions
             ])
         case "notifications/initialized":
             break // notification, no response
+        case "notifications/cancelled":
+            // The client gave up on a request (Esc, TaskStop, its own timeout). Only a wait
+            // runs long enough to be cancelled; anything else has already answered.
+            if let params = msg["params"] as? [String: Any], let rid = params["requestId"] {
+                let key = Self.requestKey(rid)
+                waitLock.lock()
+                if let token = activeWaits[key] { cancelledWaits.insert(token) }
+                waitLock.unlock()
+            }
         case "tools/list":
             respond(id: id, result: ["tools": Self.toolDefinitions])
         case "tools/call":
-            handleToolCall(id: id, params: msg["params"] as? [String: Any] ?? [:])
+            let params = msg["params"] as? [String: Any] ?? [:]
+            if params["name"] as? String == "wait_for_answers" {
+                startWait(id: id, params: params)
+            } else {
+                handleToolCall(id: id, params: params)
+            }
         default:
             if id != nil {
                 respondError(id: id, code: -32601, message: "method not found: \(method)")
@@ -61,16 +104,133 @@ final class MCPServer {
         let args = params["arguments"] as? [String: Any] ?? [:]
         do {
             let text = try invoke(tool: name, args: args)
-            respond(id: id, result: [
-                "content": [["type": "text", "text": text]]
-            ])
+            respondText(id: id, text)
         } catch {
-            // Tool-level error surfaced to the model via isError flag.
-            respond(id: id, result: [
-                "content": [["type": "text", "text": "Error: \(error)"]],
-                "isError": true
-            ])
+            respondToolError(id: id, error)
         }
+    }
+
+    private func respondText(id: Any?, _ text: String) {
+        respond(id: id, result: ["content": [["type": "text", "text": text]]])
+    }
+
+    /// Tool-level error surfaced to the model via isError flag.
+    private func respondToolError(id: Any?, _ error: Error) {
+        respond(id: id, result: [
+            "content": [["type": "text", "text": "Error: \(error)"]],
+            "isError": true
+        ])
+    }
+
+    /// A request id as a set key: ids are JSON numbers or strings, so 2 and "2" differ.
+    private static func requestKey(_ id: Any?) -> String {
+        if let s = id as? String { return "s:" + s }
+        if let n = id as? NSNumber { return "n:" + n.stringValue }
+        return "?"
+    }
+
+    // MARK: - wait_for_answers
+
+    static let defaultWaitMinutes = 240
+    static let maxWaitMinutes = 1440
+    static let waitPollSeconds = 2.5
+    static let waitProgressSeconds = 60.0
+
+    /// Validate the arguments here (a bad one answers at once), then wait on a thread
+    /// of its own so the reader keeps handling other calls and the cancellation.
+    private func startWait(id: Any?, params: [String: Any]) {
+        let args = params["arguments"] as? [String: Any] ?? [:]
+        let filter: (projectId: Int64?, sessionId: String?)
+        let minutes: Int
+        do {
+            filter = try questionFilterArgs(args)
+            if given(args, "max_minutes") {
+                guard let n = try? requireInt(args, "max_minutes"), (1...Int64(Self.maxWaitMinutes)).contains(n) else {
+                    throw MCPError.invalidArg("max_minutes must be an integer from 1 to \(Self.maxWaitMinutes)")
+                }
+                minutes = Int(n)
+            } else {
+                minutes = Self.defaultWaitMinutes
+            }
+        } catch {
+            respondToolError(id: id, error)
+            return
+        }
+        let token = (params["_meta"] as? [String: Any])?["progressToken"]
+        let key = Self.requestKey(id), waitId = UUID()
+        waitLock.lock(); activeWaits[key] = waitId; waitLock.unlock()
+        Thread.detachNewThread { [self] in
+            waitForAnswers(id: id, key: key, waitId: waitId, token: token, projectId: filter.projectId,
+                           sessionId: filter.sessionId, minutes: minutes)
+        }
+    }
+
+    /// Poll the database (reads only, no write lock) every few seconds until an answer
+    /// matches, the time is up, or the client cancels. A progress notification each
+    /// minute keeps the client's idle timeout from firing (Claude Code aborts a stdio
+    /// call after 30 silent minutes). A power assertion keeps the Mac from idle sleep
+    /// meanwhile: asleep, nothing is answered, and on wake the client counts the sleep
+    /// as silence. A closed lid still sleeps. A cancelled wait sends no response.
+    private func waitForAnswers(id: Any?, key: String, waitId: UUID, token: Any?, projectId: Int64?,
+                                sessionId: String?, minutes: Int) {
+        var assertion: IOPMAssertionID = 0
+        let asserted = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "QuestBits is waiting for your answers" as CFString, &assertion) == kIOReturnSuccess
+        defer {
+            if asserted { IOPMAssertionRelease(assertion) }
+            waitLock.lock()
+            if activeWaits[key] == waitId { activeWaits[key] = nil }
+            cancelledWaits.remove(waitId)
+            waitLock.unlock()
+        }
+        let start = Date()
+        let deadline = start.addingTimeInterval(TimeInterval(minutes * 60))
+        var lastProgress = start
+        var progress = 0
+        while true {
+            waitLock.lock(); let cancelled = cancelledWaits.contains(waitId); waitLock.unlock()
+            if cancelled { return }
+            do {
+                let answered = try store.questionCount(statuses: [.answered], projectId: projectId, sessionId: sessionId)
+                let open = try store.questionCount(statuses: [.open], projectId: projectId, sessionId: sessionId)
+                // Done: an answer is in, nothing is left to wait for, or the time is up.
+                if answered > 0 || open == 0 || Date() >= deadline {
+                    respondText(id: id, try answersJSON(projectId: projectId, sessionId: sessionId,
+                                                        waitedSeconds: Int(Date().timeIntervalSince(start))))
+                    return
+                }
+                if let token, Date().timeIntervalSince(lastProgress) >= Self.waitProgressSeconds {
+                    progress += 1
+                    lastProgress = Date()
+                    let waited = Int(lastProgress.timeIntervalSince(start)) / 60
+                    write(["jsonrpc": "2.0", "method": "notifications/progress",
+                           "params": ["progressToken": token, "progress": progress,
+                                      "message": "waiting for answers: \(open) open, \(waited) min so far"]])
+                }
+            } catch {
+                respondToolError(id: id, error)
+                return
+            }
+            Thread.sleep(forTimeInterval: Self.waitPollSeconds)
+        }
+    }
+
+    /// get_answers / wait_for_answers output: the answered questions (oldest first) and
+    /// how many are still open, for the same project / session filter.
+    private func answersJSON(projectId: Int64?, sessionId: String?, waitedSeconds: Int? = nil) throws -> String {
+        let answered = try store.questions(statuses: [.answered], projectId: projectId, sessionId: sessionId)
+        let open = try store.questionCount(statuses: [.open], projectId: projectId, sessionId: sessionId)
+        var d: [String: Any] = ["answered": answered.map(questionDict), "open": open]
+        if let waitedSeconds { d["waited_minutes"] = waitedSeconds / 60 }
+        return try jsonString(d)
+    }
+
+    /// `project_id`/`project_code` and `session` for the question tools; all optional.
+    private func questionFilterArgs(_ args: [String: Any]) throws -> (projectId: Int64?, sessionId: String?) {
+        let pid = given(args, "project_id", "project_code")
+            ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+        return (pid, try sessionArg(args))
     }
 
     // MARK: - Tool implementations
@@ -146,12 +306,17 @@ final class MCPServer {
                 if !notes.isEmpty { d["notes"] = notes.prefix(limit).map(noteDict) }
                 if notes.count > limit { d["more_notes"] = true }
             }
+            // Questions still in play: open (waiting on the user) or answered (to resume).
+            let questions = try store.questions(statuses: [.open, .answered], taskId: task.id)
+            if !questions.isEmpty { d["questions"] = questions.map(questionDict) }
             return try jsonString(d)
 
         case "inbox":
             // Compact: what to answer and since when. waiting_on only when external tasks
             // are included (otherwise every item waits on the user).
             let includeExternal = try boolArg(args, "include_external") ?? false
+            // Open questions by task, so an item says what it asks.
+            let open = Dictionary(grouping: try store.questions(statuses: [.open], activeOnly: true), by: \.taskId)
             return try jsonString(store.inbox(includeExternal: includeExternal).map { item in
                 let t = item.task
                 var d: [String: Any] = ["code": taskHandle(code: t.code, id: t.id), "title": t.title,
@@ -159,13 +324,16 @@ final class MCPServer {
                                         "waiting_since": iso(t.waitingSince ?? t.updatedAt)]
                 if includeExternal, let on = t.waitingOn { d["waiting_on"] = on.rawValue }
                 if let reason = t.waitingReason, !reason.isEmpty { d["waiting_reason"] = reason }
+                if let qs = open[t.id] { d["questions"] = qs.map { ["id": $0.id, "question": $0.prompt] as [String: Any] } }
                 return d
             })
 
         case "add_note":
             // Store.addNote trims and rejects empty text.
             guard let text = args["text"] as? String else { throw MCPError.missingArg("text") }
-            let added = try store.addNote(taskId: try resolveTaskId(args), text: text, kind: try parseNoteKind(args["kind"]))
+            // Always the agent: only the user, in the app, writes (and edits) as the user.
+            let added = try store.addNote(taskId: try resolveTaskId(args), text: text, kind: try parseNoteKind(args["kind"]),
+                                          author: .agent, sessionId: try sessionArg(args))
             var d: [String: Any] = ["note_id": added.note.id, "task": taskHandle(code: added.taskCode, id: added.note.taskId),
                                     "ts": iso(added.note.timestamp)]
             if added.note.kind != .note { d["kind"] = added.note.kind.rawValue }
@@ -242,19 +410,22 @@ final class MCPServer {
                try store.getTask(id: id).parentId != nil {
                 throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
             }
+            let status = try statusArg(args)
+            let note = try updateNoteArg(args, status: status)
             try store.updateTask(
                 id: id,
                 title: args["title"] as? String,
                 detail: args["detail"] as? String,
                 link: linkArg,
-                status: try statusArg(args),
+                status: status,
                 priority: parsePriority(args["priority"]),
                 dueDate: dueArg,
                 tags: parseTags(args["tags"]),
                 recurrence: recurArg,
                 estimateSeconds: parseMinutes(args["estimate_minutes"]).map { $0 * 60 },
                 waitingOn: try parseWaitingOn(args["waiting_on"]),
-                waitingReason: try waitingReasonArg(args)
+                waitingReason: try waitingReasonArg(args),
+                note: note
             )
             return try jsonString(taskDict(store.getTask(id: id)))
 
@@ -341,6 +512,54 @@ final class MCPServer {
             let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
             let task = try store.instantiateTemplate(id: templateId, intoProjectId: pid)
             return try jsonString(taskDict(task))
+
+        case "search_notes":
+            guard let query = args["query"] as? String else { throw MCPError.missingArg("query") }
+            let pid = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            let kind: NoteKind? = given(args, "kind") ? try parseNoteKind(args["kind"], allowQuestion: true) : nil
+            let limit = try limitArg(args, "limit", default: 20, max: 100)
+            return try jsonString(store.searchNotes(query: query, projectId: pid, kind: kind, limit: limit).map { hit in
+                var d = noteDict(hit.note)
+                d["task"] = taskHandle(code: hit.taskCode, id: hit.note.taskId)
+                d["title"] = hit.taskTitle
+                d["project"] = hit.projectCode
+                return d
+            })
+
+        case "get_note_history":
+            let noteId = try requireInt(args, "note_id")
+            let note = try store.note(id: noteId)
+            var d = noteDict(note)
+            d["edits"] = try store.noteEdits(noteId: noteId).map { ["replaced_at": iso($0.timestamp), "text": $0.text] }
+            return try jsonString(d)
+
+        case "ask_user":
+            guard let prompt = args["question"] as? String else { throw MCPError.missingArg("question") }
+            let kind = try questionKindArg(args)
+            let options = try questionOptionsArg(args)
+            let q = try store.askQuestion(
+                taskId: try resolveTaskId(args), kind: kind, prompt: prompt,
+                context: args["context"] as? String ?? "", options: options,
+                blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args))
+            var d = questionDict(q)
+            if q.blocksTask { d["task_status"] = TaskStatus.waiting.rawValue }
+            return try jsonString(d)
+
+        case "get_answers":
+            let filter = try questionFilterArgs(args)
+            return try answersJSON(projectId: filter.projectId, sessionId: filter.sessionId)
+
+        case "resume_question":
+            let resumed = try store.resumeQuestion(id: try requireInt(args, "id"), sessionId: try sessionArg(args))
+            var d = questionDict(resumed.question)
+            d["task_status"] = resumed.task.status.rawValue
+            return try jsonString(d)
+
+        case "cancel_question":
+            let q = try store.cancelQuestion(id: try requireInt(args, "id"), reason: args["reason"] as? String ?? "",
+                                             sessionId: try sessionArg(args))
+            return try jsonString(questionDict(q))
 
         case "daily_stats":
             let stats = try store.dailyStats()
@@ -448,10 +667,40 @@ final class MCPServer {
         return d
     }
 
-    /// A note in get_task: ts and text, plus kind unless it is the default (note).
+    /// A note in get_task and search: id, ts and text, plus kind unless it is the default
+    /// (note), and author, session, edited_at and question when known.
     private func noteDict(_ n: TaskNote) -> [String: Any] {
-        var d: [String: Any] = ["ts": iso(n.timestamp), "text": n.text]
+        var d: [String: Any] = ["id": n.id, "ts": iso(n.timestamp), "text": n.text]
         if n.kind != .note { d["kind"] = n.kind.rawValue }
+        if let author = n.author { d["author"] = author.rawValue }
+        if let session = n.sessionId { d["session"] = session }
+        if let edited = n.editedAt { d["edited_at"] = iso(edited) }
+        if let q = n.questionId { d["question_id"] = q }
+        return d
+    }
+
+    /// A question as the question tools return it. Options are numbered from 1, as the
+    /// user picks them; empty and default fields are omitted.
+    private func questionDict(_ q: Question) -> [String: Any] {
+        var d: [String: Any] = ["id": q.id, "task": taskHandle(code: q.taskCode, id: q.taskId),
+                                "project": q.projectCode, "question": q.prompt, "kind": q.kind.rawValue,
+                                "status": q.status.rawValue, "asked_at": iso(q.askedAt)]
+        if !q.context.isEmpty { d["context"] = q.context }
+        if !q.options.isEmpty {
+            d["options"] = q.options.map { o -> [String: Any] in
+                var od: [String: Any] = ["label": o.label]
+                if !o.note.isEmpty { od["note"] = o.note }
+                if o.recommended { od["recommended"] = true }
+                return od
+            }
+        }
+        if !q.blocksTask { d["blocks_task"] = false }
+        if let s = q.sessionId { d["session"] = s }
+        if let a = q.answer { d["answer"] = a }
+        if let c = q.answerChoice { d["choice"] = c + 1 }
+        if let r = q.cancelReason { d["cancel_reason"] = r }
+        if let t = q.answeredAt { d["answered_at"] = iso(t) }
+        if let t = q.resumedAt { d["resumed_at"] = iso(t) }
         return d
     }
 
@@ -609,13 +858,87 @@ final class MCPServer {
         return on
     }
 
-    /// add_note `kind`: absent or null = note; otherwise it must be a known kind.
-    private func parseNoteKind(_ v: Any?) throws -> NoteKind {
+    /// A note `kind`: absent or null = note; otherwise a kind an agent may write
+    /// (question only as a search filter — ask_user writes those notes).
+    private func parseNoteKind(_ v: Any?, allowQuestion: Bool = false) throws -> NoteKind {
         guard let v, !(v is NSNull) else { return .note }
-        guard let s = v as? String, let kind = NoteKind(rawValue: s) else {
-            throw MCPError.invalidArg("kind must be one of: \(NoteKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        let kinds = allowQuestion ? NoteKind.allCases : NoteKind.writable
+        guard let s = v as? String, let kind = NoteKind(rawValue: s), kinds.contains(kind) else {
+            throw MCPError.invalidArg("kind must be one of: \(kinds.map(\.rawValue).joined(separator: ", "))")
         }
         return kind
+    }
+
+    /// update_task `note` (+ `note_kind`, `session`): absent or null = no note. The kind
+    /// defaults to summary when the update closes the task, else note.
+    private func updateNoteArg(_ args: [String: Any], status: TaskStatus?) throws -> NoteDraft? {
+        guard given(args, "note") else {
+            if given(args, "note_kind") { throw MCPError.invalidArg("note_kind needs a note") }
+            return nil
+        }
+        guard let text = args["note"] as? String else { throw MCPError.invalidArg("note must be a string") }
+        let kind = given(args, "note_kind") ? try parseNoteKind(args["note_kind"])
+            : (status?.isClosed == true ? .summary : .note)
+        return NoteDraft(text: text, kind: kind, author: .agent, sessionId: try sessionArg(args))
+    }
+
+    /// `session`: an optional label for the agent session (absent, null or "" = none).
+    private func sessionArg(_ args: [String: Any]) throws -> String? {
+        guard let v = args["session"], !(v is NSNull) else { return nil }
+        guard let s = v as? String else { throw MCPError.invalidArg("session must be a string") }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// ask_user `kind`: choice (default), text or approve.
+    private func questionKindArg(_ args: [String: Any]) throws -> QuestionKind {
+        guard given(args, "kind") else { return .choice }
+        guard let s = args["kind"] as? String, let k = QuestionKind(rawValue: s) else {
+            throw MCPError.invalidArg("kind must be one of: \(QuestionKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return k
+    }
+
+    /// ask_user `options` (strings or {label, note}) and `recommended` (1-based number, or
+    /// an option's label). The store checks the counts and labels.
+    private func questionOptionsArg(_ args: [String: Any]) throws -> [QuestionOption] {
+        var options: [QuestionOption] = []
+        if given(args, "options") {
+            guard let arr = args["options"] as? [Any] else { throw MCPError.invalidArg("options must be an array") }
+            for v in arr {
+                if let s = v as? String { options.append(QuestionOption(label: s)) }
+                else if let o = v as? [String: Any], let label = o["label"] as? String {
+                    options.append(QuestionOption(label: label, note: o["note"] as? String ?? ""))
+                } else {
+                    throw MCPError.invalidArg("each option must be a string or {label, note}")
+                }
+            }
+        }
+        guard given(args, "recommended") else { return options }
+        guard !options.isEmpty else { throw MCPError.invalidArg("recommended needs options") }
+        let index: Int
+        if let n = args["recommended"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+            guard (1...options.count).contains(n.intValue) else {
+                throw MCPError.invalidArg("recommended must be an option number from 1 to \(options.count)")
+            }
+            index = n.intValue - 1
+        } else if let s = args["recommended"] as? String,
+                  let i = options.firstIndex(where: { $0.label.caseInsensitiveCompare(s.trimmingCharacters(in: .whitespaces)) == .orderedSame }) {
+            index = i
+        } else {
+            throw MCPError.invalidArg("recommended must be an option number (from 1) or an option's label")
+        }
+        options[index].recommended = true
+        return options
+    }
+
+    /// An optional integer limit from 1 to `max`; absent or null = `default`.
+    private func limitArg(_ args: [String: Any], _ key: String, default def: Int, max: Int) throws -> Int {
+        guard given(args, key) else { return def }
+        guard let n = try? requireInt(args, key), (1...Int64(max)).contains(n) else {
+            throw MCPError.invalidArg("\(key) must be an integer from 1 to \(max)")
+        }
+        return Int(n)
     }
 
     private static let defaultNotesLimit = 5
@@ -670,6 +993,8 @@ final class MCPServer {
         guard let data = try? JSONSerialization.data(withJSONObject: obj),
               var s = String(data: data, encoding: .utf8) else { return }
         s += "\n"
+        // One line at a time: a wait's thread writes too.
+        writeLock.lock(); defer { writeLock.unlock() }
         FileHandle.standardOutput.write(s.data(using: .utf8)!)
     }
 }
