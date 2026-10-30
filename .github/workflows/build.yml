@@ -1,6 +1,7 @@
 # Build check for pull requests and main: compiles both binaries on the same
 # runner image the release uses, so compiler problems (e.g. the type-checker
-# timeout that broke the v1.3.0 release build) show up before a tag is pushed.
+# timeout that broke the v1.3.0 release build) show up before a merge, which
+# releases (see release.yml).
 #
 # This repo is public: the workflow must never use secrets, and must stay on
 # `pull_request` (never `pull_request_target`), so code from a fork runs
@@ -34,3 +35,44 @@ jobs:
 
       - name: Build app bundle
         run: bash Scripts/build-app.sh
+
+  # A PR that changes the app (Sources/, Scripts/, Resources/, or the public
+  # releases README) ships as a new version: merging it to main releases the
+  # top CHANGELOG version (see release.yml). Fail early if that version is not
+  # X.Y.Z or not newer than every released version, so a merge never ships code
+  # without one. Released versions come from this repo's tags and the public
+  # releases repo (a release whose tag push failed is only there).
+  version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # base branch and tags for the diff and the compare
+
+      - name: Require a new CHANGELOG version for app changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only "$BASE_SHA"...HEAD)
+          if ! grep -qE '^(Sources|Scripts|Resources)/|^Docs/RELEASES_README\.md$' <<<"$CHANGED"; then
+            echo "No app changes; no new version needed."
+            exit 0
+          fi
+          VERSION=$(sed -nE 's/^## \[([^]]+)\].*/\1/p' CHANGELOG.md | grep -vx 'Unreleased' | head -n1 || true)
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=CHANGELOG.md::Add a ## [X.Y.Z] - YYYY-MM-DD section for this change (got '${VERSION}')."
+            exit 1
+          fi
+          PUBLIC=$(gh api "repos/90n9/quest-bits-releases/releases" --paginate -q '.[].tag_name')
+          LATEST=$( { git tag -l 'v[0-9]*'; echo "$PUBLIC"; } | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' | sort -V | tail -n1)
+          if [[ -n "$LATEST" ]]; then
+            NEWEST=$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -n1)
+            if [[ "$VERSION" == "$LATEST" || "$NEWEST" != "$VERSION" ]]; then
+              echo "::error file=CHANGELOG.md::Top version ${VERSION} must be newer than the latest release v${LATEST}."
+              exit 1
+            fi
+          fi
+          echo "Merging releases v${VERSION} (latest is v${LATEST:-none})."
