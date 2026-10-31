@@ -109,6 +109,9 @@ struct ProjectOverview: View {
                     stat("Waiting on you", c.waitingOnUser)
                     stat("Done", c.done)
                 }
+                section("Milestones") {
+                    MilestonesSection(project: project)
+                }
                 section("Questions") {
                     let n = model.openQuestions.filter { $0.projectCode == project.code }.count
                     stat("Waiting for your answer", n)

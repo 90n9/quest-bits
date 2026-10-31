@@ -361,6 +361,7 @@ final class MCPServer: @unchecked Sendable {
                 }
                 filter.sort = sort
             }
+            filter.milestone = try milestoneFilterArg(args, projectId: filter.projectId)
             return try jsonString(readTaskDicts(store.listTasks(matching: filter), compact: compact))
 
         case "get_task":
@@ -452,6 +453,7 @@ final class MCPServer: @unchecked Sendable {
                 parentId: parentId,
                 estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60,
                 branch: try optionalStringArg(args, "branch") ?? nil,
+                milestoneId: try milestoneArg(args, projectId: { projectId }) ?? nil,
                 author: .agent
             )
             return try jsonString(taskDict(task))
@@ -489,6 +491,7 @@ final class MCPServer: @unchecked Sendable {
             }
             let status = try statusArg(args)
             let note = try updateNoteArg(args, status: status)
+            let milestone = try milestoneArg(args, projectId: { try self.store.getTask(id: id).projectId })
             try store.updateTask(
                 id: id,
                 title: args["title"] as? String,
@@ -504,6 +507,7 @@ final class MCPServer: @unchecked Sendable {
                 waitingReason: try waitingReasonArg(args),
                 parentId: parent,
                 branch: try optionalStringArg(args, "branch"),
+                milestoneId: milestone,
                 author: .agent,
                 note: note
             )
@@ -551,12 +555,15 @@ final class MCPServer: @unchecked Sendable {
             let ids = try resolveTaskIds(args)
             let dueArg: Date??
             if args.keys.contains("due_date") { dueArg = .some(parseDate(args["due_date"])) } else { dueArg = .none }
+            // A milestone name is looked up in the first task's project; the store then
+            // refuses any task of another project.
+            let milestone = try milestoneArg(args, projectId: { try self.store.getTask(id: ids[0]).projectId })
             // One transaction for the whole batch: any bad task leaves every task unchanged.
             try store.bulkUpdateTasks(
                 ids: ids, status: try statusArg(args), priority: parsePriority(args["priority"]),
                 dueDate: dueArg, addTags: parseTags(args["add_tags"]),
                 waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args),
-                parentId: try parentArg(args))
+                parentId: try parentArg(args), milestoneId: milestone)
             return "updated \(ids.count) tasks"
 
         case "bulk_move_tasks":
@@ -658,6 +665,43 @@ final class MCPServer: @unchecked Sendable {
                 removed = try store.removeLink(taskId: try resolveTaskId(args), url: url)
             }
             return try jsonString(["task": try store.getTask(id: removed.taskId).code, "removed": linkDict(removed)] as [String: Any])
+
+        case "list_milestones":
+            let includeClosed = try boolArg(args, "include_closed") ?? false
+            let pid: Int64? = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            let list = try store.milestones(projectId: pid, includeClosed: includeClosed, includeArchived: pid != nil)
+            return try jsonString(list.map(milestoneDict))
+
+        case "create_milestone":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let m = try store.createMilestone(
+                projectId: pid, name: try requireString(args, "name"),
+                detail: (try optionalStringArg(args, "description") ?? nil) ?? "",
+                acceptance: (try optionalStringArg(args, "acceptance") ?? nil) ?? "",
+                targetDate: try targetDateArg(args) ?? nil)
+            return try jsonString(milestoneDict(m))
+
+        case "update_milestone":
+            let mid = try resolveMilestoneId(args)
+            var newName: String?
+            if given(args, "new_name") {
+                guard let s = args["new_name"] as? String else { throw MCPError.invalidArg("new_name must be a string") }
+                newName = s
+            }
+            let m = try store.updateMilestone(
+                id: mid, name: newName,
+                detail: try optionalStringArg(args, "description").map { $0 ?? "" },
+                acceptance: try optionalStringArg(args, "acceptance").map { $0 ?? "" },
+                targetDate: try targetDateArg(args), closed: try boolArg(args, "closed"),
+                force: try boolArg(args, "force") ?? false)
+            return try jsonString(milestoneDict(m))
+
+        case "delete_milestone":
+            let m = try store.milestone(id: try resolveMilestoneId(args))
+            let unassigned = try store.deleteMilestone(id: m.id)
+            return try jsonString(["deleted": m.name, "project": store.projectCode(id: m.projectId) ?? "",
+                                   "unassigned": unassigned] as [String: Any])
 
         case "list_templates":
             return try jsonString(store.listTemplates().map(templateDict))
@@ -835,12 +879,16 @@ final class MCPServer: @unchecked Sendable {
         // Whole minutes as before, but a non-zero sub-minute value shows as 1, not omitted.
         if t.effortSeconds > 0 { d["effort_minutes"] = max(1, t.effortSeconds / 60) }
         if t.estimateSeconds > 0 { d["estimate_minutes"] = max(1, t.estimateSeconds / 60) }
+        if let mid = t.milestoneId {
+            d["milestone_id"] = mid
+            if let name = rel.milestoneNames[mid] { d["milestone"] = name }
+        }
         return d
     }
 
     /// The compact list shape: code, title, status, plus priority, parent, blocked_by
-    /// (the open dependencies blocking it), tags, due_date, waiting_on and branch only
-    /// when set. No links (get_task has them).
+    /// (the open dependencies blocking it), tags, due_date, waiting_on, branch and milestone
+    /// (its name) only when set. No links (get_task has them).
     /// No detail or timestamps; ids only where a task has no code (`taskHandle`).
     private func compactTaskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
         var d: [String: Any] = ["code": t.code, "title": t.title, "status": t.status.rawValue]
@@ -857,6 +905,20 @@ final class MCPServer: @unchecked Sendable {
         if let due = t.dueDate { d["due_date"] = iso(due) }
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
         if let branch = t.branch { d["branch"] = branch }
+        if let mid = t.milestoneId { d["milestone"] = rel.milestoneNames[mid] ?? mid }
+        return d
+    }
+
+    /// A milestone as the milestone tools return it: its project by code, counts of its
+    /// tasks (done and total leave dropped ones out; open = not done or dropped), and
+    /// description, acceptance, target_date and closed_at only when set.
+    private func milestoneDict(_ m: Milestone) -> [String: Any] {
+        var d: [String: Any] = ["id": m.id, "project": store.projectCode(id: m.projectId) ?? "", "name": m.name,
+                                "done": m.done, "total": m.total, "open": m.open]
+        if !m.detail.isEmpty { d["description"] = m.detail }
+        if !m.acceptance.isEmpty { d["acceptance"] = m.acceptance }
+        if let t = m.targetDate { d["target_date"] = iso(t) }
+        if let c = m.closedAt { d["closed_at"] = iso(c) }
         return d
     }
 
@@ -1058,6 +1120,63 @@ final class MCPServer: @unchecked Sendable {
         guard !present.isEmpty else { return .none }
         if present.allSatisfy({ args[$0] is NSNull }) { return .some(nil) }
         return .some(try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code"))
+    }
+
+    /// update_milestone / delete_milestone: the milestone by `id`, or by `name` in a project
+    /// (`project_id`/`project_code`).
+    private func resolveMilestoneId(_ args: [String: Any]) throws -> Int64 {
+        if given(args, "id") { return try requireInt(args, "id") }
+        guard let name = args["name"] as? String else { throw MCPError.missingArg("id, or name with project_code") }
+        let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+        return try milestoneId(named: name, projectId: pid)
+    }
+
+    /// A project's milestone by name, or an error naming the project's open milestones.
+    private func milestoneId(named name: String, projectId: Int64) throws -> Int64 {
+        if let id = store.milestoneId(projectId: projectId, name: name) { return id }
+        let code = store.projectCode(id: projectId) ?? "\(projectId)"
+        let names = try store.milestones(projectId: projectId, includeClosed: false).map(\.name)
+        throw StoreError.notFound("milestone \(name) in project \(code)"
+            + (names.isEmpty ? " (it has no open milestones; create_milestone adds one)"
+                             : " (open milestones: \(names.joined(separator: ", ")))"))
+    }
+
+    /// create_task / update_task / bulk_update_tasks `milestone` (a name in the task's
+    /// project) or `milestone_id`: absent = leave alone, null = no milestone.
+    private func milestoneArg(_ args: [String: Any], projectId: () throws -> Int64) throws -> Int64?? {
+        let present = ["milestone", "milestone_id"].filter { args.keys.contains($0) }
+        guard !present.isEmpty else { return .none }
+        if present.allSatisfy({ args[$0] is NSNull }) { return .some(nil) }
+        if given(args, "milestone_id") { return .some(try requireInt(args, "milestone_id")) }
+        guard let name = args["milestone"] as? String else { throw MCPError.invalidArg("milestone must be a name or null") }
+        return .some(try milestoneId(named: name, projectId: try projectId()))
+    }
+
+    /// list_tasks `milestone` (a name, or "none" for tasks in no milestone) or
+    /// `milestone_id`. With a project the name must be one of its milestones; without one
+    /// it matches that name in any project, and must exist in at least one.
+    private func milestoneFilterArg(_ args: [String: Any], projectId: Int64?) throws -> MilestoneFilter? {
+        if given(args, "milestone_id") { return .id(try requireInt(args, "milestone_id")) }
+        guard given(args, "milestone") else { return nil }
+        guard let raw = args["milestone"] as? String, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw MCPError.invalidArg("milestone must be a milestone name, or \"none\"")
+        }
+        if raw.trimmingCharacters(in: .whitespaces).lowercased() == "none" { return .unassigned }
+        if let projectId { return .id(try milestoneId(named: raw, projectId: projectId)) }
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard try store.milestones().contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            throw StoreError.notFound("milestone \(name) in any project")
+        }
+        return .named(name)
+    }
+
+    /// create/update_milestone `target_date`: absent = .none, null = .some(nil) (clear), a
+    /// date (ISO-8601 or yyyy-MM-dd) = that date; anything else is an error, not a clear.
+    private func targetDateArg(_ args: [String: Any]) throws -> Date?? {
+        guard let v = args["target_date"] else { return .none }
+        if v is NSNull { return .some(nil) }
+        guard let d = parseDate(v) else { throw MCPError.invalidArg("target_date must be yyyy-MM-dd or ISO-8601, or null") }
+        return .some(d)
     }
 
     /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).

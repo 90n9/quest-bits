@@ -57,6 +57,9 @@ final class AppModel: ObservableObject {
     /// Per-project task counts for the sidebar rows, refreshed with the tasks (and so
     /// with every poll). A project with no tasks has no entry.
     @Published private(set) var projectCounts: [Int64: ProjectCounts] = [:]
+    /// Every project's milestones with their task counts (closed ones too), in order,
+    /// refreshed with the tasks.
+    @Published private(set) var milestones: [Milestone] = []
 
     // Non-nil while an app-level blocked-task confirmation is on screen. Set by any
     // path that tries to move a blocked task to In Progress; presented once by the root.
@@ -234,6 +237,8 @@ final class AppModel: ObservableObject {
         // they were, and the sidebar needn't redraw.
         let counts = ProjectCounts.byProject(all)
         if counts != projectCounts { projectCounts = counts }
+        let ms = (try? store.milestones()) ?? milestones
+        if ms != milestones { milestones = ms }
         syncDueReminders(all)
         reloadQuestions()
         if timeline { reloadNotes() }
@@ -904,6 +909,66 @@ final class AppModel: ObservableObject {
         let byCode = hits.filter { $0.code.localizedCaseInsensitiveContains(q) }
         let byTitle = hits.filter { !$0.code.localizedCaseInsensitiveContains(q) }
         return Array((byCode + byTitle).prefix(limit))
+    }
+
+    // MARK: - Milestones
+
+    func milestones(in projectId: Int64) -> [Milestone] { milestones.filter { $0.projectId == projectId } }
+
+    func milestone(_ id: Int64?) -> Milestone? { id.flatMap { id in milestones.first { $0.id == id } } }
+
+    /// Add a milestone to a project; a store refusal (a name taken, an archived project)
+    /// shows as a toast. Returns whether it was added.
+    @discardableResult
+    func addMilestone(projectId: Int64, name: String) -> Bool {
+        do {
+            try store.createMilestone(projectId: projectId, name: name)
+        } catch {
+            flashToast("\(error)")
+            return false
+        }
+        reloadTasks()
+        return true
+    }
+
+    func renameMilestone(_ m: Milestone, to name: String) {
+        do {
+            try store.updateMilestone(id: m.id, name: name)
+        } catch {
+            flashToast("\(error)")
+        }
+        reloadTasks()
+    }
+
+    /// Close or reopen a milestone. Closing one with open tasks needs `force` (the view
+    /// asks first).
+    func setMilestoneClosed(_ m: Milestone, _ closed: Bool, force: Bool = false) {
+        do {
+            try store.updateMilestone(id: m.id, closed: closed, force: force)
+        } catch {
+            flashToast("\(error)")
+        }
+        reloadTasks()
+    }
+
+    func deleteMilestone(_ m: Milestone) {
+        do {
+            try store.deleteMilestone(id: m.id)
+        } catch {
+            flashToast("\(error)")
+        }
+        reloadTasks()
+    }
+
+    /// Put a task in a milestone of its project (nil: in none).
+    func setMilestone(_ task: TodoTask, _ milestoneId: Int64?) {
+        guard milestoneId != task.milestoneId else { return }
+        do {
+            try store.updateTask(id: task.id, milestoneId: .some(milestoneId), author: .user)
+        } catch {
+            flashToast("\(error)")
+        }
+        reloadTasks()
     }
 
     // MARK: - Links

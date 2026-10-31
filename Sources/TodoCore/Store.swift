@@ -373,6 +373,31 @@ public final class Store: @unchecked Sendable {
         if !columnExists("tasks", "branch") { exec("ALTER TABLE tasks ADD COLUMN branch TEXT;") }
         syncLegacyLinks()
 
+        // --- Additive migration: project milestones (1.5.0) ---
+        // A stage of one project that tasks count toward, beside parent/subtask. Names are
+        // unique per project (case-insensitive). closed_at is set only by an explicit close.
+        exec("""
+        CREATE TABLE IF NOT EXISTS milestones (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            name        TEXT NOT NULL,
+            detail      TEXT NOT NULL DEFAULT '',
+            acceptance  TEXT NOT NULL DEFAULT '',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            target_date REAL,
+            closed_at   REAL,
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        """)
+        exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_milestones_name ON milestones(project_id, name COLLATE NOCASE);")
+        // NULL = in no milestone. Deleting a milestone leaves its tasks (SET NULL; the store
+        // also clears them itself first, to log it).
+        if !columnExists("tasks", "milestone_id") {
+            exec("ALTER TABLE tasks ADD COLUMN milestone_id INTEGER REFERENCES milestones(id) ON DELETE SET NULL;")
+        }
+        exec("CREATE INDEX IF NOT EXISTS idx_tasks_milestone ON tasks(milestone_id);")
+
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
         repairStatusFields()
     }
@@ -978,7 +1003,7 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since, branch"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since, branch, milestone_id"
     /// `taskCols` qualified with `tasks.`, for queries that join another table.
     private static let qualifiedTaskCols = taskCols.components(separatedBy: ", ").map { "tasks.\($0)" }.joined(separator: ", ")
     /// How many columns `taskCols` selects: the index of a column a query adds after them.
@@ -986,13 +1011,15 @@ public final class Store: @unchecked Sendable {
 
     /// `link` (legacy single link) becomes the task's primary link, its kind guessed;
     /// `author` is recorded on it. `branch` is the working branch (`normalizedBranch`).
+    /// `milestoneId` must be an open milestone of the same project.
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                            status: TaskStatus = .todo, waitingOn: WaitingOn? = nil, waitingReason: String? = nil,
                            priority: Priority = .none,
                            dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                            parentId: Int64? = nil, estimateSeconds: Int = 0,
-                           branch: String? = nil, author: NoteAuthor? = nil) throws -> TodoTask {
+                           branch: String? = nil, milestoneId: Int64? = nil,
+                           author: NoteAuthor? = nil) throws -> TodoTask {
         let link = try link.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : try Self.normalizedLinkURL($0) }
         let branch = try Self.normalizedBranch(branch)
         lock.lock(); defer { lock.unlock() }
@@ -1005,7 +1032,7 @@ public final class Store: @unchecked Sendable {
                                               status: status, waitingOn: waitingOn, waitingReason: waitingReason,
                                               priority: priority, dueDate: dueDate, tags: tags,
                                               recurrence: recurrence, parentId: parentId, estimateSeconds: estimateSeconds,
-                                              branch: branch, author: author)
+                                              branch: branch, milestoneId: milestoneId, author: author)
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return task
         } catch {
@@ -1026,7 +1053,7 @@ public final class Store: @unchecked Sendable {
                                     priority: Priority = .none,
                                     dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                                     parentId: Int64? = nil, estimateSeconds: Int = 0,
-                                    branch: String? = nil, author: NoteAuthor? = nil,
+                                    branch: String? = nil, milestoneId: Int64? = nil, author: NoteAuthor? = nil,
                                     timestampsFrom source: TodoTask? = nil,
                                     enforceNesting: Bool = true) throws -> TodoTask {
         let now = Date()
@@ -1041,6 +1068,7 @@ public final class Store: @unchecked Sendable {
         // so a grandchild would silently orphan on those paths. Internal callers that
         // already know the parent is top-level pass enforceNesting:false to skip the lookup.
         if enforceNesting, let parentId { try requireTopLevelParentUnlocked(parentId) }
+        if let milestoneId { try requireMilestoneUnlocked(milestoneId, projectId: projectId) }
         // A subtask must not recur: on completion a recurring task spawns a fresh
         // top-level occurrence, so a recurring subtask would leak a detached duplicate.
         // Force recurrence to nil whenever this task has a parent.
@@ -1064,15 +1092,15 @@ public final class Store: @unchecked Sendable {
         let ts = Self.statusTimestampExprs(status, now: nowSecs)
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, branch, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, started_at, completed_at, waiting_since, created_at, updated_at, sort_order)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(ts.startedAt), \(ts.completedAt), \(ts.waitingSince), ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)
+            INSERT INTO tasks (project_id, code, title, detail, branch, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, milestone_id, started_at, completed_at, waiting_since, created_at, updated_at, sort_order)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(ts.startedAt), \(ts.completedAt), \(ts.waitingSince), ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)
             FROM (SELECT ? AS status, ? AS started_at, ? AS completed_at, NULL AS waiting_since);
             """,
             [.int(projectId), .text(code), .text(title), .text(detail), branch.map(SQLValue.text) ?? .null,
              .text(status.rawValue), waitingOn.map { .text($0.rawValue) } ?? .null, reason.map(SQLValue.text) ?? .null,
              .text(priority.rawValue), due, .text(encodeTags(tags)),
              effectiveRecurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
-             .int(Int64(max(0, estimateSeconds)))]
+             .int(Int64(max(0, estimateSeconds))), milestoneId.map(SQLValue.int) ?? .null]
             + ts.binds
             + [.int(nowSecs), .int(nowSecs), .int(projectId),
                .text((source?.status ?? .todo).rawValue), secs(source?.startedAt), secs(source?.completedAt)]
@@ -1083,6 +1111,7 @@ public final class Store: @unchecked Sendable {
         logEvent(id, "created", "", title)
         if status != .todo { logEvent(id, "status", TaskStatus.todo.display, status.display) }
         if let waitingOn { logEvent(id, "waiting on", "", waitingOn.rawValue) }
+        if let milestoneId { logEvent(id, "milestone", "", milestoneNameUnlocked(milestoneId)) }
         guard let task = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
         return task
     }
@@ -1124,6 +1153,14 @@ public final class Store: @unchecked Sendable {
         }
         if let parentId = filter.parentId {
             conds.append("parent_id=?"); binds.append(.int(parentId))
+        }
+        switch filter.milestone {
+        case nil: break
+        case .id(let mid)?: conds.append("milestone_id=?"); binds.append(.int(mid))
+        case .named(let name)?:
+            conds.append("milestone_id IN (SELECT id FROM milestones WHERE name=? COLLATE NOCASE)")
+            binds.append(.text(name.trimmingCharacters(in: .whitespacesAndNewlines)))
+        case .unassigned?: conds.append("milestone_id IS NULL")
         }
         if filter.projectId == nil && filter.parentId == nil && !filter.includeArchived {
             conds.append(Self.activeProjectSQL)
@@ -1379,7 +1416,7 @@ public final class Store: @unchecked Sendable {
                            estimateSeconds: Int? = nil,
                            waitingOn: WaitingOn? = nil, waitingReason: String?? = nil,
                            parentId: Int64?? = nil,
-                           branch: String?? = nil, author: NoteAuthor? = nil,
+                           branch: String?? = nil, milestoneId: Int64?? = nil, author: NoteAuthor? = nil,
                            note: NoteDraft? = nil) throws {
         let noteText = try note.map { try Self.noteBody($0.text) }
         // link: .some(nil) or .some("") removes the primary link; see setLegacyLinkUnlocked.
@@ -1393,7 +1430,7 @@ public final class Store: @unchecked Sendable {
                 id: id, title: title, detail: detail, link: link, status: status, priority: priority,
                 dueDate: dueDate, tags: tags, recurrence: recurrence, estimateSeconds: estimateSeconds,
                 waitingOn: waitingOn, waitingReason: waitingReason, parentId: parentId,
-                branch: branch, author: author, spawnRecurrence: spawnRecurrence)
+                branch: branch, milestoneId: milestoneId, author: author, spawnRecurrence: spawnRecurrence)
             if let note, let noteText {
                 _ = try insertNoteUnlocked(taskId: id, text: noteText, kind: note.kind, author: note.author,
                                            sessionId: note.sessionId, statusEventId: eventId)
@@ -1406,8 +1443,9 @@ public final class Store: @unchecked Sendable {
         // in the same transaction, so the update and its note land together or not at all.
         // A new parent is checked against the parent's row and the task's subtasks.
         // A legacy link reads the task's links and rewrites them and the mirror.
+        // A milestone is checked against its row (open, same project).
         let needsTransaction = status != nil || Self.setsWaitingFields(waitingOn, waitingReason) || note != nil
-            || parentId != nil || link != nil
+            || parentId != nil || link != nil || milestoneId != nil
         guard needsTransaction else { return try apply(true) }
         do {
             try beginImmediate()
@@ -1437,7 +1475,8 @@ public final class Store: @unchecked Sendable {
     public func bulkUpdateTasks(ids: [Int64], status: TaskStatus? = nil, priority: Priority? = nil,
                                 dueDate: Date?? = nil, addTags: [String]? = nil,
                                 waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
-                                waitingReason: String?? = nil, parentId: Int64?? = nil) throws {
+                                waitingReason: String?? = nil, parentId: Int64?? = nil,
+                                milestoneId: Int64?? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         let apply = { [self] (spawnRecurrence: Bool) in
             try beginImmediate()
@@ -1446,7 +1485,7 @@ public final class Store: @unchecked Sendable {
                     try applyTaskUpdateUnlocked(id: id, status: status, priority: priority, dueDate: dueDate,
                                                 addTags: addTags, waitingOn: waitingOn, waitingOnDefault: waitingOnDefault,
                                                 waitingReason: waitingReason, parentId: parentId,
-                                                spawnRecurrence: spawnRecurrence)
+                                                milestoneId: milestoneId, spawnRecurrence: spawnRecurrence)
                 } catch StoreError.invalid(let msg) {
                     // Name the task that failed the batch.
                     let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(id)]) ?? "task \(id)"
@@ -1485,9 +1524,15 @@ public final class Store: @unchecked Sendable {
                                          recurrence: String?? = nil, estimateSeconds: Int? = nil,
                                          waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
                                          waitingReason: String?? = nil, parentId: Int64?? = nil,
-                                         branch: String?? = nil, author: NoteAuthor? = nil,
+                                         branch: String?? = nil, milestoneId: Int64?? = nil, author: NoteAuthor? = nil,
                                          spawnRecurrence: Bool) throws -> Int64? {
         guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        // milestoneId .some(id): put it in that milestone; .some(nil): in none.
+        var newMilestone: Int64?? = nil
+        if let milestoneId, milestoneId != old.milestoneId {
+            if let mid = milestoneId { try requireMilestoneUnlocked(mid, projectId: old.projectId) }
+            newMilestone = .some(milestoneId)
+        }
         // parentId .some(id): make it a subtask of that task; .some(nil): a top-level task.
         var newParent: Int64?? = nil
         if let parentId, parentId != old.parentId {
@@ -1542,6 +1587,7 @@ public final class Store: @unchecked Sendable {
             }
         }
         if let estimateSeconds { sets.append("estimate_seconds=?"); binds.append(.int(Int64(max(0, estimateSeconds)))) }
+        if let newMilestone { sets.append("milestone_id=?"); binds.append(newMilestone.map(SQLValue.int) ?? .null) }
         if let newParent {
             sets.append("parent_id=?"); binds.append(newParent.map(SQLValue.int) ?? .null)
             // Last among its new siblings (sort_order runs across the whole project).
@@ -1567,7 +1613,8 @@ public final class Store: @unchecked Sendable {
             let spawned = try createTaskUnlocked(
                 projectId: old.projectId, title: old.title, detail: old.detail, link: nil,
                 status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
-                estimateSeconds: old.estimateSeconds
+                estimateSeconds: old.estimateSeconds,
+                milestoneId: carriedMilestoneUnlocked(newMilestone ?? old.milestoneId, projectId: old.projectId)
             )
             logEvent(spawned.id, "recurrence", "", rule)
             try copyLinksUnlocked(from: old.id, to: spawned.id)
@@ -1579,6 +1626,7 @@ public final class Store: @unchecked Sendable {
                     projectId: spawned.projectId, title: sub.title, detail: sub.detail, link: nil,
                     status: .todo, priority: sub.priority, dueDate: nil, tags: sub.tags,
                     recurrence: nil, parentId: spawned.id, estimateSeconds: sub.estimateSeconds,
+                    milestoneId: carriedMilestoneUnlocked(sub.milestoneId, projectId: spawned.projectId),
                     enforceNesting: false
                 )
             }
@@ -1607,6 +1655,9 @@ public final class Store: @unchecked Sendable {
         if let estimateSeconds, max(0, estimateSeconds) != old.estimateSeconds {
             let fmt: (Int) -> String = { $0 == 0 ? "none" : "\($0 / 60)m" }
             logEvent(id, "estimate", fmt(old.estimateSeconds), fmt(max(0, estimateSeconds)))
+        }
+        if let newMilestone {
+            logEvent(id, "milestone", milestoneNameUnlocked(old.milestoneId), milestoneNameUnlocked(newMilestone))
         }
         if let newParent {
             let code: (Int64?) -> String = { [self] in
@@ -1753,6 +1804,8 @@ public final class Store: @unchecked Sendable {
             recurrence: t.recurrence,
             parentId: newParentId,
             estimateSeconds: t.estimateSeconds,
+            // A milestone is per project: a copy elsewhere starts in none.
+            milestoneId: keepStatus ? nil : carriedMilestoneUnlocked(t.milestoneId, projectId: t.projectId),
             timestampsFrom: keepStatus ? t : nil
         )
         try copyLinksUnlocked(from: t.id, to: copy.id)
@@ -1818,6 +1871,15 @@ public final class Store: @unchecked Sendable {
             "UPDATE tasks SET project_id=?, updated_at=? WHERE parent_id=?;",
             [.int(toProjectId), .int(now), .int(id)]
         )
+        if old.projectId != toProjectId {
+            // Milestones belong to a project: the task and its subtasks leave theirs.
+            let subs = subtasksUnlocked(id).filter { $0.milestoneId != nil }
+            try runWrite("UPDATE tasks SET milestone_id=NULL WHERE (id=? OR parent_id=?) AND milestone_id IS NOT NULL;",
+                         [.int(id), .int(id)])
+            for t in [old] + subs where t.milestoneId != nil {
+                logEvent(t.id, "milestone", milestoneNameUnlocked(t.milestoneId), "")
+            }
+        }
         if oldCode != newCode { logEvent(id, "project", oldCode, newCode) }
     }
 
@@ -2186,6 +2248,255 @@ public final class Store: @unchecked Sendable {
             exec("ROLLBACK;")
             NSLog("QuestBits: legacy link sync failed: \(error)")
         }
+    }
+
+    // MARK: - Milestones (1.5.0)
+
+    /// Milestone columns over alias `m`, then its task counts (order must match
+    /// `milestoneFromRow`): done, total (dropped tasks left out of both) and open.
+    private static let milestoneSelectSQL = """
+        SELECT m.id, m.project_id, m.name, m.detail, m.acceptance, m.sort_order, m.target_date, m.closed_at,
+               m.created_at, m.updated_at,
+               COALESCE(SUM(t.status = '\(TaskStatus.done.rawValue)'), 0),
+               COALESCE(SUM(t.status != '\(TaskStatus.dropped.rawValue)'), 0),
+               COALESCE(SUM(t.status NOT IN \(closedStatusSQL)), 0)
+        FROM milestones m JOIN projects p ON p.id = m.project_id LEFT JOIN tasks t ON t.milestone_id = m.id
+        """
+    /// Projects in sidebar order (as `boardOrderSQL`), then each project's milestones.
+    private static let milestoneOrderSQL =
+        "GROUP BY m.id ORDER BY p.archived_at IS NOT NULL, p.sort_order, p.id, m.sort_order, m.id"
+
+    /// A project's milestones (every project's when `projectId` is nil), in order, each with
+    /// its task counts. `includeClosed` false leaves out closed ones; `includeArchived`
+    /// false (with no project given) those of archived projects.
+    public func milestones(projectId: Int64? = nil, includeClosed: Bool = true,
+                           includeArchived: Bool = true) throws -> [Milestone] {
+        lock.lock(); defer { lock.unlock() }
+        var conds: [String] = []
+        var binds: [SQLValue] = []
+        if let projectId { conds.append("m.project_id=?"); binds.append(.int(projectId)) }
+        if !includeClosed { conds.append("m.closed_at IS NULL") }
+        if projectId == nil && !includeArchived { conds.append("p.archived_at IS NULL") }
+        let whereSQL = conds.isEmpty ? "" : "WHERE " + conds.joined(separator: " AND ") + " "
+        return try readMilestones("\(Self.milestoneSelectSQL) \(whereSQL)\(Self.milestoneOrderSQL);", binds)
+    }
+
+    public func milestone(id: Int64) throws -> Milestone {
+        lock.lock(); defer { lock.unlock() }
+        return try milestoneUnlocked(id)
+    }
+
+    /// A project's milestone by name (case-insensitive), or nil.
+    public func milestoneId(projectId: Int64, name: String) -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        return queryInt("SELECT id FROM milestones WHERE project_id=? AND name=? COLLATE NOCASE;",
+                        [.int(projectId), .text(name.trimmingCharacters(in: .whitespacesAndNewlines))])
+    }
+
+    /// A milestone name as stored: trimmed, one line, 1–80 characters, and not "none"
+    /// (list_tasks' word for tasks in no milestone).
+    public static func normalizedMilestoneName(_ raw: String) throws -> String {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw StoreError.invalid("a milestone needs a name") }
+        guard !name.contains(where: \.isNewline) else { throw StoreError.invalid("a milestone name is one line") }
+        guard name.count <= 80 else { throw StoreError.invalid("a milestone name is at most 80 characters") }
+        guard name.lowercased() != "none" else { throw StoreError.invalid("\"none\" is reserved; pick another name") }
+        return name
+    }
+
+    /// Add a milestone at the end of a project's list. The project must exist and not be
+    /// archived, and the name must be free in it (case-insensitive); both checked with the
+    /// INSERT in one BEGIN IMMEDIATE.
+    @discardableResult
+    public func createMilestone(projectId: Int64, name: String, detail: String = "", acceptance: String = "",
+                                targetDate: Date? = nil) throws -> Milestone {
+        try ensureMilestone(projectId: projectId, name: name, detail: detail, acceptance: acceptance,
+                            targetDate: targetDate, reuse: false).milestone
+    }
+
+    /// `createMilestone`, repeat-safe for importers: a milestone of that name already in the
+    /// project is returned as it is (created false; the other fields are not applied).
+    public func ensureMilestone(projectId: Int64, name: String, detail: String = "", acceptance: String = "",
+                                targetDate: Date? = nil) throws -> (milestone: Milestone, created: Bool) {
+        try ensureMilestone(projectId: projectId, name: name, detail: detail, acceptance: acceptance,
+                            targetDate: targetDate, reuse: true)
+    }
+
+    private func ensureMilestone(projectId: Int64, name raw: String, detail: String, acceptance: String,
+                                 targetDate: Date?, reuse: Bool) throws -> (milestone: Milestone, created: Bool) {
+        let name = try Self.normalizedMilestoneName(raw)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            if let existing = queryInt("SELECT id FROM milestones WHERE project_id=? AND name=? COLLATE NOCASE;",
+                                       [.int(projectId), .text(name)]) {
+                guard reuse else {
+                    let code = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "\(projectId)"
+                    throw StoreError.invalid("project \(code) already has a milestone named \(name)")
+                }
+                let m = try milestoneUnlocked(existing)
+                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+                return (m, false)
+            }
+            try requireActiveProjectUnlocked(projectId)
+            let now = Date().timeIntervalSince1970
+            try runWrite(
+                """
+                INSERT INTO milestones (project_id, name, detail, acceptance, sort_order, target_date, created_at, updated_at)
+                VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM milestones WHERE project_id=?), ?, ?, ?);
+                """,
+                [.int(projectId), .text(name), .text(detail), .text(acceptance), .int(projectId),
+                 targetDate.map { .double($0.timeIntervalSince1970) } ?? .null, .double(now), .double(now)])
+            let m = try milestoneUnlocked(lastInsertId())
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return (m, true)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Change a milestone (only given fields). `targetDate` .some(nil) clears it. `closed`
+    /// true closes it (an already closed one keeps its date), false reopens it. A milestone
+    /// is never closed for being done: closing one that still has open tasks is refused
+    /// unless `force` (its exit criteria are the user's call, not a count). Checked and
+    /// written in one BEGIN IMMEDIATE.
+    @discardableResult
+    public func updateMilestone(id: Int64, name: String? = nil, detail: String? = nil, acceptance: String? = nil,
+                                targetDate: Date?? = nil, closed: Bool? = nil, force: Bool = false) throws -> Milestone {
+        let name = try name.map(Self.normalizedMilestoneName)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let old = try milestoneUnlocked(id)
+            var sets: [String] = []
+            var binds: [SQLValue] = []
+            if let name, name != old.name {
+                if let other = queryInt("SELECT id FROM milestones WHERE project_id=? AND name=? COLLATE NOCASE AND id!=?;",
+                                        [.int(old.projectId), .text(name), .int(id)]) {
+                    throw StoreError.invalid("this project already has a milestone named \(name) (id \(other))")
+                }
+                sets.append("name=?"); binds.append(.text(name))
+            }
+            if let detail { sets.append("detail=?"); binds.append(.text(detail)) }
+            if let acceptance { sets.append("acceptance=?"); binds.append(.text(acceptance)) }
+            if let targetDate {
+                sets.append("target_date=?"); binds.append(targetDate.map { .double($0.timeIntervalSince1970) } ?? .null)
+            }
+            let now = Date().timeIntervalSince1970
+            if let closed, closed != old.isClosed {
+                if closed && old.open > 0 && !force {
+                    throw StoreError.invalid("milestone \(old.name) still has \(old.open) open task\(old.open == 1 ? "" : "s"); "
+                                             + "finish or move them first, or close it anyway (force)")
+                }
+                sets.append("closed_at=?"); binds.append(closed ? .double(now) : .null)
+            }
+            if !sets.isEmpty {
+                sets.append("updated_at=?"); binds.append(.double(now))
+                try runWrite("UPDATE milestones SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(id)])
+            }
+            let m = try milestoneUnlocked(id)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return m
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Delete a milestone; its tasks stay, in no milestone (each logged). Returns how many
+    /// tasks it had.
+    @discardableResult
+    public func deleteMilestone(id: Int64) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let m = try milestoneUnlocked(id)
+            let stmt = try prepare("SELECT id FROM tasks WHERE milestone_id=?;", [.int(id)])
+            var taskIds: [Int64] = []
+            while sqlite3_step(stmt) == SQLITE_ROW { taskIds.append(sqlite3_column_int64(stmt, 0)) }
+            sqlite3_finalize(stmt)
+            if !taskIds.isEmpty {
+                try runWrite("UPDATE tasks SET milestone_id=NULL, updated_at=? WHERE milestone_id=?;",
+                             [.int(Int64(Date().timeIntervalSince1970)), .int(id)])
+                for tid in taskIds { logEvent(tid, "milestone", m.name, "") }
+            }
+            try runWrite("DELETE FROM milestones WHERE id=?;", [.int(id)])
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return taskIds.count
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// A milestone-like prefix at the start of `title` ("P2.1 · Hide the dock", "v1.5.0 ·
+    /// Ship"): up to three words before " · " with a digit in them, so "Task · milestone"
+    /// is not one. Pure, no DB: an importer's hint only, never applied by the store.
+    public static func titleMilestoneHint(_ title: String) -> MilestoneHint? {
+        guard let sep = title.range(of: " · ") ?? title.range(of: " \u{2022} ") else { return nil }
+        let prefix = title[..<sep.lowerBound].trimmingCharacters(in: .whitespaces)
+        let rest = title[sep.upperBound...].trimmingCharacters(in: .whitespaces)
+        guard !prefix.isEmpty, !rest.isEmpty, prefix.count <= 24,
+              prefix.split(separator: " ").count <= 3,
+              prefix.contains(where: \.isNumber) else { return nil }
+        return MilestoneHint(prefix: prefix, title: rest)
+    }
+
+    private func milestoneUnlocked(_ id: Int64) throws -> Milestone {
+        guard let m = try readMilestones("\(Self.milestoneSelectSQL) WHERE m.id=? \(Self.milestoneOrderSQL);",
+                                         [.int(id)]).first else {
+            throw StoreError.notFound("milestone \(id)")
+        }
+        return m
+    }
+
+    private func readMilestones(_ sql: String, _ binds: [SQLValue]) throws -> [Milestone] {
+        let stmt = try prepare(sql, binds)
+        defer { sqlite3_finalize(stmt) }
+        func date(_ i: Int32) -> Date? {
+            sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
+        }
+        var out: [Milestone] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(Milestone(
+                id: sqlite3_column_int64(stmt, 0), projectId: sqlite3_column_int64(stmt, 1),
+                name: colText(stmt, 2), detail: colText(stmt, 3), acceptance: colText(stmt, 4),
+                sortOrder: Int(sqlite3_column_int64(stmt, 5)), targetDate: date(6), closedAt: date(7),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 8)),
+                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9)),
+                done: Int(sqlite3_column_int64(stmt, 10)), total: Int(sqlite3_column_int64(stmt, 11)),
+                open: Int(sqlite3_column_int64(stmt, 12))))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    /// The one rule for putting a task in a milestone (create, update, bulk update): the
+    /// milestone exists, is in the task's project, and is open. `current` is the task's
+    /// milestone now: keeping it is always allowed, even once closed.
+    private func requireMilestoneUnlocked(_ milestoneId: Int64, projectId: Int64, current: Int64? = nil) throws {
+        guard milestoneId != current else { return }
+        let m = try milestoneUnlocked(milestoneId)
+        guard m.projectId == projectId else {
+            let code = queryString("SELECT code FROM projects WHERE id=?;", [.int(m.projectId)]) ?? "\(m.projectId)"
+            throw StoreError.invalid("milestone \(m.name) belongs to project \(code); a task's milestone is in its own project")
+        }
+        if m.isClosed { throw StoreError.invalid("milestone \(m.name) is closed; reopen it first") }
+    }
+
+    /// `milestoneId` when a copy of a task in `projectId` can keep it (same project, still
+    /// open), else nil: duplicates and recurrence spawns don't carry a closed milestone.
+    private func carriedMilestoneUnlocked(_ milestoneId: Int64?, projectId: Int64) -> Int64? {
+        guard let milestoneId else { return nil }
+        return (try? requireMilestoneUnlocked(milestoneId, projectId: projectId)) == nil ? nil : milestoneId
+    }
+
+    /// A milestone's name for history rows ("" for none or a missing one).
+    private func milestoneNameUnlocked(_ id: Int64?) -> String {
+        id.flatMap { queryString("SELECT name FROM milestones WHERE id=?;", [.int($0)]) } ?? ""
     }
 
     // MARK: - Notes
@@ -3009,7 +3320,7 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Depends-on codes, parent codes and blocked flags for a batch of tasks, read with
+    /// Depends-on codes, parent codes, milestone names and blocked flags for a batch of tasks, read with
     /// a couple of set queries (chunked IN lists) instead of N per-task lookups.
     /// Throws on a read error rather than returning partial relations.
     public func taskRelations(for tasks: [TodoTask]) throws -> TaskRelations {
@@ -3047,6 +3358,18 @@ public final class Store: @unchecked Sendable {
             }
             guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         }
+        for chunk in Self.chunked(Array(Set(tasks.compactMap(\.milestoneId)))) {
+            let stmt = try prepare(
+                "SELECT id, name FROM milestones WHERE id IN (\(Self.placeholders(chunk.count)));",
+                chunk.map { .int($0) })
+            defer { sqlite3_finalize(stmt) }
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                rel.milestoneNames[sqlite3_column_int64(stmt, 0)] = colText(stmt, 1)
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        }
         return rel
     }
 
@@ -3080,7 +3403,7 @@ public final class Store: @unchecked Sendable {
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
         //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds,
-        //          waiting_on, waiting_reason, waiting_since, branch
+        //          waiting_on, waiting_reason, waiting_since, branch, milestone_id
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
@@ -3112,7 +3435,8 @@ public final class Store: @unchecked Sendable {
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13)),
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14)),
             sortOrder: Int(sqlite3_column_int64(stmt, 15)),
-            branch: colTextOpt(stmt, 22)
+            branch: colTextOpt(stmt, 22),
+            milestoneId: int64Opt(23)
         )
     }
 

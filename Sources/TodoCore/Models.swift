@@ -109,7 +109,8 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
 /// `TaskNote`s, appended without rewriting the task). `link` is the URL of its primary
 /// `TaskLink`, the first that is not a branch (the legacy single link, kept in step by
 /// the store); `branch` the git
-/// branch the work is on now, nil when none.
+/// branch the work is on now, nil when none. `milestoneId` is the project milestone the task
+/// counts toward (another grouping than its parent), nil when none.
 public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64
     public var code: String          // short human handle, e.g. "GEN-3"
@@ -134,6 +135,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var updatedAt: Date
     public var sortOrder: Int
     public var branch: String?
+    public var milestoneId: Int64?
 
     public init(
         id: Int64,
@@ -158,7 +160,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         createdAt: Date,
         updatedAt: Date,
         sortOrder: Int,
-        branch: String? = nil
+        branch: String? = nil,
+        milestoneId: Int64? = nil
     ) {
         self.id = id
         self.code = code
@@ -183,6 +186,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.updatedAt = updatedAt
         self.sortOrder = sortOrder
         self.branch = branch
+        self.milestoneId = milestoneId
     }
 }
 
@@ -193,6 +197,7 @@ public struct TaskRelations: Sendable {
     public var parentCodes: [Int64: String] = [:]       // parent task id → its code
     public var blockedIds: Set<Int64> = []              // open tasks with >=1 open dependency (closed tasks never)
     public var blockedBy: [Int64: [(id: Int64, code: String)]] = [:]  // task id → the open dependencies blocking it
+    public var milestoneNames: [Int64: String] = [:]    // milestone id → its name
 
     public init() {}
 }
@@ -208,16 +213,26 @@ public struct TaskFilter: Sendable {
     public var parentId: Int64?          // direct subtasks of this task
     public var includeArchived: Bool     // cross-project lists: also tasks of archived projects
     public var sort: TaskSort            // status groups first (default), or the saved board order only
+    public var milestone: MilestoneFilter?   // in this milestone, or in none
 
     public init(projectId: Int64? = nil, statuses: [TaskStatus]? = nil, tag: String? = nil, parentId: Int64? = nil,
-                includeArchived: Bool = false, sort: TaskSort = .status) {
+                includeArchived: Bool = false, sort: TaskSort = .status, milestone: MilestoneFilter? = nil) {
         self.projectId = projectId
         self.statuses = statuses
         self.tag = tag
         self.parentId = parentId
         self.includeArchived = includeArchived
         self.sort = sort
+        self.milestone = milestone
     }
+}
+
+/// `TaskFilter.milestone`: tasks of one milestone (by id, or by name in any project, the
+/// name compared case-insensitively), or tasks in no milestone.
+public enum MilestoneFilter: Hashable, Sendable {
+    case id(Int64)
+    case named(String)
+    case unassigned
 }
 
 /// How `Store.listTasks(matching:)` orders its result.
@@ -431,6 +446,61 @@ public struct RelatedTasks: Hashable, Sendable {
 
     public subscript(kind: RelationKind) -> [RelatedTask] { byKind[kind] ?? [] }
     public var isEmpty: Bool { byKind.values.allSatisfy(\.isEmpty) }
+}
+
+/// A named stage of a project ("Phase 2 Hide", "v1.5.0") that tasks count toward: a
+/// grouping beside parent/subtask, never in place of it (a task's parent and its milestone
+/// are independent). `acceptance` is the exit criteria, kept apart from the tasks: a
+/// milestone closes only when someone closes it (`closedAt`), never because its tasks are
+/// done. `done` / `total` count its tasks, subtasks included, dropped ones left out of
+/// both; `open` counts the tasks not yet closed.
+public struct Milestone: Identifiable, Hashable, Sendable {
+    public let id: Int64
+    public let projectId: Int64
+    public var name: String
+    public var detail: String
+    public var acceptance: String
+    public var sortOrder: Int
+    public var targetDate: Date?
+    public var closedAt: Date?
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var done: Int
+    public var total: Int
+    public var open: Int
+
+    public var isClosed: Bool { closedAt != nil }
+
+    public init(id: Int64, projectId: Int64, name: String, detail: String = "", acceptance: String = "",
+                sortOrder: Int = 0, targetDate: Date? = nil, closedAt: Date? = nil,
+                createdAt: Date, updatedAt: Date, done: Int = 0, total: Int = 0, open: Int = 0) {
+        self.id = id
+        self.projectId = projectId
+        self.name = name
+        self.detail = detail
+        self.acceptance = acceptance
+        self.sortOrder = sortOrder
+        self.targetDate = targetDate
+        self.closedAt = closedAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.done = done
+        self.total = total
+        self.open = open
+    }
+}
+
+/// A milestone-like prefix at the start of a task title, as older lists wrote stages before
+/// milestones existed: "P2.1 · Hide the dock" → prefix "P2.1", title "Hide the dock". Only a
+/// hint for an importer (`Store.titleMilestoneHint`): it never sets a milestone by itself.
+public struct MilestoneHint: Hashable, Sendable {
+    public let prefix: String
+    public let title: String
+
+    public init(prefix: String, title: String) {
+        self.prefix = prefix
+        self.title = title
+    }
 }
 
 /// One saved version of an agent guide (Store.saveGuide). `projectId` nil is the guide

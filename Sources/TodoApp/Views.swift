@@ -404,8 +404,9 @@ struct ProjectSidebar: View {
 
 }
 
-/// The thin done/total bar under a sidebar project name; empty when `total` is 0.
-private struct ProjectProgressBar: View {
+/// The thin done/total bar under a sidebar project name (and a milestone); empty when
+/// `total` is 0.
+struct ProjectProgressBar: View {
     let done: Int
     let total: Int
 
@@ -793,6 +794,7 @@ struct TaskListView: View {
     @State private var showNew = false
     // Collapsed-done preference persists across launches.
     @AppStorage("qbShowDoneTasks") private var showDone = false
+    @AppStorage("qbGroupByMilestone") private var groupByMilestone = false
     @State private var newTitle = ""
 
     var body: some View {
@@ -802,6 +804,7 @@ struct TaskListView: View {
             } else {
                 VStack(spacing: 0) {
                     SearchBar(query: $model.searchQuery)
+                    if !projectMilestones.isEmpty { MilestoneGroupBar(grouped: $groupByMilestone) }
                     Divider()
                     taskContent
                 }
@@ -859,18 +862,10 @@ struct TaskListView: View {
                     Divider()
                 }
                 List(selection: $model.selectedTaskIds) {
-                    ForEach(activeTasks) { task in
-                        taskRowCell(task)
-                    }
-                    .onMove { offsets, dest in
-                        // Reordering rewrites a dense sort_order for exactly the ids passed in.
-                        // That is only correct within a single project's full, unfiltered list.
-                        // While searching, activeTasks is a filtered subset, so a drag would
-                        // clobber the ordering of hidden tasks. In a smart view the rows span
-                        // multiple projects, so a global reorder scrambles each project's
-                        // per-project ordering. Disable reordering in both cases.
-                        guard model.smartView == nil, !isSearching else { return }
-                        model.moveTasks(activeTasks, from: offsets, to: dest)
+                    if groupsByMilestone {
+                        milestoneSections
+                    } else {
+                        orderedActiveRows
                     }
                     // Closed (done and dropped) quests collapse into a toggle section at the bottom.
                     if !doneTasks.isEmpty {
@@ -886,6 +881,59 @@ struct TaskListView: View {
                 // canvas shows through (matches sidebar/detail panes).
                 .scrollContentBackground(.hidden)
                 .qbParchment()
+            }
+        }
+    }
+
+    /// The active tasks in their saved order, reorderable by drag.
+    private var orderedActiveRows: some View {
+        ForEach(activeTasks) { task in
+            taskRowCell(task)
+        }
+        .onMove { offsets, dest in
+            // Reordering rewrites a dense sort_order for exactly the ids passed in.
+            // That is only correct within a single project's full, unfiltered list.
+            // While searching, activeTasks is a filtered subset, so a drag would
+            // clobber the ordering of hidden tasks. In a smart view the rows span
+            // multiple projects, so a global reorder scrambles each project's
+            // per-project ordering. Disable reordering in both cases.
+            guard model.smartView == nil, !isSearching else { return }
+            model.moveTasks(activeTasks, from: offsets, to: dest)
+        }
+    }
+
+    /// The selected project's milestones (none in a smart view).
+    private var projectMilestones: [Milestone] {
+        guard model.smartView == nil, let pid = model.selectedProjectId else { return [] }
+        return model.milestones(in: pid)
+    }
+
+    private var groupsByMilestone: Bool { groupByMilestone && !projectMilestones.isEmpty }
+
+    /// Active tasks grouped by milestone, in the project's milestone order, then the tasks in
+    /// none. An open milestone shows even with no active task (its progress still counts);
+    /// a closed one only while it has some. While searching, empty groups are left out.
+    /// A subtask stays under its parent, whichever milestone it is in. Drag-to-reorder is
+    /// off while grouped (order is per project, not per group).
+    private var milestoneGroups: [(id: Int64, milestone: Milestone?, tasks: [TodoTask])] {
+        let byMilestone = Dictionary(grouping: activeTasks) { $0.milestoneId ?? 0 }
+        let known = Set(projectMilestones.map(\.id))
+        var groups = projectMilestones.compactMap { m -> (id: Int64, milestone: Milestone?, tasks: [TodoTask])? in
+            let tasks = byMilestone[m.id] ?? []
+            if tasks.isEmpty && (m.isClosed || isSearching) { return nil }
+            return (m.id, m, tasks)
+        }
+        let rest = activeTasks.filter { !known.contains($0.milestoneId ?? 0) }
+        if !rest.isEmpty { groups.append((0, nil, rest)) }
+        return groups
+    }
+
+    private var milestoneSections: some View {
+        ForEach(milestoneGroups, id: \.id) { group in
+            Section {
+                ForEach(group.tasks) { taskRowCell($0) }
+            } header: {
+                MilestoneSectionHeader(milestone: group.milestone)
             }
         }
     }
@@ -933,7 +981,8 @@ struct TaskListView: View {
     private func taskRowCell(_ task: TodoTask) -> some View {
         TaskRow(task: task,
                 subtasks: subtasks(of: task),
-                showSubtaskUI: model.smartView == nil)
+                showSubtaskUI: model.smartView == nil,
+                showMilestone: !groupsByMilestone)
             .tag(task.id)
             // Replace the system accent selection fill — fixed ink/steel row
             // text is unreadable on it. Selection-gold matches the sidebar.
@@ -1117,6 +1166,7 @@ struct TaskRow: View {
     let task: TodoTask
     var subtasks: [TodoTask] = []
     var showSubtaskUI: Bool = false
+    var showMilestone: Bool = true
 
     @State private var addingSubtask = false
     @State private var newSubtaskTitle = ""
@@ -1184,6 +1234,7 @@ struct TaskRow: View {
                             Image(systemName: "link").font(.caption2).foregroundStyle(Theme.Colors.steel)
                         }
                         if let branch = task.branch { BranchChip(name: branch) }
+                        if showMilestone, let m = model.milestone(task.milestoneId) { MilestoneChip(name: m.name) }
                         if task.effortSeconds > 0 {
                             Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
                                 .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
@@ -1724,7 +1775,7 @@ struct TaskDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                 referenceSection(task)
-                taskSection
+                taskSection(task)
                 dueDateSection
                 tagsSection
                 relationsSection(task)
@@ -1750,7 +1801,7 @@ struct TaskDetailView: View {
         }
     }
 
-    private var taskSection: some View {
+    private func taskSection(_ task: TodoTask) -> some View {
         QBDetailSection("Task") {
             TextField("Title", text: $title).qbField()
             Picker("Status", selection: $status) {
@@ -1775,6 +1826,9 @@ struct TaskDetailView: View {
                 }
                 .labelsHidden()
                 .fixedSize()
+            }
+            if task.milestoneId != nil || !model.milestones(in: task.projectId).isEmpty {
+                labeledRow("Milestone") { MilestonePicker(task: task) }
             }
         }
     }
@@ -2643,6 +2697,15 @@ func fmtDateTime(_ d: Date) -> String {
     return f.string(from: d)
 }
 
+/// Format a date as "Nov 15", locale-safe (Gregorian).
+func fmtShortDate(_ d: Date) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.calendar = Calendar(identifier: .gregorian)
+    f.dateFormat = "MMM d"
+    return f.string(from: d)
+}
+
 /// Small tag pill — `badge-tag-purple`: lavender surface, brand-blue text, full pill.
 struct TagChip: View {
     let text: String
@@ -2901,6 +2964,7 @@ struct NameSheet: View {
     let title: String
     let placeholder: String
     @Binding var text: String
+    var actionTitle = "Create"
     let onCreate: () -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -2915,7 +2979,7 @@ struct NameSheet: View {
                 Button("Cancel") { dismiss() }
                     .buttonStyle(QBSecondaryButtonStyle(compact: true))
                     .keyboardShortcut(.cancelAction)
-                Button("Create") { create() }
+                Button(actionTitle) { create() }
                     .buttonStyle(QBPrimaryButtonStyle(compact: true))
                     .keyboardShortcut(.defaultAction)
                     .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)

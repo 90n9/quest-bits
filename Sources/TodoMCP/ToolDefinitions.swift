@@ -26,6 +26,10 @@ extension MCPServer {
         let guideScope: [String: Any] = ["global": ["type": "boolean", "description": "true: the user's guide for every project"] as [String: Any],
                                          "project_id": int, "project_code": str]
         let repoPathStr: [String: Any] = ["type": ["string", "null"], "description": "absolute folder (or starting with ~) of the project's repo or workspace; stored with ~ expanded"]
+        let milestoneStr: [String: Any] = ["type": ["string", "null"], "description": "name of an open milestone of the task's project (see list_milestones); null takes the task out of its milestone"]
+        let milestoneInt: [String: Any] = ["type": ["integer", "null"], "description": "id form of milestone"]
+        let milestoneRef: [String: Any] = ["id": int, "project_id": int, "project_code": str,
+                                           "name": ["type": "string", "description": "the milestone's name, with project_code or project_id (or give its id)"] as [String: Any]]
         let questionFilter: [String: Any] = ["project_id": int, "project_code": str,
                                              "session": ["type": "string", "description": "only questions asked with this session label"] as [String: Any]]
 
@@ -68,7 +72,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "list_tasks",
-             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Without `project_id`/`project_code` or `parent_id`/`parent_code`, tasks of archived projects are left out unless `include_archived` is true. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task). Sorted in_progress, waiting, todo, done, dropped, then by board order (projects in sidebar order, then each project's own task order). With `sort` \"board\" the status grouping is dropped and you get the saved order the app shows (set with reorder_tasks): each top-level task in order, followed by its own subtasks in order; use it to read back an order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on, branch. To read detail, links and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
+             "description": "List tasks. By default only open tasks (todo, in_progress, waiting) in the compact view. Without `project_id`/`project_code` or `parent_id`/`parent_code`, tasks of archived projects are left out unless `include_archived` is true. Filters (all optional, combined with AND): `project_id`/`project_code`, `status` (a status, an array of statuses, or \"all\" to include done and dropped), `tag` (one whole tag; case-insensitive for ASCII letters only), `parent_id`/`parent_code` (subtasks of that task), `milestone` (a milestone's name — within the project when one is given, else in any project — or \"none\" for tasks in no milestone) or `milestone_id`. Sorted in_progress, waiting, todo, done, dropped, then by board order (projects in sidebar order, then each project's own task order). With `sort` \"board\" the status grouping is dropped and you get the saved order the app shows (set with reorder_tasks): each top-level task in order, followed by its own subtasks in order; use it to read back an order. The compact view gives code, title, status, and only when set: priority, parent, blocked_by (open dependencies blocking it), tags, due_date, waiting_on, branch, milestone (its name). To read detail, links and the other fields use get_task, or pass view \"full\" for get_task's shape. list_tasks never includes notes; get_task does.",
              "inputSchema": obj([
                 "project_id": int, "project_code": str,
                 "status": ["anyOf": [
@@ -76,34 +80,38 @@ extension MCPServer {
                     ["type": "array", "items": statusEnum, "minItems": 1]
                 ], "description": "status or statuses to include; \"all\" = every status. Default: open (todo, in_progress, waiting)."] as [String: Any],
                 "tag": str, "parent_id": int, "parent_code": str,
+                "milestone": ["type": "string", "description": "a milestone name, or \"none\" for tasks in no milestone"] as [String: Any],
+                "milestone_id": int,
                 "include_archived": ["type": "boolean", "description": "with no project or parent given, also list tasks of archived projects (default false)"] as [String: Any],
                 "view": ["type": "string", "enum": ["compact", "full"], "description": "compact (default) or full (same fields as get_task, without notes)"] as [String: Any],
                 "sort": ["type": "string", "enum": TaskSort.allCases.map(\.rawValue), "description": "status (default): status groups, then board order; board: the saved order only, status ignored"] as [String: Any]
              ])],
 
             ["name": "get_task",
-             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, links, branch, due_date, detail, effort or estimate; `links` [{id, kind, url, title, author, source, created_at}] lists the task's links oldest first (kind pr|design|doc|file|branch|other; title, author and source only when known), `link` is the url of the first one that is not a branch (the older single-link field), and `branch` is the git branch the work is on now; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{id, ts, text, kind, author, session, edited_at, question_id}] (kind omitted when \"note\"; author user|agent, absent on notes from before 1.4.0; no `notes` key when there are none), and `more_notes: true` when older notes were left out. Questions still open or answered-but-not-resumed (see ask_user) are in `questions`. `relations` (only when it has any) groups the tasks it is related to, across projects, by kind: blocked_by (its dependencies, open or closed), blocks (tasks that depend on it), relates, duplicates (it is a duplicate of these), duplicated_by; each entry is {code, title, status}. `detail` is markdown; images the user attached in the app are linked as `attachments/<file>`, and `attachments` lists those files' absolute paths so you can open them.",
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, links, branch, due_date, detail, effort or estimate; `links` [{id, kind, url, title, author, source, created_at}] lists the task's links oldest first (kind pr|design|doc|file|branch|other; title, author and source only when known), `link` is the url of the first one that is not a branch (the older single-link field), and `branch` is the git branch the work is on now; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks; `milestone` (name) and `milestone_id` only when the task is in one. Includes the latest notes (see add_note) newest first as `notes` [{id, ts, text, kind, author, session, edited_at, question_id}] (kind omitted when \"note\"; author user|agent, absent on notes from before 1.4.0; no `notes` key when there are none), and `more_notes: true` when older notes were left out. Questions still open or answered-but-not-resumed (see ask_user) are in `questions`. `relations` (only when it has any) groups the tasks it is related to, across projects, by kind: blocked_by (its dependencies, open or closed), blocks (tasks that depend on it), relates, duplicates (it is a duplicate of these), duplicated_by; each entry is {code, title, status}. `detail` is markdown; images the user attached in the app are linked as `attachments/<file>`, and `attachments` lists those files' absolute paths so you can open them.",
              "inputSchema": obj([
                 "id": int, "code": str,
                 "notes_limit": ["type": "integer", "minimum": 0, "maximum": 100, "description": "how many latest notes to include (default 5, 0 = none, max 100)"] as [String: Any]
              ])],
 
             ["name": "create_task",
-             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, branch, priority, due_date, tags, recurrence optional (link becomes the task's primary link, its kind guessed; add more with add_link); status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). The project (given or the parent's) must not be archived. Returns the task with its new code (same shape as get_task, without notes).",
+             "description": "Create a task under a project (give `project_id` or `project_code`). detail, link, branch, priority, due_date, tags, recurrence optional (link becomes the task's primary link, its kind guessed; add more with add_link); status defaults to todo. status waiting needs `waiting_on` (user|external) and takes an optional `waiting_reason`. Pass `parent_id` or `parent_code` to make it a subtask of another task (one level of nesting). `milestone` (name) or `milestone_id` puts it in an open milestone of its project. The project (given or the parent's) must not be archived. Returns the task with its new code (same shape as get_task, without notes).",
              "inputSchema": obj([
                 "project_id": int, "project_code": str, "title": str, "detail": str, "link": str, "branch": branchStr,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
                 "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
-                "estimate_minutes": estimateInt, "parent_id": int, "parent_code": str
+                "estimate_minutes": estimateInt, "parent_id": int, "parent_code": str,
+                "milestone": milestoneStr, "milestone_id": milestoneInt
              ], required: ["title"])],
 
             ["name": "update_task",
-             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, branch:null, due_date:null, or recurrence:null to clear them. `link` is the older single-link field: it replaces the task's primary link (the first that is not a branch) or adds it, and null removes that link; to keep several links use add_link / remove_link. `branch` is the git branch the work is on now. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). Priority does not change where a task sits; reorder_tasks does that. status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Optional `note` adds a note in the same write, linked to the status change: its `note_kind` defaults to summary when the update closes the task (done/dropped) and to note otherwise. A summary is never required to close a task. `parent_code`/`parent_id` moves the task under a top-level task of the same project (one level of nesting: a task with subtasks, or a recurring one, cannot become a subtask); null makes it top-level again. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
+             "description": "Update a task by `id` or `code`. Only provided fields change. Pass link:null, branch:null, due_date:null, or recurrence:null to clear them. `link` is the older single-link field: it replaces the task's primary link (the first that is not a branch) or adds it, and null removes that link; to keep several links use add_link / remove_link. `branch` is the git branch the work is on now. Use this to update progress status, priority, due date, tags, recurrence, or estimate_minutes (0 clears the estimate). Priority does not change where a task sits; reorder_tasks does that. status waiting needs `waiting_on` (user|external) unless the task is already waiting; `waiting_reason` is optional. Moving to any other status clears waiting_on/waiting_reason, and setting them on a task that is not (or will not be) waiting is an error. status dropped abandons a task but keeps it and its history: it closes like done (dependents unblock) but is not a completion (no completed_at, not in daily_stats, a recurring task spawns no next occurrence). To log progress use add_note; do not append to detail. Optional `note` adds a note in the same write, linked to the status change: its `note_kind` defaults to summary when the update closes the task (done/dropped) and to note otherwise. A summary is never required to close a task. `parent_code`/`parent_id` moves the task under a top-level task of the same project (one level of nesting: a task with subtasks, or a recurring one, cannot become a subtask); null makes it top-level again. `milestone` (name of an open milestone of the task's project) or `milestone_id` puts the task in that milestone; null takes it out. A milestone is a grouping beside parent/subtask: setting one never moves the task under a parent, and finishing a milestone's tasks never closes it. Returns the updated task (same shape as get_task, without notes; omitted fields are empty/default).",
              "inputSchema": obj([
                 "id": int, "code": str, "title": str, "detail": str, "link": str, "branch": branchStr,
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
                 "priority": priorityEnum, "due_date": dateStr, "tags": tagsArr, "recurrence": recurrenceEnum,
                 "estimate_minutes": estimateInt, "parent_code": parentStr, "parent_id": parentInt,
+                "milestone": milestoneStr, "milestone_id": milestoneInt,
                 "note": ["type": "string", "description": "optional note to add with this update, e.g. a closing summary: what was done, files/PRs, what is left"] as [String: Any],
                 "note_kind": noteKindEnum, "session": sessionStr
              ])],
@@ -113,11 +121,11 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "duplicate_task",
-             "description": "Clone a task (by `id` or `code`); the copy gets a fresh code. Without a target (or with its own project) it duplicates in the same project for reuse: the copy starts as a todo, and status, started/completed times and waiting fields are not copied. With another project as `to_project_id`/`to_project_code` it copies the task there as is (original kept): status, started/completed times and waiting fields carry over. A target project must not be archived.",
+             "description": "Clone a task (by `id` or `code`); the copy gets a fresh code. Without a target (or with its own project) it duplicates in the same project for reuse: the copy starts as a todo, and status, started/completed times and waiting fields are not copied. With another project as `to_project_id`/`to_project_code` it copies the task there as is (original kept): status, started/completed times and waiting fields carry over. A copy keeps the task's milestone within the same project (while that milestone is open), never in another project. A target project must not be archived.",
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "move_task",
-             "description": "Move (transfer) a task (by `id` or `code`) to another project (`to_project_id` or `to_project_code`), which must not be archived.",
+             "description": "Move (transfer) a task (by `id` or `code`) to another project (`to_project_id` or `to_project_code`), which must not be archived. Milestones belong to a project, so the task and its subtasks leave theirs.",
              "inputSchema": obj(["id": int, "code": str, "to_project_id": int, "to_project_code": str])],
 
             ["name": "reorder_tasks",
@@ -129,12 +137,13 @@ extension MCPServer {
              ])],
 
             ["name": "bulk_update_tasks",
-             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, waiting_on, waiting_reason, priority, due_date, add_tags, parent_code/parent_id to all. add_tags merges (keeps existing). Waiting and parent rules match update_task. All or nothing: if any task fails (e.g. the waiting rule), no task changes.",
+             "description": "Update many tasks at once (give `ids` and/or `codes` arrays). Applies any of status, waiting_on, waiting_reason, priority, due_date, add_tags, parent_code/parent_id, milestone/milestone_id (a milestone name is looked up in the first task's project; every task must be in that project) to all. add_tags merges (keeps existing). Waiting and parent rules match update_task. All or nothing: if any task fails (e.g. the waiting rule), no task changes.",
              "inputSchema": obj([
                 "ids": ["type": "array", "items": int], "codes": ["type": "array", "items": str],
                 "status": statusEnum, "waiting_on": waitingOnEnum, "waiting_reason": waitingReasonStr,
                 "priority": priorityEnum, "due_date": dateStr, "add_tags": tagsArr,
-                "parent_code": parentStr, "parent_id": parentInt
+                "parent_code": parentStr, "parent_id": parentInt,
+                "milestone": milestoneStr, "milestone_id": milestoneInt
              ])],
 
             ["name": "bulk_move_tasks",
@@ -242,6 +251,31 @@ extension MCPServer {
             ["name": "remove_link",
              "description": "Remove a link from a task: give the task (`id` or `code`) and the link's `url`, or the link's `link_id` alone. Returns {task, removed: {id, kind, url, ...}}; a link the task does not have is an error.",
              "inputSchema": obj(["id": int, "code": str, "url": str, "link_id": int])],
+
+            ["name": "list_milestones",
+             "description": "A project's milestones (`project_id`/`project_code`), or with no project those of every active project, in order. A milestone is a named stage of one project (e.g. \"Phase 2 Hide\", \"v1.5.0\") that tasks count toward, beside parent/subtask. Closed ones are left out unless `include_closed` is true. Each: {id, project (code), name, done, total, open, description?, acceptance?, target_date?, closed_at?}; done/total count its tasks (subtasks included, dropped ones in neither), open counts those not done or dropped. `acceptance` is its exit criteria: a milestone whose tasks are all done is not finished until its acceptance is met and someone closes it.",
+             "inputSchema": obj(["project_id": int, "project_code": str,
+                                 "include_closed": ["type": "boolean", "description": "also list closed milestones (default false)"] as [String: Any]])],
+
+            ["name": "create_milestone",
+             "description": "Add a milestone at the end of a project's list (`project_id`/`project_code`, not archived). `name` is unique in the project (case-insensitive, not \"none\"). Optional `description`, `acceptance` (the exit criteria, e.g. \"CHU-29 daily driver for a week\") and `target_date`. Put tasks in it with update_task / bulk_update_tasks `milestone`. Do not create milestones from title prefixes such as \"P2.1 ·\" on your own: a prefix is a hint, not proof of the stage. Returns the milestone as list_milestones does.",
+             "inputSchema": obj(["project_id": int, "project_code": str, "name": str, "description": str,
+                                 "acceptance": ["type": "string", "description": "exit criteria, kept apart from the tasks"] as [String: Any],
+                                 "target_date": dateStr], required: ["name"])],
+
+            ["name": "update_milestone",
+             "description": "Change a milestone, by `id` or by `name` with `project_code`/`project_id`: `new_name`, `description`, `acceptance`, `target_date` (null clears it), `closed` (true closes, false reopens). A milestone never closes by itself when its tasks are done; close it only when its acceptance is met and the user agrees. Closing one that still has open tasks is refused unless `force` is true. A closed milestone takes no new tasks (its tasks keep it). Returns the milestone.",
+             "inputSchema": obj(milestoneRef.merging([
+                "new_name": str, "description": str,
+                "acceptance": ["type": "string", "description": "exit criteria, kept apart from the tasks"] as [String: Any],
+                "target_date": dateStr,
+                "closed": ["type": "boolean", "description": "true closes the milestone, false reopens it"] as [String: Any],
+                "force": ["type": "boolean", "description": "close even though tasks are still open"] as [String: Any]
+             ]) { a, _ in a })],
+
+            ["name": "delete_milestone",
+             "description": "Delete a milestone, by `id` or by `name` with `project_code`/`project_id`. Its tasks are kept, in no milestone. Returns {deleted (name), project, unassigned (how many tasks it had)}.",
+             "inputSchema": obj(milestoneRef)],
 
             ["name": "list_templates",
              "description": "List all reusable task templates. Each has an `id`, `name`, and the preset fields (title, detail, priority, tags, estimate_minutes) applied to tasks spawned from it.",
