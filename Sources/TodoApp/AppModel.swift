@@ -2,8 +2,8 @@ import Foundation
 import Combine
 import SwiftUI
 
-/// Top-level observable state for the app. Wraps the shared Store, watches the DB
-/// file for external (MCP) writes, and owns the pomodoro engine.
+/// Top-level observable state for the app. Wraps the shared Store and watches the DB
+/// file for external (MCP) writes.
 /// Cross-project smart filters shown in the sidebar.
 enum SmartView: String, CaseIterable {
     case allTasks
@@ -92,7 +92,6 @@ final class AppModel: ObservableObject {
     @Published var wikiSelection: WikiItem?
     @Published var wikiQuery = "" { didSet { if wikiQuery != oldValue { reloadWiki() } } }
     @Published var daySeries: [DayStat] = []
-    @Published var projectEfforts: [ProjectEffort] = []
 
     /// The single selected task id, or nil when zero or multiple are selected.
     var selectedTaskId: Int64? { selectedTaskIds.count == 1 ? selectedTaskIds.first : nil }
@@ -123,8 +122,7 @@ final class AppModel: ObservableObject {
         if let sv = smartView { return !sv.isSingleStatus }
         return true
     }
-    @Published var stats: DailyStats = DailyStats(date: "", completedPomodoros: 0, totalFocusSeconds: 0)
-    @Published var settings: PomodoroSettings = .standard
+    @Published var settings: AppSettings = .standard
 
     // Set by menu commands; views observe these to open their create sheets.
     @Published var pendingNewProject = false
@@ -154,47 +152,19 @@ final class AppModel: ObservableObject {
     private var toastSeq = 0
 
     let store: Store
-    let pomodoro: PomodoroEngine
 
     private var watchTimer: Timer?
     private var lastDBStamp: TimeInterval = 0
-    private var effortBuffer = 0                 // unflushed focused seconds
-    private var cancellables = Set<AnyCancellable>()
 
     init() {
         // App + MCP share the default DB location.
         let store = (try? Store()) ?? { fatalError("cannot open store") }()
         self.store = store
-        let loaded = (try? store.loadSettings()) ?? .standard
-        self.settings = loaded
-        self.pomodoro = PomodoroEngine(store: store, settings: loaded)
+        self.settings = (try? store.loadSettings()) ?? .standard
         reloadAll()
         if selectedProjectId == nil { selectedProjectId = (activeProjects.first ?? projects.first)?.id }
         reloadTasks()
         startWatching()
-
-        // Effort: accrue focused seconds onto in-progress tasks; flush when the timer stops.
-        pomodoro.onFocusSecond = { [weak self] in self?.accrueEffortSecond() }
-        pomodoro.$running.dropFirst().sink { [weak self] running in
-            if !running { self?.flushEffort() }
-        }.store(in: &cancellables)
-    }
-
-    // MARK: - Effort accrual
-
-    private func accrueEffortSecond() {
-        effortBuffer += 1
-        if effortBuffer >= 5 { flushEffort() }   // batch writes
-    }
-
-    private func flushEffort() {
-        guard effortBuffer > 0 else { return }
-        let seconds = effortBuffer
-        effortBuffer = 0
-        let ids = (try? store.inProgressTaskIds()) ?? []
-        guard !ids.isEmpty else { return }
-        for id in ids { try? store.addEffort(toTaskId: id, seconds: seconds) }
-        reloadTasks(timeline: false)   // effort is not on the timeline
     }
 
     // MARK: - Reload
@@ -207,18 +177,16 @@ final class AppModel: ObservableObject {
             projectTab = .tasks
         }
         reloadTasks()
-        reloadStats()
         if showDashboard { reloadDashboard() }
         reloadWiki()
     }
 
     func reloadDashboard() {
         daySeries = (try? store.dailyStatsSeries(days: 7)) ?? []
-        projectEfforts = (try? store.effortByProject()) ?? []
     }
 
     /// `timeline` false skips the selected task's notes / history / questions, for a write
-    /// that cannot change them (the effort flush every few seconds while a timer runs).
+    /// that cannot change them.
     func reloadTasks(timeline: Bool = true) {
         let all = (try? store.listTasks(projectId: nil)) ?? []
         // Cross-project views (smart views, menu bar) leave out archived projects; a
@@ -244,8 +212,8 @@ final class AppModel: ObservableObject {
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
         let blocking = (try? store.blockingCounts()) ?? blockingCounts
         if blocking != blockingCounts { blockingCounts = blocking }
-        // Publish only on a change: most polls and effort flushes leave the counts as
-        // they were, and the sidebar needn't redraw.
+        // Publish only on a change: most polls leave the counts as they were, and the
+        // sidebar needn't redraw.
         let counts = ProjectCounts.byProject(all)
         if counts != projectCounts { projectCounts = counts }
         let ms = (try? store.milestones()) ?? milestones
@@ -287,10 +255,6 @@ final class AppModel: ObservableObject {
             tasks: allTasks,
             enabled: settings.notificationsEnabled,
             soundEnabled: settings.soundEnabled)
-    }
-
-    func reloadStats() {
-        stats = (try? store.dailyStats()) ?? stats
     }
 
     func selectProject(_ id: Int64?) {
@@ -1182,10 +1146,6 @@ final class AppModel: ObservableObject {
 
     var selectedTask: TodoTask? { tasks.first(where: { $0.id == selectedTaskId }) }
 
-    func toggleTimer() {
-        if pomodoro.running { pomodoro.pause() } else { pomodoro.startFocus() }
-    }
-
     /// Copy a code to the clipboard and flash a confirmation toast.
     func copyCode(_ code: String) {
         copyToClipboard(code)
@@ -1325,9 +1285,8 @@ final class AppModel: ObservableObject {
 
     // MARK: - Settings
 
-    func saveSettings(_ s: PomodoroSettings) {
+    func saveSettings(_ s: AppSettings) {
         settings = s
-        pomodoro.settings = s
         try? store.saveSettings(s)
         // Toggling notifications/sound takes effect immediately for due reminders.
         syncDueReminders((try? store.listTasks(projectId: nil)) ?? [])

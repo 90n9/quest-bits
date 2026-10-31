@@ -15,7 +15,7 @@ extension MCPServer {
         let dateStr: [String: Any] = ["type": "string", "description": "ISO-8601 or yyyy-MM-dd; null to clear"]
         let tagsArr: [String: Any] = ["type": "array", "items": str]
         let recurrenceEnum: [String: Any] = ["type": "string", "enum": ["daily", "weekly", "monthly"], "description": "repeat interval; null to clear. On completion, spawns the next occurrence with the due date advanced."]
-        let estimateInt: [String: Any] = ["type": "integer", "description": "planned effort in minutes (0 = unset). Compared against actual tracked effort_minutes."]
+        let estimateInt: [String: Any] = ["type": "integer", "description": "planned effort in minutes (0 = unset). Shown beside the task's effort_minutes when it has any."]
         let noteKindEnum: [String: Any] = ["type": "string", "enum": NoteKind.writable.map(\.rawValue)]
         let branchStr: [String: Any] = ["type": "string", "description": "the git branch the task's work is on now; null clears it"]
         let linkKindEnum: [String: Any] = ["type": "string", "enum": LinkKind.allCases.map(\.rawValue), "description": "what the link points at; guessed from the url when omitted"]
@@ -406,7 +406,7 @@ extension MCPServer {
              ]) { a, _ in a })],
 
             ["name": "daily_stats",
-             "description": "Today's pomodoro stats: completed count and total focus minutes.",
+             "description": "Tasks completed today (local day), across every project: {date (yyyy-MM-dd), tasks_completed (top-level tasks), subtasks_completed}. Dropped tasks are not completions and never count.",
              "inputSchema": obj([:])]
         ]
     }

@@ -12,7 +12,6 @@ struct TodoAppMain: App {
         WindowGroup {
             ContentView()
                 .environmentObject(delegate.model)
-                .environmentObject(delegate.model.pomodoro)
                 .frame(minWidth: 820, minHeight: 520)
                 // DESIGN.md defines light tokens only — lock the app to light appearance.
                 .preferredColorScheme(.light)
@@ -21,15 +20,13 @@ struct TodoAppMain: App {
         .windowToolbarStyle(.unified)
         .commands { TodoCommands(model: delegate.model, shortcuts: delegate.shortcuts) }
 
-        // Menu bar timer: live phase + mm:ss countdown, with the active task and
-        // Start/Pause · Skip · Stop controls in the dropdown. Observes the same
-        // PomodoroEngine the main window uses — no duplicated timer logic.
+        // Menu bar item: a static icon, with the active task and window/update/quit
+        // commands in the dropdown. No timer and no per-second redraw.
         MenuBarExtra {
             MenuBarContent()
                 .environmentObject(delegate.model)
-                .environmentObject(delegate.model.pomodoro)
         } label: {
-            MenuBarLabel(engine: delegate.model.pomodoro)
+            MenuBarLabel()
         }
         .menuBarExtraStyle(.menu)
 
@@ -90,19 +87,10 @@ struct TodoCommands: Commands {
             Button("Mark Dropped") { model.setStatusOnSelected(.dropped) }
                 .keyboardShortcut(sc(.statusDropped)).disabled(model.selectedTaskId == nil)
         }
-
-        CommandMenu("Timer") {
-            Button(model.pomodoro.running ? "Pause" : "Start") { model.toggleTimer() }
-                .keyboardShortcut(sc(.timerToggle))
-            Button("Skip Phase") { model.pomodoro.skip() }
-                .keyboardShortcut(sc(.timerSkip))
-            Button("Stop Timer") { model.pomodoro.stop() }
-                .keyboardShortcut(sc(.timerStop))
-        }
     }
 }
 
-/// Owns the model and notification setup. The menu-bar timer is a SwiftUI
+/// Owns the model and notification setup. The menu-bar item is a SwiftUI
 /// `MenuBarExtra` scene (see `TodoAppMain`), not a hand-rolled status item.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -113,7 +101,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MCPRegistration.registerIfNeeded()
         requestNotificationPermission()
-        wirePomodoroNotifications()
 
         // Sparkle auto-updater. `startingUpdater: true` schedules the first
         // background check per SUScheduledCheckInterval from Info.plist
@@ -158,53 +145,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func requestNotificationPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
-
-    private func wirePomodoroNotifications() {
-        model.pomodoro.onPhaseEnd = { [weak self] finished, next in
-            guard let self, self.model.settings.notificationsEnabled else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "\(finished.label) complete"
-            content.body = next == .focus ? "Break over — back to focus." : "Time for a \(next.label.lowercased())."
-            if self.model.settings.soundEnabled { content.sound = .default }
-            let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-            UNUserNotificationCenter.current().add(req)
-        }
-    }
 }
 
 extension AppDelegate: SPUUpdaterDelegate {}
 
-// MARK: - Menu bar timer
+// MARK: - Menu bar
 
-/// The menu-bar title: phase icon + live mm:ss. Observes the shared engine so it
-/// updates on every tick, exactly like the main window's PomodoroBar.
+/// The menu-bar title: a static template icon (it follows the menu bar's light/dark
+/// tint). QUE-25 replaces it with the waiting-on-you / working counts.
 struct MenuBarLabel: View {
-    @ObservedObject var engine: PomodoroEngine
-
     var body: some View {
-        Text(title)
-    }
-
-    private var title: String {
-        let icon = engine.phase == .focus ? "🍅" : (engine.phase == .idle ? "⏸" : "☕️")
-        if engine.phase == .idle { return "\(icon) --:--" }
-        return "\(icon) \(engine.clock)\(engine.running ? "" : " ⏸")"
+        Image(systemName: "checklist")
+            .accessibilityLabel("QuestBits")
     }
 }
 
-/// Dropdown for the menu-bar timer: current phase/clock, the active in-progress
-/// task, and Start/Pause · Skip · Stop wired to the existing engine + model.
+/// Dropdown for the menu-bar item: the active in-progress task, then window,
+/// update and quit commands.
 struct MenuBarContent: View {
     @EnvironmentObject var model: AppModel
-    @EnvironmentObject var engine: PomodoroEngine
 
     var body: some View {
-        // No live clock here: the countdown ticking every second while the menu is
-        // open forces an NSMenu rebuild per tick, which desyncs the hover highlight
-        // (the blue highlight lands on the wrong item). The menu-bar label already
-        // shows the live mm:ss; the dropdown only needs the (rarely-changing) phase.
-        Text(phaseHeadline)
-
         if let active = model.inProgressTasks.first {
             let extra = model.inProgressTasks.count - 1
             Text("Active: \(active.title)" + (extra > 0 ? " (+\(extra) more)" : ""))
@@ -214,21 +175,9 @@ struct MenuBarContent: View {
 
         Divider()
 
-        Button(engine.running ? "Pause" : "Start") { model.toggleTimer() }
-        Button("Skip Phase") { engine.skip() }
-            .disabled(engine.phase == .idle)
-        Button("Stop") { engine.stop() }
-            .disabled(engine.phase == .idle)
-
-        Divider()
-
         Button("Show Main Window") { Self.showMainWindow() }
         Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
         Button("Quit Todo") { NSApp.terminate(nil) }
-    }
-
-    private var phaseHeadline: String {
-        engine.phase == .idle ? "Ready" : engine.phase.label
     }
 
     /// Bring the main window forward (recreating window behavior of the old

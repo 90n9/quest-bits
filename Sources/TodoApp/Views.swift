@@ -51,8 +51,6 @@ struct ContentView: View {
                 }
             }
             .frame(maxHeight: .infinity)
-            Divider()
-            PomodoroBar()
         }
         .overlay(alignment: .top) {
             if let toast = model.toast {
@@ -2112,7 +2110,10 @@ struct TaskDetailView: View {
 
     private func timingSection(_ task: TodoTask) -> some View {
         QBDetailSection("Timing") {
-            LabeledContent("Effort", value: fmtEffort(task.effortSeconds))
+            // Effort only grew with the Pomodoro timer (gone in 1.5.0): shown when a task has some.
+            if task.effortSeconds > 0 {
+                LabeledContent("Effort", value: fmtEffort(task.effortSeconds))
+            }
             if let s = task.startedAt {
                 LabeledContent("Started", value: fmtDateTime(s))
             }
@@ -2737,112 +2738,21 @@ struct WaitingChip: View {
     }
 }
 
-// MARK: - Pomodoro bar
-
-struct PomodoroBar: View {
-    @EnvironmentObject var model: AppModel
-    @EnvironmentObject var engine: PomodoroEngine
-
-    var body: some View {
-        HStack(spacing: 16) {
-            // Phase + clock (heading-4 scale, monospaced digits for the countdown)
-            HStack(spacing: 8) {
-                QBIcon(name: phaseIcon(engine.phase), size: 20)
-                    .foregroundStyle(Theme.Colors.brandYellow)
-                Text(engine.phase == .idle ? "Ready" : engine.clock)
-                    .font(.system(size: 22, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Theme.Colors.onDark)
-                    .frame(minWidth: 90, alignment: .leading)
-                Text(engine.phase.label)
-                    .font(Theme.Fonts.bodySm)
-                    .foregroundStyle(Theme.Colors.onDarkMuted)
-            }
-
-            Rectangle().fill(Theme.Colors.onDarkMuted.opacity(0.35))
-                .frame(width: 1, height: 24)
-
-            // Controls: Start/Pause is the primary CTA; Skip/Stop stay quiet.
-            HStack(spacing: 10) {
-                if engine.running {
-                    Button { engine.pause() } label: { Label("Pause", systemImage: "pause.fill") }
-                        .buttonStyle(QBOnDarkButtonStyle(compact: true))
-                } else {
-                    Button { engine.startFocus() } label: { Label("Start", systemImage: "play.fill") }
-                        .buttonStyle(QBOnDarkButtonStyle(compact: true))
-                }
-                Button { engine.skip() } label: { Image(systemName: "forward.fill") }
-                    .buttonStyle(QBGhostButtonStyle(onDark: true))
-                    .disabled(engine.phase == .idle)
-                Button { engine.stop() } label: { Image(systemName: "stop.fill") }
-                    .buttonStyle(QBGhostButtonStyle(onDark: true))
-                    .disabled(engine.phase == .idle)
-            }
-
-            Spacer()
-
-            // Daily stats
-            HStack(spacing: 16) {
-                statBadge(icon: "checkmark.seal", value: "\(model.stats.completedPomodoros)", label: "pomodoros")
-                statBadge(icon: "clock", value: "\(model.stats.totalFocusSeconds / 60)m", label: "focus today")
-            }
-        }
-        .padding(.horizontal, Theme.Spacing.md)
-        .padding(.vertical, Theme.Spacing.xs)
-        .qbHearth()
-    }
-
-    /// Bundled icon name per phase — hearth metaphor: campfire while focusing,
-    /// a tavern break, a proper rest, embers when idle.
-    private func phaseIcon(_ phase: PomodoroPhase) -> String {
-        switch phase {
-        case .focus: return "tabler-campfire"
-        case .shortBreak: return "lucide-beer"
-        case .longBreak: return "lucide-bed"
-        case .idle: return "lucide-flame-kindling"
-        }
-    }
-
-    private func statBadge(icon: String, value: String, label: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon).foregroundStyle(Theme.Colors.onDarkMuted)
-            Text(value).font(Theme.Fonts.bodyMdMedium.monospacedDigit()).foregroundStyle(Theme.Colors.onDark)
-            Text(label).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.onDarkMuted)
-        }
-    }
-}
-
 // MARK: - Settings
 
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var focusMin = 25
-    @State private var shortMin = 5
-    @State private var longMin = 15
-    @State private var rounds = 4
-
     @EnvironmentObject var shortcuts: ShortcutStore
     @State private var notify = true
     @State private var sound = true
-    @State private var autoAdvance = true
-    @State private var breaksEffort = false
     @State private var mcpStatus = ""
     @State private var showGuide = false
 
     var body: some View {
         Form {
-            Section("Pomodoro Durations (minutes)") {
-                Stepper("Focus: \(focusMin)", value: $focusMin, in: 1...120)
-                Stepper("Short break: \(shortMin)", value: $shortMin, in: 1...60)
-                Stepper("Long break: \(longMin)", value: $longMin, in: 1...60)
-                Stepper("Rounds before long break: \(rounds)", value: $rounds, in: 1...12)
-            }
             Section("Notifications") {
-                Toggle("Notify when a phase ends", isOn: $notify)
+                Toggle("Remind me when a task is due", isOn: $notify)
                 Toggle("Play sound", isOn: $sound).disabled(!notify)
-            }
-            Section("Timer Behavior") {
-                Toggle("Auto-start next phase", isOn: $autoAdvance)
-                Toggle("Count break time as effort", isOn: $breaksEffort)
             }
             Section("Updates") {
                 LabeledContent("Version",
@@ -2909,26 +2819,14 @@ struct SettingsView: View {
         .frame(width: 460, height: 640)
         .sheet(isPresented: $showGuide) { GuideSheet(project: nil) }
         .onAppear { loadValues() }
-        .onChange(of: focusMin) { _, _ in save() }
-        .onChange(of: shortMin) { _, _ in save() }
-        .onChange(of: longMin) { _, _ in save() }
-        .onChange(of: rounds) { _, _ in save() }
         .onChange(of: notify) { _, _ in save() }
         .onChange(of: sound) { _, _ in save() }
-        .onChange(of: autoAdvance) { _, _ in save() }
-        .onChange(of: breaksEffort) { _, _ in save() }
     }
 
     private func loadValues() {
         let s = model.settings
-        focusMin = s.focusSeconds / 60
-        shortMin = s.shortBreakSeconds / 60
-        longMin = s.longBreakSeconds / 60
-        rounds = s.roundsBeforeLongBreak
         notify = s.notificationsEnabled
         sound = s.soundEnabled
-        autoAdvance = s.autoAdvance
-        breaksEffort = s.countBreaksAsEffort
         refreshMCP()
     }
 
@@ -2939,16 +2837,7 @@ struct SettingsView: View {
     }
 
     private func save() {
-        model.saveSettings(PomodoroSettings(
-            focusSeconds: focusMin * 60,
-            shortBreakSeconds: shortMin * 60,
-            longBreakSeconds: longMin * 60,
-            roundsBeforeLongBreak: rounds,
-            notificationsEnabled: notify,
-            soundEnabled: sound,
-            autoAdvance: autoAdvance,
-            countBreaksAsEffort: breaksEffort
-        ))
+        model.saveSettings(AppSettings(notificationsEnabled: notify, soundEnabled: sound))
     }
 
     private func exportBackup() {
@@ -3067,31 +2956,16 @@ func fmtMinutes(_ minutes: Double) -> String {
     return "\(m / 60)h \(m % 60)m"
 }
 
-/// The stats dashboard: focus, pomodoros, and completed tasks per day (last 7 days),
-/// plus accrued effort per project. Uses Swift Charts, with a custom fallback below macOS 13.
+/// The stats dashboard: tasks completed per day (last 7 days), plus what is in flight now
+/// (in progress, open questions). Uses Swift Charts, with a custom fallback below macOS 13.
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
 
-    private var totalFocusSeconds: Int { model.daySeries.reduce(0) { $0 + $1.focusSeconds } }
-    private var totalPomodoros: Int { model.daySeries.reduce(0) { $0 + $1.pomodoros } }
+    private var completedToday: Int { model.daySeries.last?.tasksCompleted ?? 0 }
     private var totalCompleted: Int { model.daySeries.reduce(0) { $0 + $1.tasksCompleted } }
-    private var totalTrackedSeconds: Int { model.projectEfforts.reduce(0) { $0 + $1.effortSeconds } }
 
-    private var focusData: [BarDatum] {
-        model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.focusSeconds) / 60.0) }
-    }
-    private var pomodoroData: [BarDatum] {
-        model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.pomodoros)) }
-    }
     private var completedData: [BarDatum] {
         model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.tasksCompleted)) }
-    }
-    /// Top projects by effort (skip zero-effort ones; show at most 8).
-    private var effortData: [BarDatum] {
-        model.projectEfforts
-            .filter { $0.effortSeconds > 0 }
-            .prefix(8)
-            .map { BarDatum(label: $0.code, value: Double($0.effortSeconds) / 60.0) }
     }
 
     var body: some View {
@@ -3100,36 +2974,9 @@ struct DashboardView: View {
                 Text("Stats")
                     .font(Theme.Fonts.heading3)
                     .foregroundStyle(Theme.Colors.ink)
-
-                // Summary tiles (last 7 days + all-time tracked effort).
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
-                    StatTile(icon: "clock", tint: Theme.Colors.brandYellowDeep,
-                             value: fmtEffort(totalFocusSeconds), label: "Focus (7d)")
-                    StatTile(icon: "checkmark.seal", tint: Theme.Colors.brandCoral,
-                             value: "\(totalPomodoros)", label: "Pomodoros (7d)")
-                    StatTile(icon: "checkmark.circle", tint: Theme.Colors.successAccent,
-                             value: "\(totalCompleted)", label: "Completed (7d)")
-                    StatTile(icon: "hourglass", tint: Theme.Colors.brandBlue,
-                             value: fmtEffort(totalTrackedSeconds), label: "Tracked effort")
-                }
-
-                ChartCard(title: "Focus per day", subtitle: "minutes, last 7 days") {
-                    BarChartView(data: focusData, unit: "min", tint: Theme.Colors.brandYellowDeep) { fmtMinutes($0) }
-                }
-                ChartCard(title: "Pomodoros per day", subtitle: "completed focus sessions") {
-                    BarChartView(data: pomodoroData, unit: "count", tint: Theme.Colors.brandCoral) { "\(Int($0))" }
-                }
+                summaryTiles
                 ChartCard(title: "Tasks completed per day", subtitle: "last 7 days") {
                     BarChartView(data: completedData, unit: "count", tint: Theme.Colors.successAccent) { "\(Int($0))" }
-                }
-                ChartCard(title: "Effort per project", subtitle: "minutes tracked, top projects") {
-                    if effortData.isEmpty {
-                        Text("No tracked effort yet — run a focus timer on an in-progress task.")
-                            .font(Theme.Fonts.bodySm).foregroundStyle(Theme.Colors.slate)
-                            .frame(maxWidth: .infinity, minHeight: 120)
-                    } else {
-                        BarChartView(data: effortData, unit: "min", tint: Theme.Colors.brandBlue) { fmtMinutes($0) }
-                    }
                 }
             }
             .padding(Theme.Spacing.lg)
@@ -3137,6 +2984,20 @@ struct DashboardView: View {
         .qbParchment()
         .navigationTitle("Dashboard")
         .onAppear { model.reloadDashboard() }
+    }
+
+    /// Summary tiles: completions (today, last 7 days) and the work in flight now.
+    private var summaryTiles: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
+            StatTile(icon: "checkmark.circle", tint: Theme.Colors.successAccent,
+                     value: "\(completedToday)", label: "Completed today")
+            StatTile(icon: "checkmark.seal", tint: Theme.Colors.brandCoral,
+                     value: "\(totalCompleted)", label: "Completed (7d)")
+            StatTile(icon: "play.circle", tint: Theme.Colors.brandYellowDeep,
+                     value: "\(model.inProgressTasks.count)", label: "In progress")
+            StatTile(icon: "questionmark.bubble", tint: Theme.Colors.brandBlue,
+                     value: "\(model.openQuestions.count)", label: "Open questions")
+        }
     }
 
     /// Short weekday ("Mon") for a yyyy-MM-dd date string; falls back to the raw string.

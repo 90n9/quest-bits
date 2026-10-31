@@ -1096,8 +1096,8 @@ final class MCPServer: @unchecked Sendable {
             let stats = try store.dailyStats()
             return try jsonString([
                 "date": stats.date,
-                "completed_pomodoros": stats.completedPomodoros,
-                "total_focus_minutes": stats.totalFocusSeconds / 60
+                "tasks_completed": stats.tasksCompleted,
+                "subtasks_completed": stats.subtasksCompleted
             ] as [String: Any])
 
         default:

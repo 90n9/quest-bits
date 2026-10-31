@@ -211,6 +211,8 @@ public final class Store: @unchecked Sendable {
         );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);")
+        // focus_sessions: the Pomodoro timer's log (removed in 1.5.0). Nothing reads or
+        // writes it now; kept so existing history survives (migrations are additive only).
         exec("""
         CREATE TABLE IF NOT EXISTS focus_sessions (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1545,17 +1547,6 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Ids of tasks currently In Progress in projects not archived — for effort accrual
-    /// (only the tasks the In Progress view and menu bar show earn focus time).
-    public func inProgressTaskIds() throws -> [Int64] {
-        lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT id FROM tasks WHERE status='in_progress' AND \(Self.activeProjectSQL);", [])
-        defer { sqlite3_finalize(stmt) }
-        var out: [Int64] = []
-        while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }
-        return out
-    }
-
     /// The inbox: waiting tasks that wait on the user — plus those waiting on a third party
     /// with `includeExternal` — across every project not archived, each with its project's
     /// code. Longest waiting first: `waiting_since` (falling back to `updated_at` for a row
@@ -1579,7 +1570,8 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Add focused seconds to a task's effort total.
+    /// Add seconds to a task's effort total. Nothing calls it since the Pomodoro timer
+    /// went (1.5.0); kept with the column so a manual time log can reuse it.
     public func addEffort(toTaskId id: Int64, seconds: Int) throws {
         lock.lock(); defer { lock.unlock() }
         try runWrite("UPDATE tasks SET effort_seconds = effort_seconds + ? WHERE id=?;", [.int(Int64(seconds)), .int(id)])
@@ -4960,41 +4952,35 @@ public final class Store: @unchecked Sendable {
         )
     }
 
-    // MARK: - Focus sessions & stats
+    // MARK: - Stats
 
-    public func recordFocusSession(startedAt: Date, endedAt: Date, focusSeconds: Int) throws {
-        lock.lock(); defer { lock.unlock() }
-        try runWrite(
-            "INSERT INTO focus_sessions (started_at, ended_at, focus_seconds) VALUES (?, ?, ?);",
-            [.int(Int64(startedAt.timeIntervalSince1970)), .int(Int64(endedAt.timeIntervalSince1970)), .int(Int64(focusSeconds))]
-        )
-    }
-
+    /// Tasks completed on `date`'s local day, top-level and subtasks counted apart (the
+    /// dashboard counts top-level ones). Dropped tasks have no completed_at, so never count.
     public func dailyStats(for date: Date = Date()) throws -> DailyStats {
         lock.lock(); defer { lock.unlock() }
         let cal = Calendar.current
         let start = cal.startOfDay(for: date)
         let end = cal.date(byAdding: .day, value: 1, to: start)!
         let stmt = try prepare(
-            "SELECT COUNT(*), COALESCE(SUM(focus_seconds),0) FROM focus_sessions WHERE started_at >= ? AND started_at < ?;",
+            "SELECT COALESCE(SUM(parent_id IS NULL), 0), COALESCE(SUM(parent_id IS NOT NULL), 0) FROM tasks "
+            + "WHERE completed_at IS NOT NULL AND completed_at >= ? AND completed_at < ?;",
             [.int(Int64(start.timeIntervalSince1970)), .int(Int64(end.timeIntervalSince1970))]
         )
         defer { sqlite3_finalize(stmt) }
-        var count = 0, total = 0
+        var top = 0, sub = 0
         if sqlite3_step(stmt) == SQLITE_ROW {
-            count = Int(sqlite3_column_int64(stmt, 0))
-            total = Int(sqlite3_column_int64(stmt, 1))
+            top = Int(sqlite3_column_int64(stmt, 0))
+            sub = Int(sqlite3_column_int64(stmt, 1))
         }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.calendar = Calendar(identifier: .gregorian)
         fmt.dateFormat = "yyyy-MM-dd"
-        return DailyStats(date: fmt.string(from: start), completedPomodoros: count, totalFocusSeconds: total)
+        return DailyStats(date: fmt.string(from: start), tasksCompleted: top, subtasksCompleted: sub)
     }
 
     /// Per-day activity for the last `days` calendar days (oldest first, includes today):
-    /// focus seconds, completed pomodoros (focus sessions), and tasks completed that day.
-    /// Rows are bucketed by local start-of-day, matching `dailyStats`.
+    /// tasks completed that day. Rows are bucketed by local start-of-day, matching `dailyStats`.
     public func dailyStatsSeries(days: Int = 7) throws -> [DayStat] {
         lock.lock(); defer { lock.unlock() }
         let n = max(1, days)
@@ -5007,7 +4993,6 @@ public final class Store: @unchecked Sendable {
         // Build day buckets oldest → newest.
         let todayStart = cal.startOfDay(for: Date())
         var labels: [String] = []
-        var focus: [String: (secs: Int, count: Int)] = [:]
         var done: [String: Int] = [:]
         for offset in stride(from: n - 1, through: 0, by: -1) {
             guard let start = cal.date(byAdding: .day, value: -offset, to: todayStart) else { continue }
@@ -5015,24 +5000,10 @@ public final class Store: @unchecked Sendable {
         }
         guard let rangeStart = cal.date(byAdding: .day, value: -(n - 1), to: todayStart),
               let rangeEnd = cal.date(byAdding: .day, value: 1, to: todayStart) else {
-            return labels.map { DayStat(date: $0, focusSeconds: 0, pomodoros: 0, tasksCompleted: 0) }
+            return labels.map { DayStat(date: $0, tasksCompleted: 0) }
         }
         let lo = SQLValue.int(Int64(rangeStart.timeIntervalSince1970))
         let hi = SQLValue.int(Int64(rangeEnd.timeIntervalSince1970))
-
-        // Focus sessions in range → bucket by started_at's local day.
-        if let stmt = try? prepare(
-            "SELECT started_at, focus_seconds FROM focus_sessions WHERE started_at >= ? AND started_at < ?;", [lo, hi]) {
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let day = cal.startOfDay(for: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)))
-                let key = fmt.string(from: day)
-                var e = focus[key] ?? (0, 0)
-                e.secs += Int(sqlite3_column_int64(stmt, 1))
-                e.count += 1
-                focus[key] = e
-            }
-            sqlite3_finalize(stmt)
-        }
 
         // Tasks completed in range → bucket by completed_at's local day. Exclude subtasks
         // (parent_id IS NOT NULL) so the dashboard reflects real top-level throughput, not
@@ -5047,46 +5018,23 @@ public final class Store: @unchecked Sendable {
             sqlite3_finalize(stmt)
         }
 
-        return labels.map { key in
-            let f = focus[key] ?? (0, 0)
-            return DayStat(date: key, focusSeconds: f.secs, pomodoros: f.count, tasksCompleted: done[key] ?? 0)
-        }
+        return labels.map { DayStat(date: $0, tasksCompleted: done[$0] ?? 0) }
     }
 
-    /// Total accrued effort per project (all projects, highest first; zero-effort projects included).
-    public func effortByProject() throws -> [ProjectEffort] {
-        lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare(
-            """
-            SELECT p.id, p.code, p.name, COALESCE(SUM(t.effort_seconds), 0) AS eff
-            FROM projects p
-            LEFT JOIN tasks t ON t.project_id = p.id
-            GROUP BY p.id, p.code, p.name
-            ORDER BY eff DESC, p.name;
-            """, [])
-        defer { sqlite3_finalize(stmt) }
-        var out: [ProjectEffort] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            out.append(ProjectEffort(
-                projectId: sqlite3_column_int64(stmt, 0),
-                code: colText(stmt, 1),
-                name: colText(stmt, 2),
-                effortSeconds: Int(sqlite3_column_int64(stmt, 3))
-            ))
-        }
-        return out
-    }
+    // MARK: - Settings
 
-    // MARK: - Settings (pomodoro durations)
-
-    public func loadSettings() throws -> PomodoroSettings {
+    /// The app's preferences: the `app` row, else the notification flags of the old
+    /// Pomodoro blob (`pomodoro`, left in place), else the defaults.
+    public func loadSettings() throws -> AppSettings {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT value FROM settings WHERE key='pomodoro';", [])
-        defer { sqlite3_finalize(stmt) }
-        if sqlite3_step(stmt) == SQLITE_ROW,
-           let data = colText(stmt, 0).data(using: .utf8),
-           let s = try? JSONDecoder().decode(PomodoroSettings.self, from: data) {
-            return s
+        for key in ["app", "pomodoro"] {
+            let stmt = try prepare("SELECT value FROM settings WHERE key=?;", [.text(key)])
+            defer { sqlite3_finalize(stmt) }
+            if sqlite3_step(stmt) == SQLITE_ROW,
+               let data = colText(stmt, 0).data(using: .utf8),
+               let s = try? JSONDecoder().decode(AppSettings.self, from: data) {
+                return s
+            }
         }
         return .standard
     }
@@ -5101,10 +5049,10 @@ public final class Store: @unchecked Sendable {
         try FileManager.default.copyItem(at: dbURL, to: url)
     }
 
-    public func saveSettings(_ s: PomodoroSettings) throws {
+    public func saveSettings(_ s: AppSettings) throws {
         lock.lock(); defer { lock.unlock() }
         let json = String(data: try JSONEncoder().encode(s), encoding: .utf8) ?? "{}"
-        try runWrite("INSERT INTO settings (key, value) VALUES ('pomodoro', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;", [.text(json)])
+        try runWrite("INSERT INTO settings (key, value) VALUES ('app', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;", [.text(json)])
     }
 
     // MARK: - Import ledger

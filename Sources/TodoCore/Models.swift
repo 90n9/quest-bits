@@ -128,7 +128,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var recurrence: String?   // nil = non-recurring; "daily" | "weekly" | "monthly"
     public var startedAt: Date?      // first time it went In Progress (or straight to Done)
     public var completedAt: Date?    // when it went Done; cleared on reopen
-    public var effortSeconds: Int    // focused time accrued while In Progress + timer running
+    public var effortSeconds: Int    // time tracked by the Pomodoro timer of builds before 1.5.0
     public var estimateSeconds: Int  // planned effort; 0 = unset (compared to effortSeconds)
     public var parentId: Int64?      // nil = top-level; else the parent task (one level of nesting)
     public var createdAt: Date
@@ -807,65 +807,29 @@ public struct Question: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-/// One completed focus session, for daily stats.
-public struct FocusSession: Identifiable, Codable, Hashable, Sendable {
-    public var id: Int64
-    public var startedAt: Date
-    public var endedAt: Date
-    public var focusSeconds: Int
-
-    public init(id: Int64, startedAt: Date, endedAt: Date, focusSeconds: Int) {
-        self.id = id
-        self.startedAt = startedAt
-        self.endedAt = endedAt
-        self.focusSeconds = focusSeconds
-    }
-}
-
-/// Aggregated stats for a single day.
+/// Tasks completed on a single day (the MCP `daily_stats` tool).
 public struct DailyStats: Codable, Hashable, Sendable {
     public var date: String          // yyyy-MM-dd, local
-    public var completedPomodoros: Int
-    public var totalFocusSeconds: Int
+    public var tasksCompleted: Int   // top-level tasks whose completed_at falls on that day
+    public var subtasksCompleted: Int
 
-    public init(date: String, completedPomodoros: Int, totalFocusSeconds: Int) {
+    public init(date: String, tasksCompleted: Int, subtasksCompleted: Int) {
         self.date = date
-        self.completedPomodoros = completedPomodoros
-        self.totalFocusSeconds = totalFocusSeconds
+        self.tasksCompleted = tasksCompleted
+        self.subtasksCompleted = subtasksCompleted
     }
 }
 
 /// Per-day aggregated activity for the stats dashboard (one row per calendar day).
 public struct DayStat: Identifiable, Codable, Hashable, Sendable {
     public var date: String          // yyyy-MM-dd, local
-    public var focusSeconds: Int     // focused time logged that day
-    public var pomodoros: Int        // completed focus sessions that day
     public var tasksCompleted: Int   // tasks whose completed_at falls on that day
 
     public var id: String { date }
 
-    public init(date: String, focusSeconds: Int, pomodoros: Int, tasksCompleted: Int) {
+    public init(date: String, tasksCompleted: Int) {
         self.date = date
-        self.focusSeconds = focusSeconds
-        self.pomodoros = pomodoros
         self.tasksCompleted = tasksCompleted
-    }
-}
-
-/// Effort accrued against a single project, for the dashboard's per-project chart.
-public struct ProjectEffort: Identifiable, Codable, Hashable, Sendable {
-    public var projectId: Int64
-    public var code: String
-    public var name: String
-    public var effortSeconds: Int
-
-    public var id: Int64 { projectId }
-
-    public init(projectId: Int64, code: String, name: String, effortSeconds: Int) {
-        self.projectId = projectId
-        self.code = code
-        self.name = name
-        self.effortSeconds = effortSeconds
     }
 }
 
@@ -897,49 +861,25 @@ public struct ProjectCounts: Hashable, Sendable {
     }
 }
 
-/// User-configurable pomodoro durations (seconds) + behavior flags.
-public struct PomodoroSettings: Codable, Hashable, Sendable {
-    public var focusSeconds: Int
-    public var shortBreakSeconds: Int
-    public var longBreakSeconds: Int
-    public var roundsBeforeLongBreak: Int
-
-    // Behavior flags (added later — decoded with defaults for old saved blobs).
-    public var notificationsEnabled: Bool
+/// App preferences stored in the `settings` table under key `app`. Builds before 1.5.0
+/// kept the notification flags inside the Pomodoro timer's blob (key `pomodoro`); that
+/// row is left as it was and read only as a fallback until the first save.
+public struct AppSettings: Codable, Hashable, Sendable {
+    public var notificationsEnabled: Bool   // due-date reminders
     public var soundEnabled: Bool
-    public var autoAdvance: Bool          // auto-start the next phase
-    public var countBreaksAsEffort: Bool  // accrue effort during breaks too
 
-    public static let standard = PomodoroSettings(
-        focusSeconds: 25 * 60,
-        shortBreakSeconds: 5 * 60,
-        longBreakSeconds: 15 * 60,
-        roundsBeforeLongBreak: 4
-    )
+    public static let standard = AppSettings()
 
-    public init(focusSeconds: Int, shortBreakSeconds: Int, longBreakSeconds: Int, roundsBeforeLongBreak: Int,
-                notificationsEnabled: Bool = true, soundEnabled: Bool = true,
-                autoAdvance: Bool = true, countBreaksAsEffort: Bool = false) {
-        self.focusSeconds = focusSeconds
-        self.shortBreakSeconds = shortBreakSeconds
-        self.longBreakSeconds = longBreakSeconds
-        self.roundsBeforeLongBreak = roundsBeforeLongBreak
+    public init(notificationsEnabled: Bool = true, soundEnabled: Bool = true) {
         self.notificationsEnabled = notificationsEnabled
         self.soundEnabled = soundEnabled
-        self.autoAdvance = autoAdvance
-        self.countBreaksAsEffort = countBreaksAsEffort
     }
 
-    // Migration-safe decoding: flags missing from older JSON fall back to defaults.
+    // Migration-safe decoding: flags missing from a saved blob (or the old `pomodoro`
+    // blob, which has more keys) fall back to the defaults.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        focusSeconds = try c.decode(Int.self, forKey: .focusSeconds)
-        shortBreakSeconds = try c.decode(Int.self, forKey: .shortBreakSeconds)
-        longBreakSeconds = try c.decode(Int.self, forKey: .longBreakSeconds)
-        roundsBeforeLongBreak = try c.decode(Int.self, forKey: .roundsBeforeLongBreak)
         notificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .notificationsEnabled) ?? true
         soundEnabled = try c.decodeIfPresent(Bool.self, forKey: .soundEnabled) ?? true
-        autoAdvance = try c.decodeIfPresent(Bool.self, forKey: .autoAdvance) ?? true
-        countBreaksAsEffort = try c.decodeIfPresent(Bool.self, forKey: .countBreaksAsEffort) ?? false
     }
 }
