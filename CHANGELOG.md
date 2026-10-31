@@ -121,7 +121,8 @@ _Nothing yet._
   work logs) into QuestBits from a mapping you review. A dry run writes
   nothing and lists every item with what would change; `--apply` writes only
   the plan you reviewed, backs up the database first, and a second run adds
-  nothing twice.
+  nothing twice. If a source changed after the dry run, `--apply` stops
+  without writing.
 
 ### Changed
 

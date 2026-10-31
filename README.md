@@ -196,7 +196,10 @@ questbits import --config <mapping.json> --dry-run   # bring in work tracked els
 `import` reads a mapping you write and review. `--dry-run` never writes the
 database: it plans against a copy and writes a plan and a summary of every item.
 `--apply --plan <plan.json>` then writes only the reviewed plan (backing up
-first), and a rerun adds nothing twice. Like `todo-mcp`, the CLI honours
+first), and a rerun adds nothing twice. If a source changed since the dry run,
+or an item the plan didn't review turns up, `--apply` stops without writing
+and lists them; dry-run again, or pass `--allow-drift` to apply anyway.
+Like `todo-mcp`, the CLI honours
 `TODO_DB_PATH`.
 
 ### Claude Code hooks
