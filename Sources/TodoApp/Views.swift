@@ -2798,6 +2798,7 @@ struct SettingsView: View {
     @EnvironmentObject var shortcuts: ShortcutStore
     @State private var notify = true
     @State private var sound = true
+    @State private var agentNotify = true
     @State private var mcpStatus = ""
     @State private var showGuide = false
 
@@ -2805,7 +2806,9 @@ struct SettingsView: View {
         Form {
             Section("Notifications") {
                 Toggle("Remind me when a task is due", isOn: $notify)
-                Toggle("Play sound", isOn: $sound).disabled(!notify)
+                Toggle("Notify me when an agent needs me", isOn: $agentNotify)
+                    .help("A task an agent set waiting on you, a new question or approval, or a session waiting at its terminal")
+                Toggle("Play sound", isOn: $sound).disabled(!notify && !agentNotify)
             }
             Section("Updates") {
                 LabeledContent("Version",
@@ -2874,12 +2877,14 @@ struct SettingsView: View {
         .onAppear { loadValues() }
         .onChange(of: notify) { _, _ in save() }
         .onChange(of: sound) { _, _ in save() }
+        .onChange(of: agentNotify) { _, _ in save() }
     }
 
     private func loadValues() {
         let s = model.settings
         notify = s.notificationsEnabled
         sound = s.soundEnabled
+        agentNotify = s.agentNotificationsEnabled
         refreshMCP()
     }
 
@@ -2890,7 +2895,8 @@ struct SettingsView: View {
     }
 
     private func save() {
-        model.saveSettings(AppSettings(notificationsEnabled: notify, soundEnabled: sound))
+        model.saveSettings(AppSettings(notificationsEnabled: notify, soundEnabled: sound,
+                                      agentNotificationsEnabled: agentNotify))
     }
 
     private func exportBackup() {

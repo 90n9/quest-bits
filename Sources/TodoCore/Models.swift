@@ -876,12 +876,16 @@ public struct ProjectCounts: Hashable, Sendable {
 public struct AppSettings: Codable, Hashable, Sendable {
     public var notificationsEnabled: Bool   // due-date reminders
     public var soundEnabled: Bool
+    /// Notify when something new waits on the user: a task an agent set waiting on them,
+    /// a new question (the gate's approvals too), a session needing them at the terminal.
+    public var agentNotificationsEnabled: Bool
 
     public static let standard = AppSettings()
 
-    public init(notificationsEnabled: Bool = true, soundEnabled: Bool = true) {
+    public init(notificationsEnabled: Bool = true, soundEnabled: Bool = true, agentNotificationsEnabled: Bool = true) {
         self.notificationsEnabled = notificationsEnabled
         self.soundEnabled = soundEnabled
+        self.agentNotificationsEnabled = agentNotificationsEnabled
     }
 
     // Migration-safe decoding: flags missing from a saved blob (or the old `pomodoro`
@@ -890,5 +894,6 @@ public struct AppSettings: Codable, Hashable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         notificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .notificationsEnabled) ?? true
         soundEnabled = try c.decodeIfPresent(Bool.self, forKey: .soundEnabled) ?? true
+        agentNotificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .agentNotificationsEnabled) ?? true
     }
 }

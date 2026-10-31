@@ -98,6 +98,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let shortcuts = ShortcutStore()
     var updaterController: SPUStandardUpdaterController!
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Set before launch finishes, so a click that launched the app is delivered too.
+        UNUserNotificationCenter.current().delegate = self
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         MCPRegistration.registerIfNeeded()
         requestNotificationPermission()
@@ -148,6 +153,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension AppDelegate: SPUUpdaterDelegate {}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    /// Show notifications while the app is in front too (a banner, in the list, with the
+    /// sound the request carries): a window may be open on something else.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    /// A click on a "waiting on you" notification opens the Waiting on you page at its item.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
+        let item = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+            ? NotificationScheduler.waitingItem(in: response.notification.request.content.userInfo) : nil
+        completionHandler()
+        guard let item else { return }
+        Task { @MainActor in
+            MenuBarContent.showMainWindow()
+            self.model.showWaitingArrival(item)
+        }
+    }
+}
 
 // MARK: - Menu bar
 

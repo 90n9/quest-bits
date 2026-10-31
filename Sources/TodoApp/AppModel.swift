@@ -111,6 +111,8 @@ final class AppModel: ObservableObject {
     // says so) without reading the DB again.
     private var inboxTasks: [InboxTask] = []
     private var attentionSessions: [AgentSession] = []
+    // What was seen waiting so far, to notify only about what is new (QUE-26).
+    private var waitingWatch = WaitingWatch()
     /// Open questions in projects not archived, longest waiting first; refreshed with the
     /// tasks (so with every poll), republished only when they changed.
     @Published private(set) var openQuestions: [Question] = []
@@ -278,6 +280,7 @@ final class AppModel: ObservableObject {
     /// Refresh the open questions; drop a selection that is no longer open (answered
     /// here, or withdrawn by the agent) for the next one in line.
     func reloadQuestions() {
+        let readAt = Date()
         let open = (try? store.questions(statuses: [.open], activeOnly: true)) ?? openQuestions
         if open != openQuestions { openQuestions = open }
         let sessions = (try? store.agentSessions(seenSince: Date().addingTimeInterval(-Self.sessionsShownSeconds)))
@@ -291,6 +294,33 @@ final class AppModel: ObservableObject {
         if let tasks = try? store.inbox() { inboxTasks = tasks.map { InboxTask(task: $0.task, projectCode: $0.projectCode) } }
         if let sessions = try? store.sessionsNeedingUser() { attentionSessions = sessions }
         rebuildWaitingOnYou()
+        notifyNewWaiting(readAt: readAt)
+    }
+
+    /// Notify about what newly waits on the user (QUE-26): one notification per read, for
+    /// everything new in it (`WaitingWatch` has the rules). The watch sees every read, also
+    /// while notifications are off, so turning them on never announces old items.
+    private func notifyNewWaiting(readAt: Date) {
+        let arrivals = waitingWatch.arrivals(
+            in: waitingOnYou, readAt: readAt,
+            projectCode: { id in id.map(projectCode(for:)) ?? "" },
+            isGate: { q in (try? store.isGateQuestion(id: q.id)) ?? false },
+            setByAgent: { t in
+                WaitingWatch.setByAgent(history: (try? store.taskHistory(taskId: t.id)) ?? [])
+            })
+        guard settings.agentNotificationsEnabled, let first = arrivals.first,
+              let notice = WaitingWatch.notice(arrivals) else { return }
+        NotificationScheduler.shared.postWaiting(title: notice.title, body: notice.body,
+                                                 sound: settings.soundEnabled, item: first.item)
+    }
+
+    /// The Waiting on you page at what a notification was posted for (its click).
+    func showWaitingArrival(_ item: WaitingArrival.Item) {
+        switch item {
+        case .session(let id): showInboxItem(.session(id))
+        case .question(let id): showInboxItem(.question(id))
+        case .task(let id): showInboxItem(.task(id))
+        }
     }
 
     /// Rebuild `waitingOnYou` from the open questions and the parts last read (each

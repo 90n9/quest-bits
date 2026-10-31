@@ -3982,6 +3982,14 @@ public final class Store: @unchecked Sendable {
         case asked(Question, expired: Bool)
     }
 
+    /// Whether question `id` was asked by the gate (it has a gate_requests row).
+    public func isGateQuestion(id: Int64) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare("SELECT 1 FROM gate_requests WHERE question_id=? LIMIT 1;", [.int(id)])
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
     /// The gate's decision for a call a rule matched, in one BEGIN IMMEDIATE so two hooks
     /// for the same call never both use one approval. Looks at this session's requests for
     /// the same tool and input hash that are not used yet, newest first:
