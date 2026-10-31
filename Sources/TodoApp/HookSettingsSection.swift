@@ -66,7 +66,8 @@ struct HookSettingsSection: View {
             + "stops and ends: the session shows in QuestBits, and a new session in a project's folder "
             + "starts with that project's brief; after a compaction, a session gets its claimed tasks back. "
             + "In a project's folder, risky calls (git push, releases, PRs, recursive rm outside the folder, "
-            + "sending messages) wait for your approval under Questions. Your other hooks and settings stay as they are, and "
+            + "sending messages) wait for your approval under Questions, and a session waiting at its terminal "
+            + "(a permission prompt, an MCP form, your input) shows as needing you there. Your other hooks and settings stay as they are, and "
             + "settings.json is backed up first. Takes effect in new Claude Code sessions."
     }
 

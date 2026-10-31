@@ -2,14 +2,17 @@ import Foundation
 
 /// `questbits hook <event>`: Claude Code hook commands that record the session the hook
 /// fires in (`agent_sessions`, see AgentSession), reading the hook's event JSON on stdin.
-/// Only session_id, cwd, transcript_path, source (SessionStart) and reason (SessionEnd)
-/// are read; a prompt or reply in the event is never stored.
+/// Only session_id, cwd, transcript_path, source (SessionStart), reason (SessionEnd) and
+/// notification_type and message (Notification, the message stored redacted) are read; a
+/// prompt or reply in the event is never stored.
 ///
 ///   session-start       SessionStart       running; prints the session line (and --brief),
 ///                                          or after a compaction the session's work (--after-compact)
 ///   user-prompt-submit  UserPromptSubmit   running
 ///   stop                Stop               idle (its turn ended)
 ///   session-end         SessionEnd         ended, with the reason
+///   notification        Notification       needs the user at the terminal (SessionAttention),
+///                                          in a project's folder only
 ///
 /// A hook must never get in Claude Code's way: every hook exits 0 and is silent on stderr,
 /// whatever goes wrong (no database, bad JSON, a locked database), and creates no database.
@@ -17,7 +20,7 @@ import Foundation
 enum HookCommand {
     static let command = CLICommand(
         name: "hook",
-        usage: "hook <session-start|user-prompt-submit|stop|session-end|pre-tool-use> [--brief | --after-compact]",
+        usage: "hook <session-start|user-prompt-submit|stop|session-end|notification|pre-tool-use> [--brief | --after-compact]",
         summary: "Claude Code hook: record the session from the event JSON on stdin (always exits 0).",
         details: """
         Register each as a command hook on the Claude Code event of the same name, with the
@@ -32,6 +35,11 @@ enum HookCommand {
           user-prompt-submit  UserPromptSubmit: running (the prompt itself is not read or stored)
           stop                Stop: idle, waiting at the terminal
           session-end         SessionEnd: ended, with its reason
+          notification        Notification (permission_prompt, idle_prompt, elicitation_dialog, ...):
+                              when cwd belongs to a project, the session shows in the app as
+                              needing you at the terminal, with the notification's message
+                              (secrets redacted). Cleared by the session's next prompt, Stop,
+                              QuestBits call or Bash/MCP call. Prints nothing.
           pre-tool-use        PreToolUse: the QuestBits gate. In a project's repo folder, a call a
                               gate rule matches (git push, gh release, gh pr merge/create, a recursive
                               rm outside the folder, MCP tools that send messages, the project's own
@@ -45,7 +53,7 @@ enum HookCommand {
         neverFails: true,
         run: { run($0, $1) })
 
-    static let events = ["session-start", "user-prompt-submit", "stop", "session-end"]
+    static let events = ["session-start", "user-prompt-submit", "stop", "session-end", "notification"]
 
     static func run(_ args: CLIArgs, _ ctx: CLIContext) -> Int32 {
         // The gate answers with a decision of its own (never allow on an error): GateCommand.
@@ -78,12 +86,15 @@ enum HookCommand {
         case "session-start": kind = .start
         case "user-prompt-submit": kind = .prompt
         case "stop": kind = .stop
+        case "notification": kind = .notify
         default: kind = .end
         }
         let event = SessionEvent(kind, sessionId: sid, cwd: cwd, transcriptPath: field("transcript_path"),
                                  source: kind == .start ? field("source") : nil,
                                  endReason: kind == .end ? field("reason") : nil,
-                                 process: kind == .end ? nil : ClaudeProcess.host())
+                                 process: kind == .end ? nil : ClaudeProcess.host(),
+                                 notificationType: kind == .notify ? field("notification_type") : nil,
+                                 message: kind == .notify ? field("message") : nil)
         let out = try ctx.withWritableStore { store -> String in
             let session = try store.recordSession(event)
             guard kind == .start, let session else { return "" }

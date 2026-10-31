@@ -286,15 +286,19 @@ final class MCPServer: @unchecked Sendable {
     }
 
     /// Write `kind` on session `sid`, at most every `touchEverySeconds` for the same kind
-    /// unless `force`.
+    /// unless `force`. An MCP call is always written while the session needs the user at
+    /// its terminal (SessionAttention): the call shows it went on, which clears that.
     private func recordSessionEvent(_ sid: String, _ kind: SessionEvent.Kind, force: Bool) {
         let now = Date()
         touchLock.lock()
         let last = lastTouch[sid]
-        let due = force || last == nil || last!.kind != kind || now.timeIntervalSince(last!.at) >= Self.touchEverySeconds
-        if due { lastTouch[sid] = (now, kind) }
+        var due = force || last == nil || last!.kind != kind || now.timeIntervalSince(last!.at) >= Self.touchEverySeconds
         touchLock.unlock()
+        if !due, kind.clearsAttention, (try? store.agentSession(id: sid))?.attention != nil { due = true }
         guard due else { return }
+        touchLock.lock()
+        lastTouch[sid] = (now, kind)
+        touchLock.unlock()
         _ = try? store.recordSession(SessionEvent(kind, sessionId: sid, at: now))
     }
 

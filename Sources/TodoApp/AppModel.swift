@@ -1135,6 +1135,17 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
+    /// The user says a session no longer needs them at its terminal (e.g. they answered
+    /// it and the session has not made a call the hooks see since).
+    func dismissAttention(_ session: AgentSession) {
+        do {
+            try store.clearSessionAttention(id: session.id)
+        } catch {
+            flashToast("Couldn't dismiss: \(error)")
+        }
+        reloadQuestions()
+    }
+
     func removeLink(_ link: TaskLink) {
         do {
             try store.removeLink(id: link.id)

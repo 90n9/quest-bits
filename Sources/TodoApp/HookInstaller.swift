@@ -46,7 +46,9 @@ enum HookInstaller {
     /// (PreToolUse, QUE-36): it runs on every Bash and MCP call (the matcher is a regex,
     /// anchored so BashOutput and the like stay out), and when it fails the call is blocked,
     /// never let through. It decides on its own errors itself (ask), so a block means the
-    /// gate could not run at all.
+    /// gate could not run at all. Notification (QUE-37): the types that mean the session
+    /// waits for the user at its terminal (SessionAttention.needsUser), and the two that
+    /// mean an MCP form was answered; auth_success and the others stay out.
     static let rows: [Row] = [
         Row(event: "SessionStart", matcher: "startup|resume|clear|fork", arguments: "hook session-start --brief", timeout: 10),
         Row(event: "SessionStart", matcher: "compact", arguments: "hook session-start --after-compact", timeout: 10),
@@ -54,8 +56,12 @@ enum HookInstaller {
         Row(event: "Stop", matcher: nil, arguments: "hook stop", timeout: 5),
         Row(event: "SessionEnd", matcher: nil, arguments: "hook session-end", timeout: 5),
         Row(event: "PreToolUse", matcher: "^(Bash|mcp__.*)$", arguments: "hook pre-tool-use", timeout: 15,
-            onFailure: "block")
+            onFailure: "block"),
+        Row(event: "Notification", matcher: notificationMatcher, arguments: "hook notification", timeout: 5)
     ]
+
+    static let notificationMatcher = "permission_prompt|idle_prompt|elicitation_dialog|elicitation_url_dialog"
+        + "|agent_needs_input|elicitation_complete|elicitation_response"
 
     enum Status: Equatable {
         case notInstalled

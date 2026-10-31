@@ -29,14 +29,16 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     public var endReason: String?       // SessionEnd reason, or superseded / process_exited
     public var pid: Int32?              // the Claude Code process, as the hook found it
     public var pidStartedAt: Date?      // that process's start (tells it from a reused pid)
+    public var attention: SessionAttention?  // it needs the user at its terminal (Notification hook)
 
     public init(id: String, cwd: String, projectId: Int64?, transcriptPath: String?, source: String?,
                 state: SessionState, startedAt: Date, lastSeen: Date, lastEvent: String?,
-                endedAt: Date?, endReason: String?, pid: Int32?, pidStartedAt: Date?) {
+                endedAt: Date?, endReason: String?, pid: Int32?, pidStartedAt: Date?,
+                attention: SessionAttention? = nil) {
         self.id = id; self.cwd = cwd; self.projectId = projectId; self.transcriptPath = transcriptPath
         self.source = source; self.state = state; self.startedAt = startedAt; self.lastSeen = lastSeen
         self.lastEvent = lastEvent; self.endedAt = endedAt; self.endReason = endReason
-        self.pid = pid; self.pidStartedAt = pidStartedAt
+        self.pid = pid; self.pidStartedAt = pidStartedAt; self.attention = attention
     }
 
     /// How long after the last sign of life a running or waiting session still counts as
@@ -82,6 +84,51 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// A session that needs the user at its terminal: Claude Code's Notification hook said it
+/// waits for a permission answer, for input, or on an MCP server's form (QUE-37). Only for
+/// sessions whose folder belongs to a project. `kind` is Claude Code's notification_type;
+/// `message` its notification text, redacted (GateRedactor) and cut, since a permission
+/// message can quote a command. The next sign that the session went on clears it: a prompt,
+/// a Stop, a SessionStart or SessionEnd, a QuestBits MCP call, or a Bash/MCP tool call
+/// (the gate's PreToolUse hook); a finished MCP form clears an elicitation. Background
+/// heartbeats of wait_for_answers do not clear it.
+public struct SessionAttention: Codable, Hashable, Sendable {
+    public var kind: String
+    public var message: String
+    public var at: Date
+
+    public init(kind: String, message: String, at: Date) { self.kind = kind; self.message = message; self.at = at }
+
+    /// The notification types that mean "the user must act at the terminal".
+    public static let needsUser: Set<String> = ["permission_prompt", "idle_prompt", "elicitation_dialog",
+                                                "elicitation_url_dialog", "agent_needs_input"]
+    /// The notification types that mean an MCP form (elicitation) was answered.
+    public static let resolvesElicitation: Set<String> = ["elicitation_complete", "elicitation_response"]
+
+    /// The longest message kept (characters).
+    public static let messageLimit = 300
+
+    /// `text` redacted (GateRedactor), on one line and cut to `messageLimit`.
+    public static func storedMessage(_ text: String?) -> String {
+        let flat = (text ?? "").split(whereSeparator: \.isNewline).joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+        let clean = GateRedactor.redact(flat)
+        return clean.count <= messageLimit ? clean : String(clean.prefix(messageLimit - 1)) + "…"
+    }
+
+    /// What the app says it waits for.
+    public var headline: String {
+        switch kind {
+        case "permission_prompt": return "Needs your permission at the terminal"
+        case "idle_prompt": return "Waiting for your input at the terminal"
+        case "elicitation_dialog": return "An MCP server asks for input at the terminal"
+        case "elicitation_url_dialog": return "An MCP server asks you to open a link at the terminal"
+        case "agent_needs_input": return "A background agent needs input at the terminal"
+        default: return "Needs you at the terminal"
+        }
+    }
+}
+
 /// `AgentSession.status`: what the app shows on a question's card and in the sessions list.
 public enum SessionStatus: Hashable, Sendable {
     case waiting                    // in wait_for_answers, seen in the last 6 minutes
@@ -89,6 +136,11 @@ public enum SessionStatus: Hashable, Sendable {
     case idle                       // its turn ended; open at its terminal, or closed without a word
     case quiet(processOpen: Bool)   // running or waiting but silent for 6+ minutes: unknown
     case ended(String?)             // SessionEnd (reason), or its process is gone
+
+    public var isEnded: Bool {
+        if case .ended = self { return true }
+        return false
+    }
 
     /// Whether offering `claude --resume` makes sense: not while the session is live, and
     /// not while its process is known to be open (resuming would run it twice).
@@ -111,6 +163,17 @@ public struct SessionEvent: Sendable {
         case mcp                       // a QuestBits MCP call: running (a waiting session stays waiting)
         case wait                      // wait_for_answers is waiting: waiting
         case waitDone = "wait_done"    // wait_for_answers returned: running, if it was waiting
+        case notify = "notification"   // Notification: sets or clears `attention` (project sessions only)
+
+        /// Whether this event shows the session went on, so a "needs you at the terminal"
+        /// item is over. wait / wait_done are not: a wait runs in the background while a
+        /// permission prompt may still be open.
+        public var clearsAttention: Bool {
+            switch self {
+            case .start, .prompt, .stop, .end, .mcp: return true
+            case .wait, .waitDone, .notify: return false
+            }
+        }
     }
     public var kind: Kind
     public var sessionId: String
@@ -119,22 +182,29 @@ public struct SessionEvent: Sendable {
     public var source: String?
     public var endReason: String?
     public var process: ClaudeProcess?
+    public var notificationType: String?    // Notification: Claude Code's notification_type
+    public var message: String?             // Notification: its text (stored redacted)
     public var at: Date
 
     public init(_ kind: Kind, sessionId: String, cwd: String? = nil, transcriptPath: String? = nil,
-                source: String? = nil, endReason: String? = nil, process: ClaudeProcess? = nil, at: Date = Date()) {
+                source: String? = nil, endReason: String? = nil, process: ClaudeProcess? = nil,
+                notificationType: String? = nil, message: String? = nil, at: Date = Date()) {
         self.kind = kind; self.sessionId = sessionId; self.cwd = cwd; self.transcriptPath = transcriptPath
-        self.source = source; self.endReason = endReason; self.process = process; self.at = at
+        self.source = source; self.endReason = endReason; self.process = process
+        self.notificationType = notificationType; self.message = message; self.at = at
     }
 
     /// Hook events create the session when it is missing (a hook installed mid-session);
-    /// SessionEnd and MCP calls only change a session a hook recorded.
+    /// SessionEnd and MCP calls only change a session a hook recorded. A Notification
+    /// creates one only in a project's folder.
     public var createsSession: Bool {
         switch kind {
-        case .start, .prompt, .stop: return true
+        case .start, .prompt, .stop, .notify: return true
         case .end, .mcp, .wait, .waitDone: return false
         }
     }
+
+    public var clearsAttention: Bool { kind.clearsAttention }
 }
 
 // MARK: - The Claude Code process

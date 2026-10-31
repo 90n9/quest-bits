@@ -502,6 +502,13 @@ public final class Store: @unchecked Sendable {
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_agent_sessions_pid ON agent_sessions(pid, state);")
         exec("CREATE INDEX IF NOT EXISTS idx_agent_sessions_seen ON agent_sessions(last_seen);")
+        // A session that needs the user at its terminal (QUE-37, SessionAttention): Claude
+        // Code's notification_type, its message (redacted, cut) and when. NULL = nothing.
+        if !columnExists("agent_sessions", "attention") { exec("ALTER TABLE agent_sessions ADD COLUMN attention TEXT;") }
+        if !columnExists("agent_sessions", "attention_message") {
+            exec("ALTER TABLE agent_sessions ADD COLUMN attention_message TEXT;")
+        }
+        if !columnExists("agent_sessions", "attention_at") { exec("ALTER TABLE agent_sessions ADD COLUMN attention_at REAL;") }
         // The Claude Code session a question was asked from (NULL = unknown), beside the
         // free-form `session_id` label the agent passes.
         if !columnExists("questions", "agent_session_id") {
@@ -3974,7 +3981,13 @@ public final class Store: @unchecked Sendable {
     // MARK: - Agent sessions (Claude Code sessions)
 
     private static let sessionCols = "id, cwd, project_id, transcript_path, source, state, started_at, last_seen, "
-        + "last_event, ended_at, end_reason, pid, pid_started_at"
+        + "last_event, ended_at, end_reason, pid, pid_started_at, attention, attention_message, attention_at"
+
+    /// SET clauses that clear a session's attention raised at or before the bound time
+    /// (bind it three times): a later notification stays.
+    private static let clearAttentionSQL = ["attention", "attention_message", "attention_at"].map {
+        "\($0)=CASE WHEN attention_at IS NULL OR attention_at <= ? THEN NULL ELSE \($0) END"
+    }
 
     /// Record a hook event or QuestBits call on a Claude Code session (`SessionEvent`), in
     /// one BEGIN IMMEDIATE with the row re-read inside it. A hook event creates the row when
@@ -3988,6 +4001,12 @@ public final class Store: @unchecked Sendable {
     ///   background while the agent works). wait: waiting. wait_done: running (idle
     ///   stays idle: the turn ended while the wait ran in the background).
     ///   These never create a session or touch one that ended.
+    /// - notify (Notification hook): only for a session whose folder maps to a project
+    ///   (else nothing is written and the session row is returned as it is). A type the user
+    ///   must act on (`SessionAttention.needsUser`) sets `attention` with the redacted message;
+    ///   idle_prompt also makes it idle. A finished MCP form clears an elicitation. Other
+    ///   types are ignored.
+    /// - start, prompt, stop, end and mcp clear an `attention` raised at or before the event.
     /// Every event moves last_seen (the heartbeat) forward, never back.
     @discardableResult
     public func recordSession(_ e: SessionEvent) throws -> AgentSession? {
@@ -4004,6 +4023,23 @@ public final class Store: @unchecked Sendable {
                 exec("ROLLBACK;")
                 return existing
             }
+            // A Notification: what it does to `attention` (nil = nothing to record).
+            var notice: (set: SessionAttention?, clearElicitation: Bool)?
+            if e.kind == .notify {
+                let type = Self.blankToNil(e.notificationType) ?? ""
+                let inProject = existing?.projectId != nil || cwd.flatMap {
+                    Self.bestProject(for: $0, among: (try? listProjectsUnlocked(includeArchived: false)) ?? [])
+                } != nil
+                if inProject, SessionAttention.needsUser.contains(type) {
+                    notice = (SessionAttention(kind: type, message: SessionAttention.storedMessage(e.message), at: e.at), false)
+                } else if inProject, existing != nil, SessionAttention.resolvesElicitation.contains(type) {
+                    notice = (nil, true)
+                }
+                guard notice != nil else {
+                    exec("ROLLBACK;")
+                    return existing
+                }
+            }
             if existing == nil {
                 let project = cwd.flatMap { Self.bestProject(for: $0, among: (try? listProjectsUnlocked(includeArchived: false)) ?? []) }
                 try runWrite("INSERT INTO agent_sessions (id, cwd, project_id, started_at, last_seen) VALUES (?, ?, ?, ?, ?);",
@@ -4017,6 +4053,10 @@ public final class Store: @unchecked Sendable {
             case .mcp: state = existing?.state == .waiting ? .waiting : .running
             case .wait: state = .waiting
             case .waitDone: state = existing?.state == .idle ? .idle : .running
+            case .notify:
+                if notice?.set?.kind == "idle_prompt" { state = .idle }
+                else if let old = existing?.state, old != .ended { state = old }
+                else { state = .running }
             }
             var sets = ["state=?", "last_seen=MAX(last_seen, ?)", "last_event=?"]
             var binds: [SQLValue] = [.text(state.rawValue), .double(now), .text(e.kind.rawValue)]
@@ -4025,6 +4065,18 @@ public final class Store: @unchecked Sendable {
                 binds += [.double(now), Self.blankToNil(e.endReason).map(SQLValue.text) ?? .null]
             } else {
                 sets += ["ended_at=NULL", "end_reason=NULL"]
+            }
+            if e.clearsAttention {
+                sets += Self.clearAttentionSQL
+                binds += Array(repeating: .double(now), count: 3)
+            }
+            if let set = notice?.set {
+                sets += ["attention=?", "attention_message=?", "attention_at=?"]
+                binds += [.text(set.kind), .text(set.message), .double(now)]
+            } else if notice?.clearElicitation == true {
+                sets += ["attention=CASE WHEN attention LIKE 'elicitation%' THEN NULL ELSE attention END",
+                         "attention_message=CASE WHEN attention LIKE 'elicitation%' THEN NULL ELSE attention_message END",
+                         "attention_at=CASE WHEN attention LIKE 'elicitation%' THEN NULL ELSE attention_at END"]
             }
             if let cwd, e.kind == .start || existing?.cwd.isEmpty == true {
                 sets.append("cwd=?"); binds.append(.text(cwd))
@@ -4051,7 +4103,8 @@ public final class Store: @unchecked Sendable {
                      .text(SessionState.ended.rawValue)])
                 for old in superseded { try expireClaimsUnlocked(holderId: old.id, at: e.at) }
                 try runWrite(
-                    "UPDATE agent_sessions SET state=?, ended_at=?, end_reason='superseded' "
+                    "UPDATE agent_sessions SET state=?, ended_at=?, end_reason='superseded', "
+                    + "attention=NULL, attention_message=NULL, attention_at=NULL "
                     + "WHERE id<>? AND pid=? AND ABS(pid_started_at - ?) < 1 AND state<>?;",
                     [.text(SessionState.ended.rawValue), .double(now), .text(id), .int(Int64(p.pid)),
                      .double(p.startedAt.timeIntervalSince1970), .text(SessionState.ended.rawValue)])
@@ -4080,7 +4133,8 @@ public final class Store: @unchecked Sendable {
             try beginImmediate()
             var n = 0
             for s in gone {
-                try runWrite("UPDATE agent_sessions SET state=?, ended_at=?, end_reason='process_exited' "
+                try runWrite("UPDATE agent_sessions SET state=?, ended_at=?, end_reason='process_exited', "
+                             + "attention=NULL, attention_message=NULL, attention_at=NULL "
                              + "WHERE id=? AND state<>? AND pid=? AND last_seen<=?;",
                              [.text(SessionState.ended.rawValue), .double(now.timeIntervalSince1970), .text(s.id),
                               .text(SessionState.ended.rawValue), .int(Int64(s.pid ?? 0)),
@@ -4122,6 +4176,40 @@ public final class Store: @unchecked Sendable {
         return try readSessionsUnlocked(sql + " ORDER BY last_seen DESC", binds)
     }
 
+    /// The open sessions that need the user at their terminal (`attention` set, not
+    /// ended), the longest waiting first. `projectId` narrows to one project. What an
+    /// inbox lists as "needs you at the terminal".
+    public func sessionsNeedingUser(projectId: Int64? = nil) throws -> [AgentSession] {
+        lock.lock(); defer { lock.unlock() }
+        var sql = "WHERE attention IS NOT NULL AND state<>?"
+        var binds: [SQLValue] = [.text(SessionState.ended.rawValue)]
+        if let projectId { sql += " AND project_id=?"; binds.append(.int(projectId)) }
+        return try readSessionsUnlocked(sql + " ORDER BY attention_at", binds)
+    }
+
+    /// Clear session `id`'s attention raised at or before `at` (the session went on: the
+    /// gate saw its next tool call, or the user dismissed it in the app). Writes nothing
+    /// when there is none, so a caller on every tool call stays read-only. Returns whether
+    /// it cleared one. Moves no heartbeat and no state.
+    @discardableResult
+    public func clearSessionAttention(id: String, at: Date = Date()) throws -> Bool {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        lock.lock(); defer { lock.unlock() }
+        guard let s = try agentSessionUnlocked(id), let a = s.attention, a.at <= at else { return false }
+        do {
+            try beginImmediate()
+            try runWrite("UPDATE agent_sessions SET \(Self.clearAttentionSQL.joined(separator: ", ")) "
+                         + "WHERE id=? AND attention IS NOT NULL;",
+                         Array(repeating: .double(at.timeIntervalSince1970), count: 3) + [.text(id)])
+            let cleared = try agentSessionUnlocked(id)?.attention == nil
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return cleared
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
     private func agentSessionUnlocked(_ id: String) throws -> AgentSession? {
         try readSessionsUnlocked("WHERE id=?", [.text(id)]).first
     }
@@ -4144,7 +4232,10 @@ public final class Store: @unchecked Sendable {
                 lastSeen: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 7)),
                 lastEvent: colTextOpt(stmt, 8), endedAt: dateOpt(9), endReason: colTextOpt(stmt, 10),
                 pid: sqlite3_column_type(stmt, 11) == SQLITE_NULL ? nil : Int32(truncatingIfNeeded: sqlite3_column_int64(stmt, 11)),
-                pidStartedAt: dateOpt(12)))
+                pidStartedAt: dateOpt(12),
+                attention: colTextOpt(stmt, 13).map {
+                    SessionAttention(kind: $0, message: colTextOpt(stmt, 14) ?? "", at: dateOpt(15) ?? Date(timeIntervalSince1970: 0))
+                }))
             rc = sqlite3_step(stmt)
         }
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }

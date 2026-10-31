@@ -28,9 +28,30 @@ enum GateCommand {
     }
 
     static func run(_ ctx: CLIContext, home: String = NSHomeDirectory()) -> Int32 {
-        let decision = decide(input: ctx.readStdin(), ctx: ctx, home: home)
+        let started = Date()
+        let input = ctx.readStdin()
+        let decision = decide(input: input, ctx: ctx, home: home)
         if let out = output(decision) { ctx.write(out + "\n") }
+        clearAttention(input: input, ctx: ctx, at: started)
         return 0
+    }
+
+    /// A tool call means the session went on: clear its "needs you at the terminal" item
+    /// (SessionAttention) raised before this call. Read-only unless there is one; any
+    /// error is ignored (the decision is already out).
+    static func clearAttention(input: Data, ctx: CLIContext, at: Date) {
+        guard ctx.databaseExists,
+              let json = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any],
+              let sid = (json["session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sid.isEmpty,
+              let attention = try? ctx.withStore({ try $0.agentSession(id: sid)?.attention }),
+              attention.at <= at
+        else { return }
+        do {
+            _ = try ctx.withWritableStore { try $0.clearSessionAttention(id: sid, at: at) }
+        } catch {
+            debug("the session's attention could not be cleared")
+        }
     }
 
     static func output(_ decision: Decision) -> String? {

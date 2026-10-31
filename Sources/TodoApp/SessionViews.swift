@@ -22,6 +22,9 @@ struct SessionStatusLine: View {
 
     private func content(_ status: SessionStatus, now: Date) -> some View {
         VStack(alignment: .leading, spacing: 4) {
+            if let attention = session.attention, !status.isEnded {
+                AttentionLine(session: session, attention: attention, now: now)
+            }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Image(systemName: Self.icon(status)).foregroundStyle(Self.color(status))
                 Text(Self.text(status, session, now: now))
@@ -92,6 +95,46 @@ struct SessionStatusLine: View {
         if s < 3600 { return "\(Int(s / 60)) min ago" }
         if s < 6 * 3600 { return "\(Int(s / 3600)) h ago" }
         return fmtDateTime(date)
+    }
+}
+
+/// A session that needs the user at its terminal (SessionAttention): what it waits for,
+/// since when, the notification's message, and the session's folder to copy, with a button
+/// to dismiss it once handled (the session's next prompt, Stop or tool call clears it too).
+struct AttentionLine: View {
+    @EnvironmentObject var model: AppModel
+    let session: AgentSession
+    let attention: SessionAttention
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            header
+            if !attention.message.isEmpty {
+                Text(attention.message)
+                    .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+                    .lineLimit(3).textSelection(.enabled)
+            }
+            if !session.cwd.isEmpty {
+                CommandRow(command: "cd " + AgentSession.shellQuoted(session.cwd),
+                           note: "Its folder: answer in the terminal running Claude Code there")
+            }
+        }
+        .padding(8)
+        .background(Theme.Colors.brandYellowDeep.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "terminal").foregroundStyle(Theme.Colors.brandYellowDeep)
+            Text("\(attention.headline) (since \(SessionStatusLine.ago(attention.at, now: now)))")
+                .font(Theme.Fonts.caption.weight(.semibold)).foregroundStyle(Theme.Colors.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button("Dismiss") { model.dismissAttention(session) }
+                .buttonStyle(QBGhostButtonStyle())
+                .help("Handled it: remove this until the session needs you again")
+        }
     }
 }
 
