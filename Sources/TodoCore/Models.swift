@@ -201,15 +201,33 @@ public struct TaskFilter: Sendable {
     public var tag: String?              // has this tag (whole tag, case-insensitive)
     public var parentId: Int64?          // direct subtasks of this task
     public var includeArchived: Bool     // cross-project lists: also tasks of archived projects
+    public var sort: TaskSort            // status groups first (default), or the saved board order only
 
     public init(projectId: Int64? = nil, statuses: [TaskStatus]? = nil, tag: String? = nil, parentId: Int64? = nil,
-                includeArchived: Bool = false) {
+                includeArchived: Bool = false, sort: TaskSort = .status) {
         self.projectId = projectId
         self.statuses = statuses
         self.tag = tag
         self.parentId = parentId
         self.includeArchived = includeArchived
+        self.sort = sort
     }
+}
+
+/// How `Store.listTasks(matching:)` orders its result.
+public enum TaskSort: String, CaseIterable, Sendable {
+    /// By status (`TaskStatus.listRank`), then the flat board order: projects in sidebar
+    /// order, then each project's sort_order.
+    case status
+    /// The saved order the app shows, status ignored: projects in sidebar order; in each
+    /// project its top-level tasks by sort_order, each one followed by its own subtasks
+    /// by sort_order (see `Store.reorderTasks`).
+    case board
+}
+
+/// Where `Store.reorderTasks` puts the tasks it is given among their siblings.
+public enum TaskPlacement: String, CaseIterable, Sendable {
+    case top, bottom
 }
 
 /// A reusable task template: preset fields that spawn a real task on demand.

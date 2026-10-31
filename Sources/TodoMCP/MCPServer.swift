@@ -355,6 +355,12 @@ final class MCPServer: @unchecked Sendable {
                 }
                 filter.tag = tag
             }
+            if given(args, "sort") {
+                guard let s = args["sort"] as? String, let sort = TaskSort(rawValue: s) else {
+                    throw MCPError.invalidArg("sort must be \"status\" or \"board\"")
+                }
+                filter.sort = sort
+            }
             return try jsonString(readTaskDicts(store.listTasks(matching: filter), compact: compact))
 
         case "get_task":
@@ -515,6 +521,25 @@ final class MCPServer: @unchecked Sendable {
             let toPid = try resolveProjectId(args, idKey: "to_project_id", codeKey: "to_project_code")
             try store.moveTask(id: tid, toProjectId: toPid)
             return try jsonString(taskDict(store.getTask(id: tid)))
+
+        case "reorder_tasks":
+            // Validated before the write: an unknown code here, and inside the store's one
+            // transaction a missing id, a repeat, or tasks that are not siblings; any of
+            // them leaves the order as it was.
+            let ids = try orderedTaskIds(args)
+            var place = TaskPlacement.top
+            if given(args, "place") {
+                guard let s = args["place"] as? String, let p = TaskPlacement(rawValue: s) else {
+                    throw MCPError.invalidArg("place must be \"top\" or \"bottom\"")
+                }
+                place = p
+            }
+            let siblings = try store.reorderTasks(ids: ids, place: place)
+            guard let first = siblings.first else { throw StoreError.invalid("nothing to reorder") }
+            var out: [String: Any] = ["project": store.projectCode(id: first.projectId) ?? "",
+                                      "tasks": try readTaskDicts(siblings, compact: true)]
+            if let pid = first.parentId, let parent = try? store.getTask(id: pid) { out["parent"] = parent.code }
+            return try jsonString(out)
 
         case "bulk_update_tasks":
             let ids = try resolveTaskIds(args)
@@ -937,6 +962,29 @@ final class MCPServer: @unchecked Sendable {
         guard !ids.isEmpty else { throw MCPError.missingArg("ids or codes") }
         var seen = Set<Int64>()
         return ids.filter { seen.insert($0).inserted }
+    }
+
+    /// reorder_tasks' tasks, in order: `codes` (array of string) or `ids` (array of int),
+    /// not both, since a mix has no single order. An unknown code is an error naming it;
+    /// unknown ids and repeats are left to the store, which checks them in its transaction.
+    private func orderedTaskIds(_ args: [String: Any]) throws -> [Int64] {
+        let hasIds = given(args, "ids"), hasCodes = given(args, "codes")
+        guard hasIds != hasCodes else {
+            throw hasIds ? MCPError.invalidArg("give codes or ids, not both") : MCPError.missingArg("codes or ids")
+        }
+        if hasCodes {
+            guard let codes = args["codes"] as? [String] else { throw MCPError.invalidArg("codes must be an array of task codes") }
+            return try codes.map { code in
+                guard let id = store.taskId(forCode: code) else { throw StoreError.notFound("task \(code)") }
+                return id
+            }
+        }
+        guard let arr = args["ids"] as? [Any] else { throw MCPError.invalidArg("ids must be an array of task ids") }
+        return try arr.map { v in
+            if let n = v as? NSNumber { return n.int64Value }
+            if let s = v as? String, let n = Int64(s) { return n }
+            throw MCPError.invalidArg("ids: \(v) is not a task id")
+        }
     }
 
     /// Resolve a task id from either `id` (int) or `code` (string handle like "GEN-3").

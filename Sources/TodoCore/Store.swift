@@ -1084,9 +1084,9 @@ public final class Store: @unchecked Sendable {
             conds.append(Self.activeProjectSQL)
         }
         let whereSQL = conds.isEmpty ? "" : "WHERE " + conds.joined(separator: " AND ")
+        let orderSQL = filter.sort == .board ? Self.treeOrderSQL : "\(Self.statusRankSQL), \(Self.boardOrderSQL)"
         return try readTasks(
-            "SELECT \(Self.qualifiedTaskCols) FROM tasks \(Self.projectJoinSQL) \(whereSQL) "
-            + "ORDER BY \(Self.statusRankSQL), \(Self.boardOrderSQL);", binds)
+            "SELECT \(Self.qualifiedTaskCols) FROM tasks \(Self.projectJoinSQL) \(whereSQL) ORDER BY \(orderSQL);", binds)
     }
 
     /// Run a `taskCols` SELECT and read every row; a step error throws instead of
@@ -1118,6 +1118,13 @@ public final class Store: @unchecked Sendable {
     /// sort_order, then archived ones), then each project's own task order.
     private static let boardOrderSQL =
         "p.archived_at IS NOT NULL, p.sort_order, p.id, tasks.sort_order, tasks.id"
+    /// `TaskSort.board`: the order the app's list shows. Projects as in `boardOrderSQL`;
+    /// within a project each top-level task by sort_order, followed by its own subtasks by
+    /// sort_order. A subtask keeps its parent's place even when the parent is filtered out.
+    private static let treeOrderSQL =
+        "p.archived_at IS NOT NULL, p.sort_order, p.id, "
+        + "COALESCE((SELECT pt.sort_order FROM tasks pt WHERE pt.id = tasks.parent_id), tasks.sort_order), "
+        + "COALESCE(tasks.parent_id, tasks.id), tasks.parent_id IS NOT NULL, tasks.sort_order, tasks.id"
 
     /// `TaskStatus.listRank` as a SQL expression over the `status` column.
     private static let statusRankSQL = "CASE status "
@@ -1734,11 +1741,71 @@ public final class Store: @unchecked Sendable {
         if oldCode != newCode { logEvent(id, "project", oldCode, newCode) }
     }
 
-    /// Persist a new ordering for a project's tasks (ids in desired order).
-    public func reorderTasks(orderedIds: [Int64]) throws {
+    /// Persist a new order for sibling tasks: the top-level tasks of one project, or the
+    /// subtasks of one parent. `ids` (at least one, no repeats) must all exist and share one
+    /// project and one parent; otherwise it throws and nothing changes. The given tasks go
+    /// to the top (or the bottom) of their siblings, in the given order; siblings not given
+    /// keep their relative order below (or above) them.
+    ///
+    /// sort_order runs across the whole project (subtasks included). Inside one BEGIN
+    /// IMMEDIATE this re-reads the project's tasks by (sort_order, id), lets the siblings
+    /// trade the places they already held, and writes a dense 0, 1, … over the project in
+    /// one UPDATE, only for rows whose value changed. Other tasks keep their places, so a
+    /// parent still carries its subtasks, and earlier ties (the old app drag wrote 0… over
+    /// the open tasks only) are resolved. Status, priority, parent, project and updated_at
+    /// never change: order is not a task edit. Returns the siblings in their new order —
+    /// the board order (`TaskSort.board`) the app's list and board show.
+    @discardableResult
+    public func reorderTasks(ids: [Int64], place: TaskPlacement = .top) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
-        for (i, id) in orderedIds.enumerated() {
-            try runWrite("UPDATE tasks SET sort_order=? WHERE id=?;", [.int(Int64(i)), .int(id)])
+        do {
+            try beginImmediate()
+            let siblings = try reorderTasksUnlocked(ids: ids, place: place)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return siblings
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func reorderTasksUnlocked(ids: [Int64], place: TaskPlacement) throws -> [TodoTask] {
+        guard !ids.isEmpty else { throw StoreError.invalid("give at least one task to reorder") }
+        var given: [TodoTask] = []
+        var seen = Set<Int64>()
+        for id in ids {
+            guard let task = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+            guard seen.insert(id).inserted else { throw StoreError.invalid("\(task.code) is listed twice") }
+            given.append(task)
+        }
+        let first = given[0]
+        if let other = given.first(where: { $0.projectId != first.projectId }) {
+            throw StoreError.invalid("\(other.code) is not in the same project as \(first.code); reorder one project at a time")
+        }
+        if let other = given.first(where: { $0.parentId != first.parentId }) {
+            throw StoreError.invalid("\(other.code) and \(first.code) are not siblings; reorder either top-level tasks "
+                                     + "or the subtasks of one parent, not both")
+        }
+        let all = try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE project_id=? ORDER BY sort_order, id;",
+                                [.int(first.projectId)])
+        let slots = all.indices.filter { all[$0].parentId == first.parentId }
+        let rest = slots.map { all[$0] }.filter { !seen.contains($0.id) }
+        let siblings = place == .top ? given + rest : rest + given
+        var order = all
+        for (slot, task) in zip(slots, siblings) { order[slot] = task }
+        // Only rows whose position changed: an unchanged order writes nothing (no poll reload).
+        let moved = order.enumerated().filter { $0.element.sortOrder != $0.offset }
+            .map { (id: $0.element.id, order: $0.offset) }
+        if !moved.isEmpty {
+            let cases = Array(repeating: "WHEN ? THEN ?", count: moved.count).joined(separator: " ")
+            let binds = moved.flatMap { [SQLValue.int($0.id), .int(Int64($0.order))] } + moved.map { SQLValue.int($0.id) }
+            try runWrite("UPDATE tasks SET sort_order = CASE id \(cases) END WHERE id IN (\(Self.placeholders(moved.count)));",
+                         binds)
+        }
+        return slots.indices.map { i in
+            var task = siblings[i]
+            task.sortOrder = slots[i]
+            return task
         }
     }
 

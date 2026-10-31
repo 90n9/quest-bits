@@ -765,12 +765,17 @@ final class AppModel: ObservableObject {
     }
 
     /// Reorder the displayed rows after a drag. `displayed` is the array the List is
-    /// showing (top-level tasks in a project view; the flat list in a smart view), so
-    /// offsets line up regardless of nesting.
+    /// showing (the open top-level tasks of one project), so offsets line up regardless of
+    /// nesting. They go to the top in the new order; closed ones stay below them, and
+    /// subtasks stay with their parents (the same `Store.reorderTasks` MCP reorder_tasks uses).
     func moveTasks(_ displayed: [TodoTask], from offsets: IndexSet, to destination: Int) {
         var ordered = displayed
         ordered.move(fromOffsets: offsets, toOffset: destination)
-        try? store.reorderTasks(orderedIds: ordered.map { $0.id })
+        do {
+            try store.reorderTasks(ids: ordered.map(\.id))
+        } catch {
+            flashToast("Couldn't reorder: \(error)")
+        }
         reloadTasks()
     }
 
