@@ -11,59 +11,30 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             UpdateBanner()
+            // Two columns: the sidebar and the page. A page's detail (the task, question,
+            // decision… picked in its list) opens as a pane on the right only once an item
+            // is picked, so lists and the Dashboard use the full width until then.
             NavigationSplitView {
                 ProjectSidebar()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
-            } content: {
-                if model.showArchived {
-                    ArchivedProjectsView()
-                        .navigationSplitViewColumnWidth(min: 320, ideal: 420)
-                } else if model.showInbox {
-                    InboxListView()
-                        .navigationSplitViewColumnWidth(min: 300, ideal: 380)
-                } else if model.showActivity {
-                    ActivityListView()
-                        .navigationSplitViewColumnWidth(min: 320, ideal: 400)
-                } else if model.showDecisions {
-                    DecisionListView()
-                        .navigationSplitViewColumnWidth(min: 320, ideal: 400)
-                } else if model.showQuestions {
-                    QuestionListView()
-                        .navigationSplitViewColumnWidth(min: 260, ideal: 320)
-                } else if model.showDashboard {
-                    DashboardView()
-                        .navigationSplitViewColumnWidth(min: 420, ideal: 560)
-                } else if let p = model.selectedProject, model.projectTab != .tasks {
-                    ProjectTabColumn(project: p, tab: model.projectTab)
-                        .modifier(ProjectTabsInset())
-                        .navigationSplitViewColumnWidth(min: 280, ideal: 360)
-                } else if model.boardView && model.boardAvailable {
-                    BoardView()
-                        .modifier(ProjectTabsInset())
-                        .navigationSplitViewColumnWidth(min: 520, ideal: 820)
-                } else {
-                    TaskListView()
-                        .modifier(ProjectTabsInset())
-                        .navigationSplitViewColumnWidth(min: 280, ideal: 360)
-                }
             } detail: {
-                if model.showArchived {
-                    ContentUnavailableViewCompat(text: "Find an archived project to open or unarchive it")
-                } else if model.showInbox {
-                    InboxDetailView()
-                } else if model.showActivity {
-                    ActivityDetailView()
-                } else if model.showDecisions {
-                    DecisionDetailView()
-                } else if model.showQuestions {
-                    QuestionDetailView()
-                } else if model.showDashboard {
-                    ContentUnavailableViewCompat(text: "Your activity at a glance")
-                } else if let p = model.selectedProject, model.projectTab != .tasks {
-                    ProjectTabDetail(project: p, tab: model.projectTab)
-                } else {
-                    TaskDetailView()
-                }
+                mainPage
+                    .frame(minWidth: 420)
+                    .inspector(isPresented: Binding(get: { model.detailPaneOpen },
+                                                    set: { if !$0 { model.closeDetailPane() } })) {
+                        detailPane
+                            .inspectorColumnWidth(min: 340, ideal: 460, max: 720)
+                    }
+                    .toolbar {
+                        if model.detailPaneOpen {
+                            ToolbarItem(placement: .primaryAction) {
+                                Button { model.closeDetailPane() } label: {
+                                    Label("Close", systemImage: "sidebar.trailing")
+                                }
+                                .help("Close the detail pane")
+                            }
+                        }
+                    }
             }
             .frame(maxHeight: .infinity)
         }
@@ -85,6 +56,53 @@ struct ContentView: View {
             Button("Start anyway") { confirm.onConfirm() }
         } message: { confirm in
             Text(confirm.message)
+        }
+    }
+
+    /// The page picked in the sidebar.
+    @ViewBuilder
+    private var mainPage: some View {
+        if model.showSettings {
+            SettingsPage()
+        } else if model.showArchived {
+            ArchivedProjectsView()
+        } else if model.showInbox {
+            InboxListView()
+        } else if model.showActivity {
+            ActivityListView()
+        } else if model.showDecisions {
+            DecisionListView()
+        } else if model.showQuestions {
+            QuestionListView()
+        } else if model.showDashboard {
+            DashboardView()
+        } else if let p = model.selectedProject, model.projectTab != .tasks {
+            ProjectTabColumn(project: p, tab: model.projectTab)
+                .modifier(ProjectTabsInset())
+        } else if model.boardView && model.boardAvailable {
+            BoardView()
+                .modifier(ProjectTabsInset())
+        } else {
+            TaskListView()
+                .modifier(ProjectTabsInset())
+        }
+    }
+
+    /// What the detail pane shows for the item picked on the page (`model.detailPaneOpen`).
+    @ViewBuilder
+    private var detailPane: some View {
+        if model.showInbox {
+            InboxDetailView()
+        } else if model.showActivity {
+            ActivityDetailView()
+        } else if model.showDecisions {
+            DecisionDetailView()
+        } else if model.showQuestions {
+            QuestionDetailView()
+        } else if let p = model.selectedProject, model.projectTab != .tasks {
+            ProjectTabDetail(project: p, tab: model.projectTab)
+        } else {
+            TaskDetailView()
         }
     }
 }
@@ -170,6 +188,16 @@ struct UpdateBanner: View {
 
 // MARK: - Projects sidebar
 
+extension View {
+    /// A sidebar row's tap, also offered to VoiceOver (and other accessibility clients) as
+    /// the row's press.
+    func sidebarAction(_ action: @escaping () -> Void) -> some View {
+        onTapGesture(perform: action)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { action() }
+    }
+}
+
 struct ProjectSidebar: View {
     @EnvironmentObject var model: AppModel
     @State private var showNew = false
@@ -220,7 +248,7 @@ struct ProjectSidebar: View {
             .font(Theme.Fonts.bodySmMedium)
             .foregroundStyle(model.showInbox ? Theme.Colors.brandBlue : Theme.Colors.ink)
             .contentShape(Rectangle())
-            .onTapGesture { model.selectInbox() }
+            .sidebarAction { model.selectInbox() }
             .listRowBackground(sidebarRowCard(model.showInbox))
             .help("Questions, approvals, tasks and sessions waiting on you")
     }
@@ -231,7 +259,7 @@ struct ProjectSidebar: View {
             .font(Theme.Fonts.bodySmMedium)
             .foregroundStyle(model.showActivity ? Theme.Colors.brandBlue : Theme.Colors.ink)
             .contentShape(Rectangle())
-            .onTapGesture { model.selectActivity() }
+            .sidebarAction { model.selectActivity() }
             .listRowBackground(sidebarRowCard(model.showActivity))
             .help("What you and your agents did: changes, notes and wiki edits")
     }
@@ -249,9 +277,43 @@ struct ProjectSidebar: View {
             .font(Theme.Fonts.bodySmMedium)
             .foregroundStyle(model.showDecisions ? Theme.Colors.brandBlue : Theme.Colors.ink)
             .contentShape(Rectangle())
-            .onTapGesture { model.selectDecisions() }
+            .sidebarAction { model.selectDecisions() }
             .listRowBackground(sidebarRowCard(model.showDecisions))
             .help("Decisions your agents made on their own: mark them seen, or disagree")
+    }
+
+    /// A smart view (All Tasks, In Progress).
+    private func smartViewRow(_ v: SmartView) -> some View {
+        Label { Text(v.title) } icon: { QBIcon(name: qbSidebarIcon(v)) }
+            .font(Theme.Fonts.bodySmMedium)
+            .foregroundStyle(model.smartView == v ? Theme.Colors.brandBlue : Theme.Colors.ink)
+            .contentShape(Rectangle())
+            .sidebarAction { model.selectSmartView(v) }
+            .listRowBackground(sidebarRowCard(model.smartView == v))
+    }
+
+    /// "Questions": the questions agents left, with their count.
+    private var questionsRow: some View {
+        Label {
+            HStack {
+                Text("Questions")
+                Spacer()
+                if !model.openQuestions.isEmpty {
+                    Text("\(model.openQuestions.count)")
+                        .font(Theme.Fonts.micro)
+                        .foregroundStyle(Theme.Colors.onDark)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(qbStatusColor(.waiting), in: Capsule())
+                }
+            }
+        } icon: { QBIcon(name: "lucide-scroll-text") }
+            .font(Theme.Fonts.bodySmMedium)
+            .foregroundStyle(model.showQuestions ? Theme.Colors.brandBlue : Theme.Colors.ink)
+            .contentShape(Rectangle())
+            .sidebarAction { model.selectQuestions() }
+            .listRowBackground(sidebarRowCard(model.showQuestions))
+            .help("Questions agents left for you")
     }
 
     private func inboxBadge(_ n: Int) -> some View {
@@ -268,56 +330,42 @@ struct ProjectSidebar: View {
             get: { model.selectedProjectId },
             set: { model.selectProject($0) }
         )) {
+            // Ordered by what needs the user first: what waits on them, then the work in
+            // flight, then overviews, then the rarely used.
             Section {
                 inboxRow
-                ForEach(SmartView.allCases, id: \.self) { v in
-                    Label { Text(v.title) } icon: { QBIcon(name: qbSidebarIcon(v)) }
-                        .font(Theme.Fonts.bodySmMedium)
-                        .foregroundStyle(model.smartView == v ? Theme.Colors.brandBlue : Theme.Colors.ink)
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.selectSmartView(v) }
-                        .listRowBackground(sidebarRowCard(model.smartView == v))
-                }
-                activityRow
+                questionsRow
                 decisionsRow
+                smartViewRow(.inProgress)
+                smartViewRow(.allTasks)
                 Label { Text("Dashboard") } icon: { QBIcon(name: "lucide-castle") }
                     .font(Theme.Fonts.bodySmMedium)
                     .foregroundStyle(model.showDashboard ? Theme.Colors.brandBlue : Theme.Colors.ink)
                     .contentShape(Rectangle())
-                    .onTapGesture { model.selectDashboard() }
+                    .sidebarAction { model.selectDashboard() }
                     .listRowBackground(sidebarRowCard(model.showDashboard))
-                Label {
-                    HStack {
-                        Text("Questions")
-                        Spacer()
-                        if !model.openQuestions.isEmpty {
-                            Text("\(model.openQuestions.count)")
-                                .font(Theme.Fonts.micro)
-                                .foregroundStyle(Theme.Colors.onDark)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 1)
-                                .background(qbStatusColor(.waiting), in: Capsule())
-                        }
-                    }
-                } icon: { QBIcon(name: "lucide-scroll-text") }
-                    .font(Theme.Fonts.bodySmMedium)
-                    .foregroundStyle(model.showQuestions ? Theme.Colors.brandBlue : Theme.Colors.ink)
-                    .contentShape(Rectangle())
-                    .onTapGesture { model.selectQuestions() }
-                    .listRowBackground(sidebarRowCard(model.showQuestions))
-                    .help("Questions agents left for you")
+                    .help("Your progress at a glance")
+                activityRow
                 Label { Text("Templates") } icon: { QBIcon(name: "lucide-backpack") }
                     .font(Theme.Fonts.bodySmMedium)
+                    .foregroundStyle(Theme.Colors.ink)
                     .contentShape(Rectangle())
-                    .onTapGesture { showTemplates = true }
+                    .sidebarAction { showTemplates = true }
                     .help("Manage reusable task templates")
                 Label { Text("Archived") } icon: { QBIcon(name: "tabler-barrel") }
                     .font(Theme.Fonts.bodySmMedium)
                     .foregroundStyle(model.showArchived ? Theme.Colors.brandBlue : Theme.Colors.ink)
                     .contentShape(Rectangle())
-                    .onTapGesture { model.selectArchived() }
+                    .sidebarAction { model.selectArchived() }
                     .listRowBackground(sidebarRowCard(model.showArchived))
                     .help("Find archived projects and unarchive them")
+                Label { Text("Settings") } icon: { Image(systemName: "gearshape").foregroundStyle(Theme.Colors.ink) }
+                    .font(Theme.Fonts.bodySmMedium)
+                    .foregroundStyle(model.showSettings ? Theme.Colors.brandBlue : Theme.Colors.ink)
+                    .contentShape(Rectangle())
+                    .sidebarAction { model.selectSettings() }
+                    .listRowBackground(sidebarRowCard(model.showSettings))
+                    .help("Notifications, Claude Code, hooks, shortcuts and data")
             } header: {
                 sidebarHeader("Quests")
             }
@@ -878,7 +926,19 @@ struct TaskListView: View {
                 ContentUnavailableViewCompat(text: "Select a view or project")
             } else {
                 VStack(spacing: 0) {
-                    SearchBar(query: $model.searchQuery)
+                    // New Task sits beside the search, at the top of the list it adds to.
+                    HStack(spacing: 0) {
+                        SearchBar(query: $model.searchQuery)
+                        if model.canAddTask {
+                            Button { showNew = true } label: {
+                                Label("New Task", systemImage: "plus")
+                            }
+                            .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                            .help("New Task (⌘N)")
+                            .padding(.trailing, Theme.Spacing.sm)
+                        }
+                    }
+                    .qbParchment()
                     if !projectMilestones.isEmpty { MilestoneGroupBar(grouped: $groupByMilestone) }
                     Divider()
                     taskContent
@@ -888,14 +948,6 @@ struct TaskListView: View {
         .navigationTitle(projectName)
         .toolbar {
             ToolbarItem(placement: .principal) { ViewModeToggle() }
-            ToolbarItem(placement: .primaryAction) {
-                Button { showNew = true } label: {
-                    Label("New Task", systemImage: "plus")
-                }
-                .buttonStyle(QBPrimaryButtonStyle(compact: true))
-                .help("New Task (⌘N)")
-                .disabled(!model.canAddTask)
-            }
         }
         .sheet(isPresented: $showNew) {
             NameSheet(title: "New Task", placeholder: "Task title", text: $newTitle) {
@@ -2836,7 +2888,9 @@ struct WaitingChip: View {
 
 // MARK: - Settings
 
-struct SettingsView: View {
+/// The app's settings. Wide enough, they sit in two columns (app and agents beside guide,
+/// shortcuts and data), so little needs scrolling; narrower, one column.
+struct SettingsPage: View {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var shortcuts: ShortcutStore
     @State private var notify = true
@@ -2846,81 +2900,103 @@ struct SettingsView: View {
     @State private var showGuide = false
 
     var body: some View {
-        Form {
-            Section("Notifications") {
-                Toggle("Remind me when a task is due", isOn: $notify)
-                Toggle("Notify me when an agent needs me", isOn: $agentNotify)
-                    .help("A task an agent set waiting on you, a new question or approval, or a session waiting at its terminal")
-                Toggle("Play sound", isOn: $sound).disabled(!notify && !agentNotify)
-            }
-            Section("Updates") {
-                LabeledContent("Version",
-                               value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")
-                Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
-            }
-            Section("Claude Code (MCP)") {
-                LabeledContent("Status", value: mcpStatus)
-                if let p = MCPRegistration.registeredPath() {
-                    LabeledContent("Path") {
-                        Text(p).font(.caption.monospaced()).foregroundStyle(.secondary)
-                            .lineLimit(2).truncationMode(.middle)
-                    }
+        GeometryReader { geo in
+            if geo.size.width >= 820 {
+                HStack(alignment: .top, spacing: 0) {
+                    form { appSections }
+                    form { moreSections }
                 }
-                Button("Re-register") {
-                    MCPRegistration.registerIfNeeded(force: true)
-                    refreshMCP()
-                    model.flashToast("MCP re-registered")
-                }
-            }
-            CLISettingsSection()
-            HookSettingsSection()
-            Section {
-                Button("Edit Guide for All Projects…") { showGuide = true }
-            } header: {
-                Text("Agent Guide")
-            } footer: {
-                Text("How agents work on your tasks. A project's own guide is in its menu in the sidebar (Edit Guide…).")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section {
-                ForEach(ShortcutAction.allCases) { a in
-                    HStack {
-                        Text(a.title)
-                        Spacer()
-                        ShortcutField(shortcut: Binding(
-                            get: { shortcuts.shortcut(a) },
-                            set: { shortcuts.set(a, $0) }
-                        ))
-                        Button { shortcuts.reset(a) } label: { Image(systemName: "arrow.uturn.backward") }
-                            .buttonStyle(.borderless)
-                            .help("Reset to default")
-                    }
-                }
-                Button("Reset All Shortcuts") { shortcuts.resetAll() }
-            } header: {
-                Text("Keyboard Shortcuts")
-            } footer: {
-                Text("Click a shortcut, then press the new keys (Esc to cancel). Shortcuts work while the app is focused.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section("Data") {
-                LabeledContent("Database") {
-                    Text(model.store.dbURL.path).font(.caption.monospaced())
-                        .foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
-                }
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([model.store.dbURL])
-                }
-                Button("Export Backup…") { exportBackup() }
+            } else {
+                form { appSections; moreSections }
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 460, height: 640)
+        .qbParchment()
+        .navigationTitle("Settings")
         .sheet(isPresented: $showGuide) { GuideSheet(project: nil) }
         .onAppear { loadValues() }
         .onChange(of: notify) { _, _ in save() }
         .onChange(of: sound) { _, _ in save() }
         .onChange(of: agentNotify) { _, _ in save() }
+    }
+
+    private func form(@ViewBuilder _ content: () -> some View) -> some View {
+        Form { content() }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+    }
+
+    /// Notifications, updates, and how Claude Code reaches the app (MCP, CLI, hooks).
+    @ViewBuilder private var appSections: some View {
+        Section("Notifications") {
+            Toggle("Remind me when a task is due", isOn: $notify)
+            Toggle("Notify me when an agent needs me", isOn: $agentNotify)
+                .help("A task an agent set waiting on you, a new question or approval, or a session waiting at its terminal")
+            Toggle("Play sound", isOn: $sound).disabled(!notify && !agentNotify)
+        }
+        Section("Updates") {
+            LabeledContent("Version",
+                           value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")
+            Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
+        }
+        Section("Claude Code (MCP)") {
+            LabeledContent("Status", value: mcpStatus)
+            if let p = MCPRegistration.registeredPath() {
+                LabeledContent("Path") {
+                    Text(p).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .lineLimit(2).truncationMode(.middle)
+                }
+            }
+            Button("Re-register") {
+                MCPRegistration.registerIfNeeded(force: true)
+                refreshMCP()
+                model.flashToast("MCP re-registered")
+            }
+        }
+        CLISettingsSection()
+        HookSettingsSection()
+    }
+
+    /// The agent guide, keyboard shortcuts and the data.
+    @ViewBuilder private var moreSections: some View {
+        Section {
+            Button("Edit Guide for All Projects…") { showGuide = true }
+        } header: {
+            Text("Agent Guide")
+        } footer: {
+            Text("How agents work on your tasks. A project's own guide is in its menu in the sidebar (Edit Guide…).")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        Section {
+            ForEach(ShortcutAction.allCases) { a in
+                HStack {
+                    Text(a.title)
+                    Spacer()
+                    ShortcutField(shortcut: Binding(
+                        get: { shortcuts.shortcut(a) },
+                        set: { shortcuts.set(a, $0) }
+                    ))
+                    Button { shortcuts.reset(a) } label: { Image(systemName: "arrow.uturn.backward") }
+                        .buttonStyle(.borderless)
+                        .help("Reset to default")
+                }
+            }
+            Button("Reset All Shortcuts") { shortcuts.resetAll() }
+        } header: {
+            Text("Keyboard Shortcuts")
+        } footer: {
+            Text("Click a shortcut, then press the new keys (Esc to cancel). Shortcuts work while the app is focused.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        Section("Data") {
+            LabeledContent("Database") {
+                Text(model.store.dbURL.path).font(.caption.monospaced())
+                    .foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
+            }
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([model.store.dbURL])
+            }
+            Button("Export Backup…") { exportBackup() }
+        }
     }
 
     private func loadValues() {
@@ -3058,52 +3134,203 @@ func fmtMinutes(_ minutes: Double) -> String {
     return "\(m / 60)h \(m % 60)m"
 }
 
-/// The stats dashboard: tasks completed per day (last 7 days), plus what is in flight now
-/// (in progress, open questions). Uses Swift Charts, with a custom fallback below macOS 13.
+/// The Dashboard: a header, a row of tiles (completions, work in flight, what waits on the
+/// user), the completions chart beside what needs the user, then each quest log's progress
+/// beside the tasks in progress. It fills the page (no detail pane); tiles and rows open
+/// the page they summarise.
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
 
+    /// Days the chart covers; the tiles compare its last 7 days with the 7 before.
+    static let days = 14
+    /// Rows each list card shows before its "Show all".
+    private static let rows = 6
+
     private var completedToday: Int { model.daySeries.last?.tasksCompleted ?? 0 }
-    private var totalCompleted: Int { model.daySeries.reduce(0) { $0 + $1.tasksCompleted } }
+    private var completedYesterday: Int {
+        model.daySeries.count >= 2 ? model.daySeries[model.daySeries.count - 2].tasksCompleted : 0
+    }
+    private var thisWeek: Int { model.daySeries.suffix(7).reduce(0) { $0 + $1.tasksCompleted } }
+    private var lastWeek: Int { model.daySeries.dropLast(7).suffix(7).reduce(0) { $0 + $1.tasksCompleted } }
 
     private var completedData: [BarDatum] {
-        model.daySeries.map { BarDatum(label: weekday($0.date), value: Double($0.tasksCompleted)) }
+        model.daySeries.map { BarDatum(label: Self.dayLabel($0.date), value: Double($0.tasksCompleted)) }
     }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                Text("Stats")
-                    .font(Theme.Fonts.heading3)
-                    .foregroundStyle(Theme.Colors.ink)
-                summaryTiles
-                ChartCard(title: "Tasks completed per day", subtitle: "last 7 days") {
-                    BarChartView(data: completedData, unit: "count", tint: Theme.Colors.successAccent) { "\(Int($0))" }
+            VStack(alignment: .leading, spacing: Theme.Spacing.xl) {
+                header
+                tiles
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: Theme.Spacing.md, alignment: .top)],
+                          alignment: .leading, spacing: Theme.Spacing.md) {
+                    ChartCard(title: "Tasks completed per day",
+                              subtitle: "last \(Self.days) days · \(model.daySeries.reduce(0) { $0 + $1.tasksCompleted }) done") {
+                        BarChartView(data: completedData, unit: "count", tint: Theme.Colors.successAccent) { "\(Int($0))" }
+                    }
+                    needsYouCard
+                    questLogsCard
+                    inProgressCard
                 }
             }
-            .padding(Theme.Spacing.lg)
+            .padding(Theme.Spacing.xl)
+            .frame(maxWidth: 1280, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .qbParchment()
         .navigationTitle("Dashboard")
         .onAppear { model.reloadDashboard() }
     }
 
-    /// Summary tiles: completions (today, last 7 days) and the work in flight now.
-    private var summaryTiles: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
-            StatTile(icon: "checkmark.circle", tint: Theme.Colors.successAccent,
-                     value: "\(completedToday)", label: "Completed today")
-            StatTile(icon: "checkmark.seal", tint: Theme.Colors.brandCoral,
-                     value: "\(totalCompleted)", label: "Completed (7d)")
-            StatTile(icon: "play.circle", tint: Theme.Colors.brandYellowDeep,
-                     value: "\(model.inProgressTasks.count)", label: "In progress")
-            StatTile(icon: "questionmark.bubble", tint: Theme.Colors.brandBlue,
-                     value: "\(model.openQuestions.count)", label: "Open questions")
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(Self.today.string(from: Date()))
+                .font(Theme.Fonts.microUppercase)
+                .tracking(0.5)
+                .foregroundStyle(Theme.Colors.steel)
+            Text("Your quests at a glance")
+                .font(Theme.Fonts.heading3)
+                .foregroundStyle(Theme.Colors.inkDeep)
         }
     }
 
-    /// Short weekday ("Mon") for a yyyy-MM-dd date string; falls back to the raw string.
-    private func weekday(_ ymd: String) -> String {
+    /// The tiles; the ones about work in flight open its page.
+    private var tiles: some View {
+        // One row of five when they fit, else as many per row as fit.
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: Theme.Spacing.md) { tileSet }
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(minWidth: 5 * 170)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: Theme.Spacing.md)],
+                      spacing: Theme.Spacing.md) { tileSet }
+        }
+    }
+
+    @ViewBuilder private var tileSet: some View {
+            StatTile(icon: "checkmark.circle.fill", tint: Theme.Colors.successAccent,
+                     value: "\(completedToday)", label: "Completed today",
+                     note: "\(completedYesterday) yesterday")
+            StatTile(icon: "checkmark.seal.fill", tint: Theme.Colors.brandTeal,
+                     value: "\(thisWeek)", label: "Completed in 7 days",
+                     note: Self.compare(thisWeek, lastWeek))
+            StatTile(icon: "play.circle.fill", tint: Theme.Colors.brandYellowDeep,
+                     value: "\(model.inProgressTasks.count)", label: "In progress",
+                     note: "\(model.workingTasks.count) with an agent") { model.selectSmartView(.inProgress) }
+            StatTile(icon: "hourglass", tint: Theme.Colors.brandBlue,
+                     value: "\(model.waitingOnYou.count)", label: "Waiting on you",
+                     note: "\(model.waitingOnYou.questions.count) questions") { model.selectInbox() }
+            StatTile(icon: "crown.fill", tint: Theme.Colors.brandCoral,
+                     value: "\(model.newDecisionCount)", label: "New decisions",
+                     note: "made by agents") { model.selectDecisions() }
+    }
+
+    // MARK: cards
+
+    /// What waits on the user, in the Waiting on you page's order; a row opens it there.
+    private var needsYouCard: some View {
+        let items = Array(model.inboxItems.prefix(Self.rows))
+        return DashboardCard(title: "Needs you", subtitle: "\(model.waitingOnYou.count) waiting",
+                             more: model.waitingOnYou.count > items.count ? "Show all \(model.waitingOnYou.count)" : nil,
+                             onMore: { model.selectInbox() }) {
+            if items.isEmpty {
+                DashboardEmpty(icon: "checkmark.circle", text: "Nothing waits on you")
+            } else {
+                ForEach(items, id: \.self) { item in
+                    let row = needsYouRow(item)
+                    DashboardRow(icon: row.icon, tint: Theme.Colors.brandBlue, code: row.code, title: row.title) {
+                        model.showInboxItem(item)
+                    }
+                }
+            }
+        }
+    }
+
+    private func needsYouRow(_ item: InboxItemID) -> (icon: String, code: String?, title: String) {
+        switch item {
+        case .question(let id):
+            let q = model.waitingOnYou.questions.first { $0.id == id }
+            return ("questionmark.bubble", q?.taskCode, q?.prompt ?? "Question")
+        case .task(let id):
+            let t = model.waitingOnYou.tasks.first { $0.task.id == id }
+            return ("hand.raised", t?.task.code, t?.task.title ?? "Task")
+        case .session(let id):
+            let s = model.waitingOnYou.sessions.first { $0.id == id }
+            let folder = s.map { URL(fileURLWithPath: $0.cwd).lastPathComponent } ?? "session"
+            return ("terminal", nil, "Claude Code waits in \(folder)")
+        }
+    }
+
+    /// Each active quest log: done out of its open and done tasks; a row opens the project.
+    private var questLogsCard: some View {
+        DashboardCard(title: "Quest logs", subtitle: "done of each project's tasks") {
+            if model.activeProjects.isEmpty {
+                DashboardEmpty(icon: "map", text: "No projects yet")
+            } else {
+                ForEach(model.activeProjects) { p in
+                    let c = model.projectCounts[p.id] ?? ProjectCounts()
+                    Button { model.selectProject(p.id) } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: Theme.Spacing.sm) {
+                                Text(p.name).font(Theme.Fonts.bodySmMedium).foregroundStyle(Theme.Colors.ink)
+                                    .lineLimit(1)
+                                CodeBadge(code: p.code)
+                                Spacer(minLength: Theme.Spacing.sm)
+                                if c.waitingOnUser > 0 {
+                                    Label("\(c.waitingOnUser)", systemImage: "hand.raised.fill")
+                                        .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.brandBlue)
+                                }
+                                Text("\(c.done)/\(c.progressTotal)")
+                                    .font(Theme.Fonts.micro.monospacedDigit()).foregroundStyle(Theme.Colors.steel)
+                            }
+                            DashboardBar(ratio: c.progressTotal > 0 ? Double(c.done) / Double(c.progressTotal) : 0)
+                        }
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(DashboardRowStyle())
+                }
+            }
+        }
+    }
+
+    /// Tasks in progress, the ones an agent works on first; a row opens the task.
+    private var inProgressCard: some View {
+        let working = Set(model.workingTasks.map(\.id))
+        let tasks = model.inProgressTasks.sorted { working.contains($0.id) && !working.contains($1.id) }
+        let shown = Array(tasks.prefix(Self.rows))
+        return DashboardCard(title: "In progress", subtitle: "\(tasks.count) tasks · \(working.count) with an agent",
+                             more: tasks.count > shown.count ? "Show all \(tasks.count)" : nil,
+                             onMore: { model.selectSmartView(.inProgress) }) {
+            if shown.isEmpty {
+                DashboardEmpty(icon: "cup.and.saucer", text: "Nothing in progress")
+            } else {
+                ForEach(shown) { t in
+                    DashboardRow(icon: working.contains(t.id) ? "bolt.fill" : "circle.lefthalf.filled",
+                                 tint: Theme.Colors.brandYellowDeep, code: t.code, title: t.title) {
+                        model.showTask(t)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: formatting
+
+    private static let today: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("EEEEdMMMM")
+        return f
+    }()
+
+    /// "+3 on the 7 days before", "same as the 7 days before".
+    private static func compare(_ now: Int, _ before: Int) -> String {
+        let d = now - before
+        if d == 0 { return "same as the week before" }
+        return "\(d > 0 ? "+" : "−")\(abs(d)) on the week before"
+    }
+
+    /// Short day ("Mon 26") for a yyyy-MM-dd date string; falls back to the raw string.
+    private static func dayLabel(_ ymd: String) -> String {
         let inFmt = DateFormatter()
         inFmt.locale = Locale(identifier: "en_US_POSIX")
         inFmt.calendar = Calendar(identifier: .gregorian)
@@ -3111,28 +3338,153 @@ struct DashboardView: View {
         guard let d = inFmt.date(from: ymd) else { return ymd }
         let out = DateFormatter()
         out.calendar = Calendar(identifier: .gregorian)
-        out.dateFormat = "EEE"
+        out.dateFormat = "EEE d"
         return out.string(from: d)
     }
 }
 
-/// Compact summary tile: icon, big value, caption.
+/// A Dashboard card: title, subtitle, rows, and an optional "Show all" link.
+struct DashboardCard<Content: View>: View {
+    let title: String
+    let subtitle: String
+    var more: String? = nil
+    var onMore: () -> Void = {}
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(Theme.Fonts.heading5).foregroundStyle(Theme.Colors.ink)
+                    Text(subtitle).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.steel)
+                }
+                Spacer()
+                if let more {
+                    Button(more, action: onMore)
+                        .buttonStyle(.plain)
+                        .font(Theme.Fonts.captionBold)
+                        .foregroundStyle(Theme.Colors.brandBlue)
+                }
+            }
+            VStack(alignment: .leading, spacing: 2) { content }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .qbCard(padding: Theme.Spacing.md)
+    }
+}
+
+/// One Dashboard list row: icon, task code, title on one line; the whole row is the button.
+struct DashboardRow: View {
+    let icon: String
+    let tint: Color
+    let code: String?
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: Theme.Spacing.sm) {
+                Image(systemName: icon).font(.system(size: 12, weight: .semibold)).foregroundStyle(tint)
+                    .frame(width: 16)
+                if let code { CodeBadge(code: code) }
+                Text(title).font(Theme.Fonts.bodySm).foregroundStyle(Theme.Colors.ink)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(DashboardRowStyle())
+    }
+}
+
+/// Plain rows with a parchment highlight under the pointer.
+struct DashboardRowStyle: ButtonStyle {
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 6)
+            .background(RoundedRectangle(cornerRadius: Theme.Radius.sm)
+                .fill(configuration.isPressed ? Theme.Colors.surface : hovering ? Theme.Colors.surfaceSoft : .clear))
+            .onHover { hovering = $0 }
+    }
+}
+
+/// A card's empty state.
+struct DashboardEmpty: View {
+    let icon: String
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: icon)
+            .font(Theme.Fonts.bodySm)
+            .foregroundStyle(Theme.Colors.steel)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, Theme.Spacing.lg)
+    }
+}
+
+/// A quest log's done/total bar on the Dashboard (thicker than the sidebar's).
+struct DashboardBar: View {
+    let ratio: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Theme.Colors.hairlineSoft)
+                Capsule().fill(qbStatusColor(.done))
+                    .frame(width: CGFloat(min(max(ratio, 0), 1)) * geo.size.width)
+            }
+        }
+        .frame(height: 6)
+    }
+}
+
+/// Dashboard tile: icon, big value, label and a short note; a tile with an action opens
+/// the page it counts.
 struct StatTile: View {
     let icon: String
     let tint: Color
     let value: String
     let label: String
+    var note: String? = nil
+    var action: (() -> Void)? = nil
+    @State private var hovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Image(systemName: icon).font(.title3).foregroundStyle(tint)
-            Text(value)
-                .font(Theme.Fonts.heading4.monospacedDigit())
-                .foregroundStyle(Theme.Colors.ink)
-            Text(label).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.steel)
+        if let action {
+            Button(action: action) { card }
+                .buttonStyle(.plain)
+                .onHover { hovering = $0 }
+                .help("Open \(label)")
+        } else {
+            card
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var card: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: Theme.Spacing.sm) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 28, height: 28)
+                    .background(tint.opacity(0.14), in: Circle())
+                Text(value)
+                    .font(Theme.Fonts.heading3.monospacedDigit())
+                    .foregroundStyle(Theme.Colors.inkDeep)
+            }
+            Text(label).font(Theme.Fonts.bodySmMedium).foregroundStyle(Theme.Colors.slate).lineLimit(1)
+            if let note {
+                Text(note).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.stone).lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .qbCard(padding: Theme.Spacing.md)
+        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.lg)
+            .stroke(Theme.Colors.brandYellow.opacity(hovering ? 0.8 : 0), lineWidth: 1.5))
+        .contentShape(Rectangle())
     }
 }
 
@@ -3178,10 +3530,25 @@ struct BarChartView: View {
                 }
             }
             .chartXScale(domain: data.map(\.label))
-            .frame(height: 170)
+            // A "Sat 31" label reads on two lines, so 14 days fit without truncating.
+            .chartXAxis {
+                AxisMarks { value in
+                    AxisGridLine()
+                    AxisValueLabel(centered: true) {
+                        if let label = value.as(String.self) {
+                            VStack(spacing: 0) {
+                                ForEach(Array(label.split(separator: " ").enumerated()), id: \.offset) { _, part in
+                                    Text(part)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(height: 200)
         } else {
             FallbackBarChart(data: data, tint: tint, format: format)
-                .frame(height: 170)
+                .frame(height: 200)
         }
     }
 }

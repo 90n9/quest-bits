@@ -13,6 +13,7 @@ struct TodoAppMain: App {
             ContentView()
                 .background(MainWindowHook())
                 .environmentObject(delegate.model)
+                .environmentObject(delegate.shortcuts)
                 .frame(minWidth: 820, minHeight: 520)
                 // DESIGN.md defines light tokens only — lock the app to light appearance.
                 .preferredColorScheme(.light)
@@ -30,14 +31,6 @@ struct TodoAppMain: App {
             MenuBarLabel(model: delegate.model)
         }
         .menuBarExtraStyle(.menu)
-
-        Settings {
-            SettingsView()
-                .environmentObject(delegate.model)
-                .environmentObject(delegate.shortcuts)
-                .preferredColorScheme(.light)
-                .tint(Theme.Colors.brandBlue)
-        }
     }
 }
 
@@ -56,6 +49,15 @@ struct TodoCommands: Commands {
         // "Check for Updates…" in the app menu, right under "About".
         CommandGroup(after: .appInfo) {
             Button("Check for Updates…") { UpdateNotifier.shared.requestCheck?() }
+        }
+
+        // Settings is a page of the main window (also in the sidebar), not a window of its own.
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") {
+                MenuBarContent.showMainWindow()
+                model.selectSettings()
+            }
+            .keyboardShortcut(",")
         }
 
         // Replace (not append to) the .newItem group: a WindowGroup auto-installs a
@@ -179,29 +181,17 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
 // MARK: - Menu bar
 
-/// The menu-bar title: the template icon (it follows the menu bar's light/dark tint), then
-/// "✋ N" for what waits on the user (`waitingOnYou.count`) and "⚡ M" for the tasks being
-/// worked on (`workingTasks`), "·" between them. A zero count is left out, so with nothing
-/// waiting or working only the icon shows.
+/// The menu-bar title: the QuestBits logo, then "✋ N" for what waits on the user
+/// (`waitingOnYou.count`) and "⚡ M" for the tasks being worked on (`workingTasks`), "·"
+/// between them, all drawn as one template image (`MenuBarIcon`). A zero count is left out,
+/// so with nothing waiting or working only the logo shows.
 struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
         let waiting = model.waitingOnYou.count, working = model.workingTasks.count
-        Self.title(waiting: waiting, working: working)
+        Image(nsImage: MenuBarIcon.image(waiting: waiting, working: working))
             .accessibilityLabel(Self.spoken(waiting: waiting, working: working))
-    }
-
-    static func title(waiting: Int, working: Int) -> Text {
-        let icon = Image(systemName: "checklist")
-        let w = Text("\(Image(systemName: "hand.raised.fill")) \(waiting)")
-        let k = Text("\(Image(systemName: "bolt.fill")) \(working)")
-        switch (waiting > 0, working > 0) {
-        case (true, true): return Text("\(icon) \(w) · \(k)")
-        case (true, false): return Text("\(icon) \(w)")
-        case (false, true): return Text("\(icon) \(k)")
-        case (false, false): return Text(icon)
-        }
     }
 
     static func spoken(waiting: Int, working: Int) -> String {

@@ -83,8 +83,18 @@ final class AppModel: ObservableObject {
     // the detail column answers the selected one.
     @Published var showQuestions = false
     @Published var selectedQuestionId: Int64?
+    /// Open questions, or the history: questions answered (and picked up) or withdrawn,
+    /// newest first. On the Questions page and a project's Questions tab.
+    @Published var questionsShow: QuestionShow = .open {
+        didSet { if questionsShow != oldValue { selectedQuestionId = nil; reloadQuestions() } }
+    }
+    /// The history list, read only while it shows (`questionsShow == .history`).
+    @Published private(set) var closedQuestions: [Question] = []
+    static let questionHistoryShown = 300
     /// Archived page: the content column lists archived projects to find and unarchive.
     @Published var showArchived = false
+    /// Settings page: the app's settings in the main window (sidebar, or ⌘,).
+    @Published var showSettings = false
     /// "Waiting on you" page: the content column lists what needs the user (sessions at a
     /// terminal, open questions, tasks waiting on the user); the detail acts on the selection.
     @Published var showInbox = false
@@ -148,7 +158,7 @@ final class AppModel: ObservableObject {
     /// The project page is shown (not a smart view, the dashboard or the Questions page),
     /// so its tabs are.
     var selectedProject: Project? {
-        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, !showInbox, !showActivity,
+        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, !showSettings, !showInbox, !showActivity,
               !showDecisions, let id = selectedProjectId else { return nil }
         return projects.first { $0.id == id }
     }
@@ -156,8 +166,41 @@ final class AppModel: ObservableObject {
     /// The tab of the project page, or nil when no project page is shown.
     var shownProjectTab: ProjectTab? { selectedProject == nil ? nil : projectTab }
 
-    /// The questions the Questions page, or the project's Questions tab, lists.
-    var shownQuestions: [Question] { questionsShown(in: openQuestions) }
+    /// Whether the page shown has an item picked, so the detail pane is open. Pages pick
+    /// nothing up front: the pane opens on a click and the list keeps the full width until
+    /// then. The Dashboard, Archived and the project's Detail and Guide tabs have no pane.
+    var detailPaneOpen: Bool {
+        if showArchived || showDashboard || showSettings { return false }
+        if showInbox { return inboxSelection != nil }
+        if showActivity { return activitySelection != nil }
+        if showDecisions { return decisionSelection != nil }
+        if showQuestions { return selectedQuestionId != nil }
+        if selectedProject != nil, projectTab != .tasks {
+            switch projectTab {
+            case .wiki: return wikiSelection != nil
+            case .questions: return selectedQuestionId != nil
+            case .tasks, .detail, .guide: return false
+            }
+        }
+        return selectedTaskId != nil
+    }
+
+    /// Close the detail pane: clear the page's selection.
+    func closeDetailPane() {
+        if showInbox { inboxSelection = nil }
+        else if showActivity { activitySelection = nil }
+        else if showDecisions { decisionSelection = nil }
+        else if showQuestions { selectedQuestionId = nil }
+        else if selectedProject != nil, projectTab == .wiki { wikiSelection = nil }
+        else if selectedProject != nil, projectTab == .questions { selectedQuestionId = nil }
+        else if !selectedTaskIds.isEmpty { selectedTaskIds = [] }
+    }
+
+    /// The questions the Questions page, or the project's Questions tab, lists: open ones,
+    /// or the history.
+    var shownQuestions: [Question] {
+        questionsShown(in: questionsShow == .open ? openQuestions : closedQuestions)
+    }
 
     private func questionsShown(in open: [Question]) -> [Question] {
         guard shownProjectTab == .questions, let code = selectedProject?.code else { return open }
@@ -238,7 +281,7 @@ final class AppModel: ObservableObject {
     }
 
     func reloadDashboard() {
-        daySeries = (try? store.dailyStatsSeries(days: 7)) ?? []
+        daySeries = (try? store.dailyStatsSeries(days: DashboardView.days)) ?? []
     }
 
     /// `timeline` false skips the selected task's notes / history / questions, for a write
@@ -293,8 +336,8 @@ final class AppModel: ObservableObject {
         nextClaimExpiry = working.compactMap { $0.claim.flatMap { $0.isLive(at: now) ? $0.expiresAt : nil } }.min()
     }
 
-    /// Refresh the open questions; drop a selection that is no longer open (answered
-    /// here, or withdrawn by the agent) for the next one in line.
+    /// Refresh the open questions; a selection that is no longer open (answered here, or
+    /// withdrawn by the agent) moves to the next one in line. Nothing is picked up front.
     func reloadQuestions() {
         let readAt = Date()
         let open = (try? store.questions(statuses: [.open], activeOnly: true)) ?? openQuestions
@@ -302,9 +345,16 @@ final class AppModel: ObservableObject {
         let sessions = (try? store.agentSessions(seenSince: Date().addingTimeInterval(-Self.sessionsShownSeconds)))
             ?? agentSessions
         if sessions != agentSessions { agentSessions = sessions }
-        let shown = questionsShown(in: open)
-        if showQuestions || shownProjectTab == .questions,
-           selectedQuestionId.map({ id in !shown.contains { $0.id == id } }) ?? true {
+        let questionsPage = showQuestions || shownProjectTab == .questions
+        if questionsPage, questionsShow == .history {
+            let closed = (try? store.questions(statuses: [.answered, .resumed, .cancelled], activeOnly: true))
+                .map { Array($0.sorted { ($0.answeredAt ?? $0.askedAt) > ($1.answeredAt ?? $1.askedAt) }
+                    .prefix(Self.questionHistoryShown)) } ?? closedQuestions
+            if closed != closedQuestions { closedQuestions = closed }
+        }
+        let shown = shownQuestions
+        if questionsPage,
+           let id = selectedQuestionId, !shown.contains(where: { $0.id == id }) {
             selectedQuestionId = shown.first?.id
         }
         if let tasks = try? store.inbox() { inboxTasks = tasks.map { InboxTask(task: $0.task, projectCode: $0.projectCode) } }
@@ -342,16 +392,17 @@ final class AppModel: ObservableObject {
 
     /// Rebuild `waitingOnYou` from the open questions and the parts last read (each
     /// session's process is checked again). On the page, a selection that is gone (answered,
-    /// resumed, dismissed) moves to the item now in its place, so the next one is up.
+    /// resumed, dismissed) moves to the item now in its place, so the next one is up; with
+    /// nothing selected, nothing is picked.
     private func rebuildWaitingOnYou() {
         let built = WaitingOnYou(questions: openQuestions, tasks: inboxTasks, sessions: attentionSessions)
         guard built != waitingOnYou else { return }
         let before = inboxItems
         waitingOnYou = built
-        guard showInbox else { return }
+        guard showInbox, let sel = inboxSelection else { return }
         let items = inboxItems
-        if let sel = inboxSelection, items.contains(sel) { return }
-        let at = inboxSelection.flatMap { before.firstIndex(of: $0) } ?? 0
+        if items.contains(sel) { return }
+        let at = before.firstIndex(of: sel) ?? 0
         inboxSelection = items.isEmpty ? nil : items[min(at, items.count - 1)]
     }
 
@@ -401,6 +452,7 @@ final class AppModel: ObservableObject {
         showDashboard = false
         showQuestions = false
         showArchived = false
+        showSettings = false
         showInbox = false
         showActivity = false
         showDecisions = false
@@ -415,6 +467,7 @@ final class AppModel: ObservableObject {
         showDashboard = false
         showQuestions = false
         showArchived = false
+        showSettings = false
         showInbox = false
         showActivity = false
         showDecisions = false
@@ -429,6 +482,7 @@ final class AppModel: ObservableObject {
         showDashboard = true
         showQuestions = false
         showArchived = false
+        showSettings = false
         showInbox = false
         showActivity = false
         showDecisions = false
@@ -443,6 +497,7 @@ final class AppModel: ObservableObject {
         showQuestions = true
         showDashboard = false
         showArchived = false
+        showSettings = false
         showInbox = false
         showActivity = false
         showDecisions = false
@@ -461,13 +516,13 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showDashboard = false
         showArchived = false
+        showSettings = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
         searchQuery = ""
         inboxSelection = nil
         reloadQuestions()
-        inboxSelection = inboxItems.first
     }
 
     /// Show the Activity page, for one project or (nil) every project not archived.
@@ -478,6 +533,7 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showDashboard = false
         showArchived = false
+        showSettings = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -487,7 +543,7 @@ final class AppModel: ObservableObject {
     }
 
     /// Reread the feed with the filters (on every DB change while the page shows). The
-    /// selection stays while its row is there, else moves to the newest row.
+    /// selection stays while its row is there, else clears (the detail pane closes).
     func reloadActivity(resetLimit: Bool = false) {
         guard showActivity else { return }
         if resetLimit { activityLimit = Self.activityPage }
@@ -508,9 +564,7 @@ final class AppModel: ObservableObject {
     private func regroupActivity() {
         let groups = ActivityGroup.group(activityEvents.filter(activityWho.matches))
         if groups != activityGroups { activityGroups = groups }
-        if activitySelection.map({ id in !groups.contains { $0.id == id } }) ?? true {
-            activitySelection = groups.first?.id
-        }
+        if let id = activitySelection, !groups.contains(where: { $0.id == id }) { activitySelection = nil }
     }
 
     /// Open what a feed row is about: its task, or its page on the project's Wiki tab.
@@ -537,6 +591,7 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showDashboard = false
         showArchived = false
+        showSettings = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -546,7 +601,7 @@ final class AppModel: ObservableObject {
     }
 
     /// Reread the list with the filters (on every DB change while the page shows). The
-    /// selection stays while its decision is listed, else moves to the newest.
+    /// selection stays while its decision is listed, else clears (the detail pane closes).
     func reloadDecisions() {
         guard showDecisions else { return }
         let range = decisionsDay.range()
@@ -557,9 +612,7 @@ final class AppModel: ObservableObject {
                                     includeArchived: decisionsProjectId != nil, limit: Self.decisionsShown)
         guard let list = try? store.decisions(filter) else { return }
         if list != decisions { decisions = list }
-        if decisionSelection.map({ id in !list.contains { $0.id == id } }) ?? true {
-            decisionSelection = list.first?.id
-        }
+        if let id = decisionSelection, !list.contains(where: { $0.id == id }) { decisionSelection = nil }
     }
 
     /// Mark decisions seen (one, or every new one listed).
@@ -600,8 +653,8 @@ final class AppModel: ObservableObject {
         openTask(taskId)
     }
 
-    /// The "Waiting on you" page with `item` selected (the menu bar's entries), or its
-    /// first item when `item` is nil or gone.
+    /// The "Waiting on you" page with `item` selected (the menu bar's entries), or nothing
+    /// selected when `item` is nil or gone.
     func showInboxItem(_ item: InboxItemID?) {
         selectInbox()
         if let item, inboxItems.contains(item) { inboxSelection = item }
@@ -663,7 +716,7 @@ final class AppModel: ObservableObject {
         pendingNewTask = true
     }
 
-    /// Show a tab of the selected project's page; the Questions tab selects its first question.
+    /// Show a tab of the selected project's page.
     func selectProjectTab(_ tab: ProjectTab) {
         projectTab = tab
         if tab == .questions { selectedQuestionId = nil; reloadQuestions() }
@@ -672,6 +725,7 @@ final class AppModel: ObservableObject {
 
     func selectArchived() {
         showArchived = true
+        showSettings = false
         showQuestions = false
         showDashboard = false
         showInbox = false
@@ -682,6 +736,21 @@ final class AppModel: ObservableObject {
         selectedTaskIds = []
         searchQuery = ""
         reloadTasks()
+    }
+
+    /// Show the Settings page in the main window.
+    func selectSettings() {
+        showSettings = true
+        showArchived = false
+        showQuestions = false
+        showDashboard = false
+        showInbox = false
+        showActivity = false
+        showDecisions = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
     }
 
     /// The question after `id` in the list shown (wrapping), or nil when it is the only one.
@@ -1295,7 +1364,7 @@ final class AppModel: ObservableObject {
         if pages != wikiPages { wikiPages = pages }
         if notes != wikiDecisionNotes { wikiDecisionNotes = notes }
         let items = wikiItems
-        if wikiSelection.map({ !items.contains($0) }) ?? true { wikiSelection = items.first }
+        if let sel = wikiSelection, !items.contains(sel) { wikiSelection = nil }
     }
 
     /// The wiki list in order: decision pages, decision notes, then notes.
