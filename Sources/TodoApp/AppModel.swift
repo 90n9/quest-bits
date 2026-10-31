@@ -76,6 +76,18 @@ final class AppModel: ObservableObject {
     @Published var selectedQuestionId: Int64?
     /// Archived page: the content column lists archived projects to find and unarchive.
     @Published var showArchived = false
+    /// "Waiting on you" page: the content column lists what needs the user (sessions at a
+    /// terminal, open questions, tasks waiting on the user); the detail acts on the selection.
+    @Published var showInbox = false
+    @Published var inboxSelection: InboxItemID?
+    /// What waits on the user now, refreshed with the questions (so with every poll) and
+    /// republished only when it changed. `waitingOnYou.count` is the one count of it: the
+    /// sidebar badge, and what the menu bar and notifications show.
+    @Published private(set) var waitingOnYou = WaitingOnYou()
+    // The parts it was built from, to drop a session whose process ended (no DB write
+    // says so) without reading the DB again.
+    private var inboxTasks: [InboxTask] = []
+    private var attentionSessions: [AgentSession] = []
     /// Open questions in projects not archived, longest waiting first; refreshed with the
     /// tasks (so with every poll), republished only when they changed.
     @Published private(set) var openQuestions: [Question] = []
@@ -99,7 +111,7 @@ final class AppModel: ObservableObject {
     /// The project page is shown (not a smart view, the dashboard or the Questions page),
     /// so its tabs are.
     var selectedProject: Project? {
-        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, let id = selectedProjectId else { return nil }
+        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, !showInbox, let id = selectedProjectId else { return nil }
         return projects.first { $0.id == id }
     }
 
@@ -236,6 +248,38 @@ final class AppModel: ObservableObject {
            selectedQuestionId.map({ id in !shown.contains { $0.id == id } }) ?? true {
             selectedQuestionId = shown.first?.id
         }
+        if let tasks = try? store.inbox() { inboxTasks = tasks.map { InboxTask(task: $0.task, projectCode: $0.projectCode) } }
+        if let sessions = try? store.sessionsNeedingUser() { attentionSessions = sessions }
+        rebuildWaitingOnYou()
+    }
+
+    /// Rebuild `waitingOnYou` from the open questions and the parts last read (each
+    /// session's process is checked again). On the page, a selection that is gone (answered,
+    /// resumed, dismissed) moves to the item now in its place, so the next one is up.
+    private func rebuildWaitingOnYou() {
+        let built = WaitingOnYou(questions: openQuestions, tasks: inboxTasks, sessions: attentionSessions)
+        guard built != waitingOnYou else { return }
+        let before = inboxItems
+        waitingOnYou = built
+        guard showInbox else { return }
+        let items = inboxItems
+        if let sel = inboxSelection, items.contains(sel) { return }
+        let at = inboxSelection.flatMap { before.firstIndex(of: $0) } ?? 0
+        inboxSelection = items.isEmpty ? nil : items[min(at, items.count - 1)]
+    }
+
+    /// The page's items in order: sessions at a terminal, then questions, then waiting
+    /// tasks (each longest waiting first).
+    var inboxItems: [InboxItemID] {
+        waitingOnYou.sessions.map { .session($0.id) } + waitingOnYou.questions.map { .question($0.id) }
+            + waitingOnYou.tasks.map { .task($0.id) }
+    }
+
+    /// The item after `item` on the page (wrapping), or nil when it is the only one.
+    func inboxItem(after item: InboxItemID) -> InboxItemID? {
+        let items = inboxItems
+        guard let i = items.firstIndex(of: item), items.count > 1 else { return nil }
+        return items[(i + 1) % items.count]
     }
 
     static let sessionsShownSeconds: TimeInterval = 7 * 24 * 3600
@@ -262,6 +306,7 @@ final class AppModel: ObservableObject {
         showDashboard = false
         showQuestions = false
         showArchived = false
+        showInbox = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -273,6 +318,7 @@ final class AppModel: ObservableObject {
         showDashboard = false
         showQuestions = false
         showArchived = false
+        showInbox = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
@@ -284,6 +330,7 @@ final class AppModel: ObservableObject {
         showDashboard = true
         showQuestions = false
         showArchived = false
+        showInbox = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -295,12 +342,63 @@ final class AppModel: ObservableObject {
         showQuestions = true
         showDashboard = false
         showArchived = false
+        showInbox = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
         searchQuery = ""
         selectedQuestionId = nil
         reloadQuestions()
+    }
+
+    func selectInbox() {
+        showInbox = true
+        showQuestions = false
+        showDashboard = false
+        showArchived = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        inboxSelection = nil
+        reloadQuestions()
+        inboxSelection = inboxItems.first
+    }
+
+    /// Open what an inbox item is about: a question's or a task's task, a session's project.
+    func openInboxItem(_ item: InboxItemID) {
+        switch item {
+        case .question(let id):
+            if let q = waitingOnYou.questions.first(where: { $0.id == id }) { openTask(q.taskId) }
+        case .task(let id):
+            openTask(id)
+        case .session(let id):
+            if let pid = waitingOnYou.sessions.first(where: { $0.id == id })?.projectId { selectProject(pid) }
+        }
+    }
+
+    /// A task waiting on the user, answered: back to In Progress, with the user's note (if
+    /// any) in the same write. A blocked task asks first, like any move to In Progress.
+    func resumeWaiting(_ task: TodoTask, note: String = "") {
+        let text = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apply: () -> Void = { [weak self] in
+            guard let self else { return }
+            do {
+                try store.updateTask(id: task.id, status: .inProgress, author: .user,
+                                     note: text.isEmpty ? nil : NoteDraft(text: text, kind: .note, author: .user))
+                flashToast("\(task.code) is in progress")
+            } catch {
+                flashToast("Couldn't resume \(task.code): \(error)")
+            }
+            reloadTasks()
+        }
+        if blockedConfirmNeeded(forIds: [task.id], to: .inProgress) {
+            blockedConfirm = BlockedConfirm(
+                message: "This task is blocked by an unfinished dependency. Move it to In Progress anyway?",
+                onConfirm: apply)
+        } else {
+            apply()
+        }
     }
 
     /// New Task (⌘N): on another tab of a project page, back to Tasks first, where the
@@ -328,6 +426,7 @@ final class AppModel: ObservableObject {
         showArchived = true
         showQuestions = false
         showDashboard = false
+        showInbox = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -1323,6 +1422,9 @@ final class AppModel: ObservableObject {
         if stamp > lastDBStamp {
             lastDBStamp = stamp
             reloadAll()   // reloads the selected task's notes too: an agent may have added one
+        } else if !attentionSessions.isEmpty {
+            // A session's terminal may have closed without a hook firing: no DB write tells.
+            rebuildWaitingOnYou()
         }
     }
 }

@@ -18,6 +18,9 @@ struct ContentView: View {
                 if model.showArchived {
                     ArchivedProjectsView()
                         .navigationSplitViewColumnWidth(min: 320, ideal: 420)
+                } else if model.showInbox {
+                    InboxListView()
+                        .navigationSplitViewColumnWidth(min: 300, ideal: 380)
                 } else if model.showQuestions {
                     QuestionListView()
                         .navigationSplitViewColumnWidth(min: 260, ideal: 320)
@@ -40,6 +43,8 @@ struct ContentView: View {
             } detail: {
                 if model.showArchived {
                     ContentUnavailableViewCompat(text: "Find an archived project to open or unarchive it")
+                } else if model.showInbox {
+                    InboxDetailView()
                 } else if model.showQuestions {
                     QuestionDetailView()
                 } else if model.showDashboard {
@@ -193,12 +198,39 @@ struct ProjectSidebar: View {
         }
     }
 
+    /// "Waiting on you": everything that needs the user, with its count (`waitingOnYou.count`).
+    private var inboxRow: some View {
+        Label {
+            HStack {
+                Text("Waiting on you")
+                Spacer()
+                if !model.waitingOnYou.isEmpty { inboxBadge(model.waitingOnYou.count) }
+            }
+        } icon: { QBIcon(name: "lucide-hourglass") }
+            .font(Theme.Fonts.bodySmMedium)
+            .foregroundStyle(model.showInbox ? Theme.Colors.brandBlue : Theme.Colors.ink)
+            .contentShape(Rectangle())
+            .onTapGesture { model.selectInbox() }
+            .listRowBackground(sidebarRowCard(model.showInbox))
+            .help("Questions, approvals, tasks and sessions waiting on you")
+    }
+
+    private func inboxBadge(_ n: Int) -> some View {
+        Text("\(n)")
+            .font(Theme.Fonts.micro)
+            .foregroundStyle(Theme.Colors.onDark)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(Theme.Colors.brandBlue, in: Capsule())
+    }
+
     var body: some View {
         List(selection: Binding(
             get: { model.selectedProjectId },
             set: { model.selectProject($0) }
         )) {
             Section {
+                inboxRow
                 ForEach(SmartView.allCases, id: \.self) { v in
                     Label { Text(v.title) } icon: { QBIcon(name: qbSidebarIcon(v)) }
                         .font(Theme.Fonts.bodySmMedium)
@@ -320,7 +352,7 @@ struct ProjectSidebar: View {
 
     /// True while the selected sidebar item is an archived project.
     private var selectedIsArchived: Bool {
-        guard model.smartView == nil, !model.showDashboard, !model.showQuestions, !model.showArchived,
+        guard model.smartView == nil, !model.showDashboard, !model.showQuestions, !model.showArchived, !model.showInbox,
               let sel = model.selectedProjectId else { return false }
         return model.archivedProjects.contains { $0.id == sel }
     }
@@ -360,6 +392,7 @@ struct ProjectSidebar: View {
         .tag(p.id)
         .listRowBackground(sidebarRowCard(
             model.smartView == nil && !model.showDashboard && !model.showQuestions && !model.showArchived
+                && !model.showInbox
                 && model.selectedProjectId == p.id))
         .help(p.detail.isEmpty ? p.name : p.detail)
         .contextMenu {

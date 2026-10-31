@@ -87,6 +87,9 @@ struct QuestionDetailView: View {
 struct QuestionCard: View {
     @EnvironmentObject var model: AppModel
     let question: Question
+    /// Where Skip goes instead of the next question (the Waiting on you page: its next
+    /// item); nil there disables Skip.
+    var skipTo: (() -> Void)?? = nil
     @State private var choice: Int?
     @State private var typed = ""
     @State private var editingDraft = false
@@ -246,7 +249,7 @@ struct QuestionCard: View {
             Button("Skip for now") { skip() }
                 .buttonStyle(QBSecondaryButtonStyle(compact: true))
                 .fixedSize()
-                .disabled(model.questionAfter(question.id) == nil)
+                .disabled(skipTo.map { $0 == nil } ?? (model.questionAfter(question.id) == nil))
                 .help("Leave it open and go to the next question")
             Spacer()
             if question.kind == .approve {
@@ -288,6 +291,7 @@ struct QuestionCard: View {
     }
 
     private func skip() {
+        if let skipTo { skipTo?(); return }
         if let next = model.questionAfter(question.id) { model.selectedQuestionId = next }
     }
 
