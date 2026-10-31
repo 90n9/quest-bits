@@ -123,10 +123,25 @@ enum ExportCommand {
         guard !output.attachments.isEmpty else { return }
         let target = dir.appendingPathComponent("attachments", isDirectory: true)
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        let canonical = { (u: URL) in u.resolvingSymlinksInPath().standardizedFileURL.path }
         for src in output.attachments {
             let dest = target.appendingPathComponent(src.lastPathComponent)
-            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
-            try fm.copyItem(at: src, to: dest)
+            // Exporting into the database's own folder: the image is already where the
+            // export puts it (removing dest would delete the original).
+            if canonical(dest) == canonical(src) { continue }
+            // Copy beside it first, then swap in, so a failed copy never loses the old file.
+            let temp = target.appendingPathComponent(".\(src.lastPathComponent).\(UUID().uuidString).tmp")
+            try fm.copyItem(at: src, to: temp)
+            do {
+                if fm.fileExists(atPath: dest.path) {
+                    _ = try fm.replaceItemAt(dest, withItemAt: temp)
+                } else {
+                    try fm.moveItem(at: temp, to: dest)
+                }
+            } catch {
+                try? fm.removeItem(at: temp)
+                throw error
+            }
         }
     }
 }

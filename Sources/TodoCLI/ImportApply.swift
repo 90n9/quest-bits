@@ -1,12 +1,12 @@
 import Foundation
 
-/// Writes the items of a plan that would write, through the Store's own calls (each in its
-/// own BEGIN IMMEDIATE, never one long lock), and records each in the import ledger.
+/// Writes the items of a plan that would write, through the Store (each item in its own
+/// BEGIN IMMEDIATE, never one long lock), and records each in the import ledger.
 ///
-/// Repeat safety: a note and its ledger row are one transaction (`addImportedNote`); every
-/// other write is repeat-safe by itself (a link once per URL, ensureMilestone, a page once
-/// per provenance key, a field set to the same value), so a crash between it and its
-/// ledger row is healed by the rerun. Items the ledger already has are never written again.
+/// Crash and repeat safety: every write and its ledger row (with the write's inverse) are
+/// one transaction (`Store.importWrite`, `addImportedNote` for a note), and the checks that
+/// the target is still as the plan read it run inside it too. Items the ledger already has
+/// are never written again.
 struct ImportApplier {
     struct Result {
         var item: ImportItem
@@ -39,6 +39,9 @@ struct ImportApplier {
                 }
             }
             do {
+                if case let .note(taskId, kind, text)? = item.op {
+                    return Result(item: item, outcome: "applied", detail: try writeNote(item, taskId: taskId, kind: kind, text: text))
+                }
                 return Result(item: item, outcome: "applied", detail: try write(item))
             } catch let Skip.because(why) {
                 return Result(item: item, outcome: "skipped", detail: why)
@@ -58,63 +61,61 @@ struct ImportApplier {
                                  fingerprint: item.fingerprint, inverse: json)
     }
 
-    /// One write; returns what was written. Fields the plan read are re-read first, so a
-    /// change made since the plan (another session) stops the item instead of overwriting.
+    /// One write; returns what was written. Each runs in `Store.importWrite`: the fields
+    /// the plan read are re-read inside the write's transaction, so a change made since the
+    /// plan (another session) stops the item instead of overwriting, and the ledger row,
+    /// with the write's inverse, is written in that same transaction.
     private func write(_ item: ImportItem) throws -> String {
         guard let op = item.op else { throw CLIError.failure("nothing to write") }
-        switch op {
-        case let .repoPath(projectId, path):
-            let before = try store.listProjects(includeArchived: true).first { $0.id == projectId }?.repoPath
-            guard before == nil else { throw CLIError.failure("the project got a folder since the plan: \(before!)") }
-            let stored = try store.setProjectRepoPath(id: projectId, path: path)
-            try store.recordImport(entry(item, target: "project:\(projectId)",
-                                         inverse: ["set_repo_path": ["project": projectId, "to": NSNull()]]))
-            return "repo folder \(stored ?? "(none)")"
-        case let .milestone(projectId, name, detail, acceptance):
-            let r = try store.ensureMilestone(projectId: projectId, name: name, detail: detail, acceptance: acceptance)
-            try store.recordImport(entry(item, target: "milestone:\(r.milestone.id)",
-                                         inverse: r.created ? ["delete_milestone": r.milestone.id] : [:]))
-            return r.created ? "milestone #\(r.milestone.id) created" : "milestone #\(r.milestone.id) already there"
-        case let .milestoneTask(taskId, projectId, name):
-            guard let mid = store.milestoneId(projectId: projectId, name: name) else {
-                throw Skip.because("milestone \(name) is not there: its own item was not applied")
+        typealias Out = (result: String, entry: ImportLedgerEntry?)
+        let done = try store.importWrite(key: item.key) { (w: Store.ImportWriter) throws -> Out in
+            switch op {
+            case let .repoPath(projectId, path):
+                let stored = try w.setRepoPathIfUnset(projectId: projectId, path: path)
+                return ("repo folder \(stored ?? "(none)")",
+                        entry(item, target: "project:\(projectId)", inverse: ["set_repo_path": ["project": projectId, "to": NSNull()]]))
+            case let .milestone(projectId, name, detail, acceptance):
+                let r = try w.ensureMilestone(projectId: projectId, name: name, detail: detail, acceptance: acceptance)
+                return (r.created ? "milestone #\(r.milestone.id) created" : "milestone #\(r.milestone.id) already there",
+                        entry(item, target: "milestone:\(r.milestone.id)",
+                              inverse: r.created ? ["delete_milestone": r.milestone.id] : [:]))
+            case let .milestoneTask(taskId, projectId, name):
+                guard let mid = w.milestoneId(projectId: projectId, name: name) else {
+                    throw Skip.because("milestone \(name) is not there: its own item was not applied")
+                }
+                guard try w.setMilestoneIfUnset(taskId: taskId, milestoneId: mid) else { return ("already in the milestone", nil) }
+                return ("into milestone #\(mid)",
+                        entry(item, target: "task:\(taskId)", inverse: ["set_milestone": ["task": taskId, "to": NSNull()]]))
+            case .note:
+                throw CLIError.failure("a note is written by addImportedNote")
+            case let .link(taskId, url, kind, title):
+                let r = try w.addLink(taskId: taskId, url: url, kind: kind, title: title, author: .agent, source: item.key)
+                return (r.created ? "link #\(r.link.id)" : "link already there",
+                        entry(item, target: "task:\(taskId)", inverse: r.created ? ["remove_link": r.link.id] : [:]))
+            case let .branch(taskId, branch):
+                guard try w.setBranchIfUnset(taskId: taskId, branch: branch, author: .agent) else { return ("branch already set", nil) }
+                return ("branch \(branch)",
+                        entry(item, target: "task:\(taskId)", inverse: ["set_branch": ["task": taskId, "to": NSNull()]]))
+            case let .relation(taskId, otherId, kind):
+                let created = try w.addRelation(taskId: taskId, otherId: otherId, kind: kind)
+                return (created ? "relation added" : "relation already there",
+                        entry(item, target: "task:\(taskId)",
+                              inverse: created ? ["remove_relation": ["task": taskId, "other": otherId, "kind": kind.rawValue]] : [:]))
+            case let .page(projectId, kind, title, body, taskIds, outcome, decidedOn, source, timestamp):
+                let r = try w.createPage(projectId: projectId, kind: kind, title: title, body: body, outcome: outcome,
+                                         decidedOn: decidedOn, taskIds: taskIds, sessionId: session,
+                                         provenance: PageProvenance(source: source, key: item.key, timestamp: timestamp))
+                return (r.created ? "page #\(r.page.id)" : "page #\(r.page.id) already there",
+                        entry(item, target: "page:\(r.page.id)", inverse: r.created ? ["delete_page": r.page.id] : [:]))
             }
-            let task = try store.getTask(id: taskId)
-            if task.milestoneId == mid { return "already in the milestone" }
-            guard task.milestoneId == nil else { throw CLIError.failure("the task got another milestone since the plan") }
-            try store.bulkUpdateTasks(ids: [taskId], milestoneId: .some(mid), actor: .agent(nil))
-            try store.recordImport(entry(item, target: "task:\(taskId)",
-                                         inverse: ["set_milestone": ["task": taskId, "to": NSNull()]]))
-            return "\(task.code) into milestone #\(mid)"
-        case let .note(taskId, kind, text):
-            let note = try store.addImportedNote(taskId: taskId, text: text, kind: kind, sessionId: session,
-                                                 entry: entry(item, target: "task:\(taskId)", inverse: [:]))
-            return note.map { "note #\($0.id)" } ?? "already in the ledger"
-        case let .link(taskId, url, kind, title):
-            let r = try store.addLink(taskId: taskId, url: url, kind: kind, title: title, author: .agent, source: item.key)
-            try store.recordImport(entry(item, target: "task:\(taskId)",
-                                         inverse: r.created ? ["remove_link": r.link.id] : [:]))
-            return r.created ? "link #\(r.link.id)" : "link already there"
-        case let .branch(taskId, branch):
-            let task = try store.getTask(id: taskId)
-            if task.branch == branch { return "branch already set" }
-            guard task.branch == nil else { throw CLIError.failure("the task got another branch since the plan: \(task.branch!)") }
-            try store.updateTask(id: taskId, branch: .some(branch), author: .agent, actor: .agent(nil))
-            try store.recordImport(entry(item, target: "task:\(taskId)", inverse: ["set_branch": ["task": taskId, "to": NSNull()]]))
-            return "branch \(branch)"
-        case let .relation(taskId, otherId, kind):
-            let created = try store.addRelation(taskId: taskId, otherId: otherId, kind: kind)
-            try store.recordImport(entry(item, target: "task:\(taskId)",
-                                         inverse: created ? ["remove_relation": ["task": taskId, "other": otherId,
-                                                                                 "kind": kind.rawValue]] : [:]))
-            return created ? "relation added" : "relation already there"
-        case let .page(projectId, kind, title, body, taskIds, outcome, decidedOn, source):
-            let r = try store.createPage(projectId: projectId, kind: kind, title: title, body: body, outcome: outcome,
-                                         decidedOn: decidedOn, taskIds: taskIds, author: .agent, sessionId: session,
-                                         provenance: PageProvenance(source: source, key: item.key))
-            try store.recordImport(entry(item, target: "page:\(r.page.id)",
-                                         inverse: r.created ? ["delete_page": r.page.id] : [:]))
-            return r.created ? "page #\(r.page.id)" : "page #\(r.page.id) already there"
         }
+        return done ?? "already in the ledger"
+    }
+
+    /// A note and its ledger row: `Store.addImportedNote` (one transaction).
+    private func writeNote(_ item: ImportItem, taskId: Int64, kind: NoteKind, text: String) throws -> String {
+        let note = try store.addImportedNote(taskId: taskId, text: text, kind: kind, sessionId: session,
+                                             entry: entry(item, target: "task:\(taskId)", inverse: [:]))
+        return note.map { "note #\($0.id)" } ?? "already in the ledger"
     }
 }

@@ -226,6 +226,9 @@ final class AppModel: ObservableObject {
         if let sel = selectedProjectId, !projects.contains(where: { $0.id == sel }) {
             selectedProjectId = (activeProjects.first ?? projects.first)?.id
             projectTab = .tasks
+            // As selectProject does: the gone project's wiki search must not carry over.
+            wikiSelection = nil
+            wikiQuery = ""
         }
         reloadTasks()
         if showDashboard { reloadDashboard() }
@@ -385,6 +388,14 @@ final class AppModel: ObservableObject {
             soundEnabled: settings.soundEnabled)
     }
 
+    /// The projects a page's project picker lists: the active ones, plus `selected` when it
+    /// is archived (opened from an archived project's menu), so the picker never goes blank.
+    func pickerProjects(selected: Int64?) -> [Project] {
+        guard let selected, !activeProjects.contains(where: { $0.id == selected }),
+              let p = projects.first(where: { $0.id == selected }) else { return activeProjects }
+        return activeProjects + [p]
+    }
+
     func selectProject(_ id: Int64?) {
         if id != selectedProjectId { projectTab = .tasks; wikiSelection = nil; wikiQuery = "" }
         showDashboard = false
@@ -539,9 +550,11 @@ final class AppModel: ObservableObject {
     func reloadDecisions() {
         guard showDecisions else { return }
         let range = decisionsDay.range()
+        // One project picked (from its context menu, archived or not) shows its decisions
+        // whether or not it is archived; all projects leaves the archived ones out.
         let filter = DecisionFilter(projectId: decisionsProjectId, from: range?.from, to: range?.to,
                                     newOnly: decisionsShow == .new, disagreedOnly: decisionsShow == .disagreed,
-                                    limit: Self.decisionsShown)
+                                    includeArchived: decisionsProjectId != nil, limit: Self.decisionsShown)
         guard let list = try? store.decisions(filter) else { return }
         if list != decisions { decisions = list }
         if decisionSelection.map({ id in !list.contains { $0.id == id } }) ?? true {
@@ -1231,13 +1244,18 @@ final class AppModel: ObservableObject {
 
     /// Show a task from anywhere (e.g. a relation in another project): select it where it
     /// is listed now, or else open its project with it selected.
+    /// Only a task list on screen counts: off the list pages (Waiting on you, Activity…)
+    /// `tasks` can still hold the list shown before, and selecting there would select a
+    /// task the user cannot see (the Task menu, ⌘⌫ included, would act on it).
     func openTask(_ id: Int64) {
-        if tasks.contains(where: { $0.id == id }) {
+        let listShown = smartView != nil || shownProjectTab == .tasks
+        if listShown, tasks.contains(where: { $0.id == id }) {
             selectedTaskIds = [id]
             return
         }
         guard let pid = task(byId: id)?.projectId else { return }
         selectProject(pid)
+        if projectTab != .tasks { selectProjectTab(.tasks) }
         selectedTaskIds = [id]
     }
 
@@ -1419,10 +1437,11 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    /// Change what a link is marked as (the store's add-again path updates the kind).
+    /// Change what a link is marked as, by its id: a link removed (or changed) meanwhile
+    /// is not added back.
     func setLinkKind(_ link: TaskLink, _ kind: LinkKind) {
         do {
-            try store.addLink(taskId: link.taskId, url: link.url, kind: kind, author: .user)
+            try store.setLinkKind(id: link.id, kind: kind, url: link.url)
         } catch {
             flashToast("Couldn't change the link: \(error)")
         }
@@ -1444,7 +1463,8 @@ final class AppModel: ObservableObject {
     /// it and the session has not made a call the hooks see since).
     func dismissAttention(_ session: AgentSession) {
         do {
-            try store.clearSessionAttention(id: session.id)
+            // Only what the user saw: a newer "needs you" raised since the last poll stays.
+            try store.clearSessionAttention(id: session.id, at: session.attention?.at ?? Date())
         } catch {
             flashToast("Couldn't dismiss: \(error)")
         }
@@ -1453,7 +1473,7 @@ final class AppModel: ObservableObject {
 
     func removeLink(_ link: TaskLink) {
         do {
-            try store.removeLink(id: link.id)
+            try store.removeLink(id: link.id, url: link.url)
         } catch {
             flashToast("Couldn't remove the link: \(error)")
         }
@@ -1663,6 +1683,9 @@ final class AppModel: ObservableObject {
         let stamp = currentDBStamp()
         if stamp > lastDBStamp {
             lastDBStamp = stamp
+            // An older QuestBits (an MCP server started before the update) writes only the
+            // fields it knows: carry its writes in before reading (links, stale claims).
+            store.syncOlderBinaryWrites()
             reloadAll()   // reloads the selected task's notes too: an agent may have added one
             return
         }

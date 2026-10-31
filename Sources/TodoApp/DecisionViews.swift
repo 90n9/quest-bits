@@ -103,7 +103,9 @@ private struct DecisionFilterBar: View {
     private var projectPicker: some View {
         Picker("Project", selection: $model.decisionsProjectId) {
             Text("All projects").tag(Int64?.none)
-            ForEach(model.activeProjects) { p in Text("\(p.code) · \(p.name)").tag(Int64?.some(p.id)) }
+            ForEach(model.pickerProjects(selected: model.decisionsProjectId)) { p in
+                Text("\(p.code) · \(p.name)").tag(Int64?.some(p.id))
+            }
         }
         .labelsHidden()
         .frame(maxWidth: 220)

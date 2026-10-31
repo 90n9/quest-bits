@@ -370,7 +370,8 @@ struct WikiDecisionNoteView: View {
 
 /// Edit a page in place: title, a decision's outcome and date, its tasks (codes) and the
 /// body in the block editor. Save writes it all at once, made from the version shown: if
-/// an agent changed the page meanwhile, nothing is saved and the agent's version shows.
+/// an agent changed the page meanwhile, nothing is saved; the editor stays open with the
+/// user's text and shows the agent's version beside it, and a second Save overwrites it.
 struct WikiPageEditor: View {
     @EnvironmentObject var model: AppModel
     let page: ProjectPage
@@ -386,9 +387,12 @@ struct WikiPageEditor: View {
     /// The version the edit started from: `page` follows the store (an agent's write
     /// reloads it), so the save must not take the newer version as its base.
     @State private var baseVersion = 0
+    /// The agent's version, after a save refused because the page changed meanwhile.
+    @State private var conflict: ProjectPage?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if let conflict { ConflictNotice(theirs: conflict, onDismiss: { self.conflict = nil }) }
             TextField("Title", text: $title)
                 .textFieldStyle(.roundedBorder)
                 .font(Theme.Fonts.bodyMdMedium)
@@ -472,10 +476,12 @@ struct WikiPageEditor: View {
                                        decidedOn: page.kind == .decision ? Self.dayFormatter.string(from: decidedOn) : nil,
                                        taskIds: ids, version: baseVersion)
                 onClose()
-            } catch is PageConflict {
-                model.flashToast("An agent changed this page; your edit was not saved. Showing its version.")
+            } catch let c as PageConflict {
+                // Keep the user's text; the next Save is made from the agent's version, so
+                // it overwrites it on purpose (after the user merged what they want).
+                conflict = c.current
+                baseVersion = c.current.version
                 model.reloadWiki()
-                onClose()
             } catch {
                 model.flashToast("Couldn't save the page: \(error)")
             }
@@ -489,6 +495,60 @@ struct WikiPageEditor: View {
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
+}
+
+/// Shown in the page editor after a save was refused: an agent changed the page while it
+/// was being edited. The user's text stays in the editor; the agent's is here to read and
+/// copy from, and Save again writes the user's version over it.
+private struct ConflictNotice: View {
+    let theirs: ProjectPage
+    let onDismiss: () -> Void
+    @State private var expanded = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            header
+            if expanded { agentText }
+        }
+        .padding(Theme.Spacing.sm)
+        .background(RoundedRectangle(cornerRadius: Theme.Radius.md).fill(Theme.Colors.surfaceSoft))
+        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md).stroke(Theme.Colors.hairlineStrong))
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(Theme.Colors.steel)
+            Text("Not saved: an agent changed this page while you edited it. Your text is kept below. "
+                 + "Merge what you need from the agent's version, then Save again to replace it with yours.")
+                .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button(expanded ? "Hide Agent's Version" : "Show Agent's Version") { expanded.toggle() }
+                .buttonStyle(QBSecondaryButtonStyle(compact: true))
+            Button("Copy Agent's Text", action: copy).buttonStyle(QBSecondaryButtonStyle(compact: true))
+            Button(action: onDismiss) { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).help("Hide this notice")
+        }
+    }
+
+    private var agentText: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(theirs.title).font(Theme.Fonts.bodyMdMedium)
+                if let outcome = theirs.outcome, !outcome.isEmpty {
+                    Text("Outcome: \(outcome)").font(Theme.Fonts.caption)
+                }
+                Text(theirs.body).font(Theme.Fonts.caption).textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: 160)
+    }
+
+    private func copy() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(theirs.body, forType: .string)
+    }
 }
 
 /// A page's changes, newest first.

@@ -158,7 +158,9 @@ private struct ActivityFilterBar: View {
     private var projectPicker: some View {
         Picker("Project", selection: $model.activityProjectId) {
             Text("All projects").tag(Int64?.none)
-            ForEach(model.activeProjects) { p in Text("\(p.code) · \(p.name)").tag(Int64?.some(p.id)) }
+            ForEach(model.pickerProjects(selected: model.activityProjectId)) { p in
+                Text("\(p.code) · \(p.name)").tag(Int64?.some(p.id))
+            }
         }
         .labelsHidden()
         .frame(maxWidth: 220)

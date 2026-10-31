@@ -11,6 +11,24 @@ enum ImportSources {
 
     static func sha256(_ text: String) -> String { sha256(Data(text.utf8)) }
 
+    /// A source's timestamp text as a date: ISO 8601 (with or without fractional seconds),
+    /// or SQLite's "yyyy-MM-dd HH:mm:ss" (UTC). nil when it is neither.
+    static func date(_ text: String) -> Date? {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = iso.date(from: text) { return d }
+        iso.formatOptions = [.withInternetDateTime]
+        if let d = iso.date(from: text) { return d }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        for format in ["yyyy-MM-dd HH:mm:ss.SSS", "yyyy-MM-dd HH:mm:ss"] {
+            f.dateFormat = format
+            if let d = f.date(from: text) { return d }
+        }
+        return nil
+    }
+
     static func expand(_ path: String) -> String { (path as NSString).expandingTildeInPath }
 
     /// A source file as read now. `error` when it cannot be read (every item quoting it
@@ -169,11 +187,18 @@ enum ImportSources {
 
     /// Copy a QuestBits database to `dest` with SQLite's online backup API: a consistent
     /// snapshot even while the app or an MCP server writes it (WAL included), unlike a file
-    /// copy. The source is opened read-only and never migrated; `dest` is replaced. Then the
-    /// copy's integrity is checked.
+    /// copy. The source is only ever opened read-only, never migrated (`openSourceReadOnly`);
+    /// `dest` is replaced, and may not be the source itself. Then the copy's integrity is
+    /// checked.
     static func backup(_ source: URL, to dest: URL) throws {
-        guard FileManager.default.fileExists(atPath: source.path) else {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: source.path) else {
             throw CLIError.failure("no database at \(source.path)")
+        }
+        // Replacing dest would delete the source before it is read.
+        let canonical = { (u: URL) in u.resolvingSymlinksInPath().standardizedFileURL.path }
+        guard canonical(source) != canonical(dest) else {
+            throw CLIError.failure("\(source.path) is the copy this run writes: copy it elsewhere first, or use another --out")
         }
         try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
         for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: dest.path + suffix) }
@@ -186,16 +211,7 @@ enum ImportSources {
         var src: OpaquePointer?
         var dst: OpaquePointer?
         defer { sqlite3_close(src); sqlite3_close(dst) }
-        // Read-only first; a WAL database whose -shm is gone (no process has it open) cannot
-        // be opened that way, so then read-write with query_only (no data is written).
-        if sqlite3_open_v2(source.path, &src, SQLITE_OPEN_READONLY, nil) != SQLITE_OK
-            || sqlite3_exec(src, "SELECT count(*) FROM sqlite_master;", nil, nil, nil) != SQLITE_OK {
-            sqlite3_close(src); src = nil
-            guard sqlite3_open_v2(source.path, &src, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
-                throw CLIError.failure("cannot open \(source.path): \(String(cString: sqlite3_errmsg(src)))")
-            }
-            sqlite3_exec(src, "PRAGMA query_only=ON;", nil, nil, nil)
-        }
+        let immutableStamp = try openSourceReadOnly(source, &src)
         sqlite3_busy_timeout(src, 5000)
         guard sqlite3_open(dest.path, &dst) == SQLITE_OK else {
             throw CLIError.failure("cannot create \(dest.path): \(String(cString: sqlite3_errmsg(dst)))")
@@ -220,5 +236,57 @@ enum ImportSources {
         // One self-contained file (the copy took the source's WAL mode with it).
         sqlite3_finalize(stmt); stmt = nil
         sqlite3_exec(dst, "PRAGMA journal_mode=DELETE;", nil, nil, nil)
+        // An immutable open sees no other writer: if one started meanwhile, the copy may
+        // mix two states, so it is not used.
+        if let before = immutableStamp, fileStamp(source) != before {
+            throw CLIError.failure("\(source.path) changed while it was copied: run again")
+        }
+    }
+
+    /// Open a database for reading only, without ever writing to it or beside it.
+    /// - A plain read-only open, when SQLite can read it so and the -shm is there (a WAL
+    ///   database another process has open).
+    /// - Else, when there is no -wal with content (no process has it open, and every write
+    ///   is in the main file): read-only and immutable (`immutable=1`: no locks, no -shm),
+    ///   with the file's size and date kept so `backup` can tell a writer that started
+    ///   meanwhile. A read-write open would create -wal/-shm and could replay or checkpoint
+    ///   a leftover -wal into the source.
+    /// - Else (a -wal with frames and no usable -shm: a crash leftover) it refuses.
+    /// Returns the stamp for an immutable open, nil for a plain one.
+    private static func openSourceReadOnly(_ source: URL, _ src: inout OpaquePointer?) throws -> [Double]? {
+        let fm = FileManager.default
+        let wal = (try? fm.attributesOfItem(atPath: source.path + "-wal"))?[.size] as? NSNumber
+        // Without a -shm, even a read-only open of a WAL database may create one beside the
+        // source (and rebuild a leftover -wal's index in it): only the paths below then.
+        if fm.fileExists(atPath: source.path + "-shm"), sqlite3_open_v2(source.path, &src, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+           sqlite3_exec(src, "SELECT count(*) FROM sqlite_master;", nil, nil, nil) == SQLITE_OK {
+            return nil
+        }
+        sqlite3_close(src); src = nil
+        guard (wal?.int64Value ?? 0) == 0 else {
+            throw CLIError.failure("\(source.path) has unsaved changes in its -wal file and cannot be read safely "
+                                   + "without changing it: open QuestBits once (it saves them), quit it, and run again")
+        }
+        let stamp = fileStamp(source)
+        var comps = URLComponents()
+        comps.scheme = "file"
+        comps.path = source.path
+        comps.queryItems = [URLQueryItem(name: "mode", value: "ro"), URLQueryItem(name: "immutable", value: "1")]
+        guard let uri = comps.string,
+              sqlite3_open_v2(uri, &src, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
+              sqlite3_exec(src, "SELECT count(*) FROM sqlite_master;", nil, nil, nil) == SQLITE_OK else {
+            let why = src.map { String(cString: sqlite3_errmsg($0)) } ?? "out of memory"
+            throw CLIError.failure("cannot open \(source.path) read-only: \(why)")
+        }
+        return stamp
+    }
+
+    /// The database file's size and modification date, and whether a -wal is there.
+    private static func fileStamp(_ url: URL) -> [Double] {
+        let fm = FileManager.default
+        let a = (try? fm.attributesOfItem(atPath: url.path)) ?? [:]
+        return [(a[.size] as? NSNumber)?.doubleValue ?? -1,
+                (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1,
+                fm.fileExists(atPath: url.path + "-wal") ? 1 : 0]
     }
 }

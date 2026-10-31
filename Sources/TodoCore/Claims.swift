@@ -14,6 +14,24 @@ public struct ClaimHolder: Hashable, Sendable {
         self.id = id
         self.label = (trimmed?.isEmpty ?? true) || trimmed == id ? nil : trimmed
     }
+
+    /// The Claude Code session this holder is: `id` when it is a session id, else the
+    /// session id inside the label (`<id>/<suffix>`), else nil.
+    var sessionId: String? { AgentSession.sessionId(in: id) ?? AgentSession.sessionId(in: label) }
+
+    /// Whether claim `c` is this holder's. The same agent can claim under its label (no
+    /// session recorded yet) and call again under its session id once a hook recorded the
+    /// session, or the other way round, so a stored id that differs is not enough to say
+    /// "another session": when both sides name a Claude Code session, the sessions decide;
+    /// otherwise the claim is this holder's when its holder or label is this holder's id
+    /// or label.
+    public func holds(_ c: TaskClaim) -> Bool {
+        if c.holder == id { return true }
+        let theirs = AgentSession.sessionId(in: c.holder) ?? AgentSession.sessionId(in: c.label)
+        if let mine = sessionId, let theirs { return mine == theirs }
+        let names = Set([id, label].compactMap { $0 })
+        return names.contains(c.holder) || c.label.map(names.contains) == true
+    }
 }
 
 /// A task's claim: which session works on it, and until when the claim holds without

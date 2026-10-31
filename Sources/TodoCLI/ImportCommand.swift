@@ -8,7 +8,9 @@ import Foundation
 ///   summary.md), then rehearses the apply on that copy and runs it a second time to show
 ///   the rerun writes nothing. The copy is kept as rehearsal-after.sqlite for review.
 /// - `--apply --plan <reviewed plan.json>` writes only the items of that plan whose
-///   fingerprint is unchanged, after backing the database up. It refuses QuestBits' own
+///   fingerprint is unchanged, after backing the database up. It stops before writing
+///   anything when a source drifted or a source item appeared that the plan did not have
+///   unmapped (unless `--allow-drift`). It refuses QuestBits' own
 ///   databases (either flavor) without `--allow-real-db`, so applying to real data is
 ///   always a deliberate step.
 ///
@@ -17,7 +19,7 @@ import Foundation
 enum ImportCommand {
     static let command = CLICommand(
         name: "import",
-        usage: "import --config <file> (--dry-run | --apply --plan <plan.json>) [--db <path>] [--out <dir>] [--allow-real-db]",
+        usage: "import --config <file> (--dry-run | --apply --plan <plan.json>) [--db <path>] [--out <dir>] [--allow-real-db] [--allow-drift]",
         summary: "Import work from plan files and agent loop logs, from a reviewed mapping (dry run first).",
         details: """
         --config <file>    the mapping (JSON; see ImportConfig.swift for its shape)
@@ -28,9 +30,11 @@ enum ImportCommand {
         --db <path>        the database (default: TODO_DB_PATH, else QuestBits' own)
         --out <dir>        where manifests and reports go (default: next to the config, dated)
         --allow-real-db    let --apply write QuestBits' own database (it is backed up first)
+        --allow-drift      let --apply go on when a source drifted or has new unmapped items
+                           (they are still not written; without it, --apply writes nothing)
         """,
         options: ["config", "plan", "db", "out"],
-        flags: ["dry-run", "apply", "allow-real-db"],
+        flags: ["dry-run", "apply", "allow-real-db", "allow-drift"],
         run: { try run($0, $1) })
 
     static func run(_ args: CLIArgs, _ ctx: CLIContext) throws -> Int32 {
@@ -54,7 +58,8 @@ enum ImportCommand {
         var run = Run(config: config, configURL: configURL, configSHA: configSHA, dbURL: dbURL, outDir: outDir,
                       stamp: stamp, ctx: ctx)
         if args.has("dry-run") { return try run.dryRun() }
-        return try run.apply(planURL: URL(fileURLWithPath: ctx.absolutePath(args.value("plan")!)))
+        return try run.apply(planURL: URL(fileURLWithPath: ctx.absolutePath(args.value("plan")!)),
+                             allowDrift: args.has("allow-drift"))
     }
 
     /// QuestBits' own databases, both flavors, whichever this binary is.
@@ -148,16 +153,18 @@ enum ImportCommand {
             return 0
         }
 
-        mutating func apply(planURL: URL) throws -> Int32 {
+        mutating func apply(planURL: URL, allowDrift: Bool) throws -> Int32 {
             let reviewedPlan = try JSONSerialization.jsonObject(with: Data(contentsOf: planURL)) as? [String: Any] ?? [:]
             guard reviewedPlan["config_sha256"] as? String == configSHA else {
                 throw CLIError.failure("the mapping changed since that plan was made: run the dry run again and review it")
             }
             if let day = reviewedPlan["imported_on"] as? String { importedOn = day }
             var reviewed: [String: String] = [:]
+            var reviewedStates: [String: String] = [:]
             for case let i as [String: Any] in reviewedPlan["items"] as? [Any] ?? [] {
-                if let k = i["key"] as? String, let fp = i["fingerprint"] as? String,
-                   let s = i["state"] as? String, ImportItem.State(rawValue: s)?.writes == true { reviewed[k] = fp }
+                guard let k = i["key"] as? String, let s = i["state"] as? String else { continue }
+                reviewedStates[k] = s
+                if let fp = i["fingerprint"] as? String, ImportItem.State(rawValue: s)?.writes == true { reviewed[k] = fp }
             }
             try readSources()
             let backup = outDir.appendingPathComponent("backup-before-apply-\(stamp).sqlite")
@@ -165,6 +172,22 @@ enum ImportCommand {
             let store = try Store(url: dbURL)
             store.origin = ChangeOrigin(.importer, sessionLabel: config.session)
             let items = try plan(store)
+            // Sources that changed since the mapping, or source items the reviewed plan did
+            // not have as unmapped: the review no longer covers them, so nothing is written.
+            let unreviewed = items.filter {
+                $0.state == .drifted || ($0.state == .unresolved && reviewedStates[$0.key] != ImportItem.State.unresolved.rawValue)
+            }
+            if !unreviewed.isEmpty && !allowDrift {
+                try write("apply-\(stamp)-stopped.json", try Fmt.json([
+                    "run_id": "apply-\(stamp)", "db": dbURL.path, "plan": planURL.path, "written": 0,
+                    "stopped_on": unreviewed.map(\.json)]))
+                let list = unreviewed.prefix(20).map { "  \($0.state.rawValue) \($0.key)" + ($0.reason.map { ": \($0)" } ?? "") }
+                throw CLIError.failure("nothing written: \(unreviewed.count) item(s) drifted or are new and unmapped since the "
+                    + "reviewed plan:\n" + list.joined(separator: "\n")
+                    + (unreviewed.count > 20 ? "\n  …" : "")
+                    + "\nRun the dry run again and review it (or add --allow-drift to apply the rest anyway). "
+                    + "List: \(outDir.appendingPathComponent("apply-\(stamp)-stopped.json").path)")
+            }
             let results = ImportApplier(store: store, runId: "apply-\(stamp)", session: config.session, reviewed: reviewed)
                 .apply(items)
             let after = try plan(store)

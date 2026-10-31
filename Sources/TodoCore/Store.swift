@@ -622,21 +622,30 @@ public final class Store: @unchecked Sendable {
     /// `decisionsNewWindow` seen, so the Decisions page starts with the recent ones as new
     /// rather than every decision ever written. In one BEGIN IMMEDIATE, re-checked inside
     /// it, so the app and MCP server opening together backfill it once.
+    /// Retried like migrateNotesV2: a write lock held past busy_timeout at first open
+    /// (the other process mid-write) is not a reason to fail the open.
     private func migrateDecisionReviews() throws {
-        guard !columnExists("task_notes", "reviewed_at") else { return }
-        do {
-            try beginImmediate()
-            if !columnExists("task_notes", "reviewed_at") {
-                try runWrite("ALTER TABLE task_notes ADD COLUMN reviewed_at REAL;", [])
-                let now = Date().timeIntervalSince1970
-                try runWrite("UPDATE task_notes SET reviewed_at=? WHERE kind='decision' AND ts < ?;",
-                             [.double(now), .double(now - Self.decisionsNewWindow)])
+        var lastError: Error?
+        for attempt in 1...3 {
+            guard !columnExists("task_notes", "reviewed_at") else { return }
+            do {
+                try beginImmediate()
+                if !columnExists("task_notes", "reviewed_at") {
+                    try runWrite("ALTER TABLE task_notes ADD COLUMN reviewed_at REAL;", [])
+                    let now = Date().timeIntervalSince1970
+                    try runWrite("UPDATE task_notes SET reviewed_at=? WHERE kind='decision' AND ts < ?;",
+                                 [.double(now), .double(now - Self.decisionsNewWindow)])
+                }
+                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+                return
+            } catch {
+                exec("ROLLBACK;")
+                lastError = error
+                NSLog("QuestBits: decision review migration attempt \(attempt) failed: \(error)")
+                Thread.sleep(forTimeInterval: 1)
             }
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-        } catch {
-            exec("ROLLBACK;")
-            throw StoreError.open("decision review migration failed: \(error)")
         }
+        throw StoreError.open("decision review migration failed: \(lastError.map { "\($0)" } ?? "unknown error")")
     }
 
     /// The task_notes table as of 1.4.0. `author` is NULL on older notes (and on notes an
@@ -770,7 +779,13 @@ public final class Store: @unchecked Sendable {
         let staleDone = "status != '\(done)' AND completed_at IS NOT NULL"
         let needsWaiting = "status = '\(waiting)' AND waiting_since IS NULL"
         let staleWaiting = "status != '\(waiting)' AND (waiting_on IS NOT NULL OR waiting_reason IS NOT NULL OR waiting_since IS NOT NULL)"
-        let any = [needsDone, needsStart, staleDone, needsWaiting, staleWaiting].map { "(\($0))" }.joined(separator: " OR ")
+        // 1.5.0 fields an older binary does not know about: a claim left on a task it closed,
+        // and a milestone of the project it moved the task out of.
+        let staleClaim = "status IN \(Self.sqlList([done, TaskStatus.dropped.rawValue])) AND claimed_by IS NOT NULL"
+        let strayMilestone = "milestone_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM milestones m "
+            + "WHERE m.id = tasks.milestone_id AND m.project_id = tasks.project_id)"
+        let any = [needsDone, needsStart, staleDone, needsWaiting, staleWaiting, staleClaim, strayMilestone]
+            .map { "(\($0))" }.joined(separator: " OR ")
         guard queryInt("SELECT EXISTS(SELECT 1 FROM tasks WHERE \(any));", []) == 1 else { return }
         do {
             try beginImmediate()
@@ -805,6 +820,8 @@ public final class Store: @unchecked Sendable {
                 """, [])
             try runWrite(
                 "UPDATE tasks SET waiting_on = NULL, waiting_reason = NULL, waiting_since = NULL WHERE \(staleWaiting);", [])
+            try runWrite("UPDATE tasks SET \(Self.clearClaimSets.joined(separator: ", ")) WHERE \(staleClaim);", [])
+            try runWrite("UPDATE tasks SET milestone_id = NULL WHERE \(strayMilestone);", [])
             let fixed = sqlite3_total_changes(db) - before
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             NSLog("QuestBits: repaired status fields (\(fixed) row updates)")
@@ -1110,6 +1127,35 @@ public final class Store: @unchecked Sendable {
         try runWrite("UPDATE projects SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
     }
 
+    /// Change several fields of a project at once, all or nothing, in one BEGIN IMMEDIATE:
+    /// `code` (as setProjectCode), `repoPath` (.some(nil) clears it; as setProjectRepoPath),
+    /// `name`, `detail`. Every check runs before any write, so a refused code or folder
+    /// leaves the project as it was. Returns the code and folder as stored (nil when not given).
+    @discardableResult
+    public func editProject(id: Int64, name: String? = nil, detail: String? = nil, code rawCode: String? = nil,
+                            repoPath rawPath: String?? = nil) throws -> (code: String?, repoPath: String??) {
+        let path: String?? = try rawPath.map { try $0.flatMap(Self.normalizedRepoPath) }
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            guard queryInt("SELECT id FROM projects WHERE id=?;", [.int(id)]) != nil else {
+                throw StoreError.notFound("project \(id)")
+            }
+            let code = try rawCode.map { try validProjectCodeUnlocked($0, for: id) }
+            if case let p?? = path { try requireRepoPathFreeUnlocked(p, for: id) }
+            if let code { try runWrite("UPDATE projects SET code=? WHERE id=?;", [.text(code), .int(id)]) }
+            if let path {
+                try runWrite("UPDATE projects SET repo_path=? WHERE id=?;", [path.map(SQLValue.text) ?? .null, .int(id)])
+            }
+            var sets: [String] = [], binds: [SQLValue] = []
+            if let name { sets.append("name=?"); binds.append(.text(name)) }
+            if let detail { sets.append("detail=?"); binds.append(.text(detail)) }
+            if !sets.isEmpty {
+                try runWrite("UPDATE projects SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(id)])
+            }
+            return (code, path)
+        }
+    }
+
     /// Change a project's code and return it as stored (upper-cased). Its tasks keep
     /// their codes, as a moved task does, so references to them stay valid; new tasks
     /// take the new code. Checked and written in one BEGIN IMMEDIATE.
@@ -1140,19 +1186,18 @@ public final class Store: @unchecked Sendable {
     public func setProjectRepoPath(id: Int64, path raw: String?) throws -> String? {
         let path = try raw.flatMap(Self.normalizedRepoPath)
         lock.lock(); defer { lock.unlock() }
-        do {
-            try beginImmediate()
-            guard queryInt("SELECT id FROM projects WHERE id=?;", [.int(id)]) != nil else {
-                throw StoreError.notFound("project \(id)")
-            }
-            if let path { try requireRepoPathFreeUnlocked(path, for: id) }
-            try runWrite("UPDATE projects SET repo_path=? WHERE id=?;", [path.map(SQLValue.text) ?? .null, .int(id)])
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return path
-        } catch {
-            exec("ROLLBACK;")
-            throw error
+        return try inWriteTransaction { try setProjectRepoPathUnlocked(id: id, path: path) }
+    }
+
+    /// setProjectRepoPath's check and write (`path` already normalized), inside the
+    /// caller's lock and transaction.
+    private func setProjectRepoPathUnlocked(id: Int64, path: String?) throws -> String? {
+        guard queryInt("SELECT id FROM projects WHERE id=?;", [.int(id)]) != nil else {
+            throw StoreError.notFound("project \(id)")
         }
+        if let path { try requireRepoPathFreeUnlocked(path, for: id) }
+        try runWrite("UPDATE projects SET repo_path=? WHERE id=?;", [path.map(SQLValue.text) ?? .null, .int(id)])
+        return path
     }
 
     /// Throws when an active project other than `id` already has `path` (compared resolved,
@@ -1822,8 +1867,9 @@ public final class Store: @unchecked Sendable {
             // not run under write contention. A missed occurrence beats a failed mark-done
             // or a stuck connection; nothing is orphaned (rolled back above). Only for a
             // write failure — a rejected or missing task is reported as is. Not with a
-            // note: outside a transaction the update and its note could land apart.
-            guard status == .done, note == nil, let e = error as? StoreError, case .step = e else { throw error }
+            // note or a link: outside a transaction the update and its note, or the link
+            // rows and the status, could land apart.
+            guard status == .done, note == nil, link == nil, let e = error as? StoreError, case .step = e else { throw error }
             try apply(false)
         }
     }
@@ -1894,7 +1940,7 @@ public final class Store: @unchecked Sendable {
         // claim on only once that claim expires (checked here, against the row read inside
         // the caller's transaction). The user in the app may change any task.
         if let status, status != old.status, case .agent(let holder) = actor,
-           let claim = old.claim, claim.isLive(), claim.holder != holder?.id {
+           let claim = old.claim, claim.isLive(), holder?.holds(claim) != true {
             throw StoreError.invalid(Self.claimConflict(old, claim))
         }
         // milestoneId .some(id): put it in that milestone; .some(nil): in none.
@@ -2342,7 +2388,9 @@ public final class Store: @unchecked Sendable {
     // step: older binaries (and the legacy `link` field of create_task / update_task)
     // still read and write it as a URL. A legacy write means "the task's link is now X":
     // it replaces the primary link, or adds one (`setLegacyLinkUnlocked`);
-    // `syncLegacyLinks` carries such writes in on every open.
+    // `syncLegacyLinks` carries such writes in on every open (and when the app sees another
+    // process write), and every link write first applies one still pending
+    // (`mergeLegacyLinkUnlocked`).
 
     public static let maxLinkLength = 2048
     public static let maxBranchLength = 255
@@ -2350,7 +2398,8 @@ public final class Store: @unchecked Sendable {
 
     /// A link's URL (or path, or branch name) as stored: trimmed, one line, at most
     /// `maxLinkLength` characters; a web URL loses its trailing slashes, so ".../pull/7/"
-    /// and ".../pull/7" are the same link. Empty is an error.
+    /// and ".../pull/7" are the same link. Empty is an error. Only new input goes through
+    /// this: a value carried in from the legacy column is kept as written (`legacyLinkURL`).
     public static func normalizedLinkURL(_ raw: String) throws -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { throw StoreError.invalid("link url is empty") }
@@ -2360,12 +2409,12 @@ public final class Store: @unchecked Sendable {
         return s
     }
 
-    /// `normalizedLinkURL` for a value already in the legacy column, which an older build
-    /// never checked: a value it rejects is kept trimmed rather than dropped. nil = empty.
-    private static func lenientLinkURL(_ raw: String) -> String? {
-        if let s = try? normalizedLinkURL(raw) { return s }
-        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return s.isEmpty ? nil : s
+    /// A value already in the legacy column (an older build wrote it, or it predates the
+    /// links table), carried in byte for byte: an older build never normalized it, and a
+    /// changed value would read back different from what that build wrote (and the mirror
+    /// would rewrite the stored column). nil = blank.
+    private static func legacyLinkURL(_ raw: String) -> String? {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : raw
     }
 
     /// A branch name as stored: trimmed, nil when empty (no branch). No whitespace or
@@ -2419,61 +2468,98 @@ public final class Store: @unchecked Sendable {
     @discardableResult
     public func addLink(taskId: Int64, url: String, kind: LinkKind? = nil, title: String? = nil,
                         author: NoteAuthor?, source: String? = nil) throws -> (link: TaskLink, created: Bool) {
+        let given = url.trimmingCharacters(in: .whitespacesAndNewlines)
         let url = try Self.normalizedLinkURL(url)
         let title = try Self.linkLabel(title, "title")
         let source = try Self.linkLabel(source, "source")
         lock.lock(); defer { lock.unlock() }
-        do {
-            try beginImmediate()
-            guard getTaskUnlocked(taskId) != nil else { throw StoreError.notFound("task \(taskId)") }
-            let now = Int64(Date().timeIntervalSince1970)
-            var result: (link: TaskLink, created: Bool)
-            if var existing = try linksUnlocked(taskId).first(where: { $0.url == url }) {
-                var sets: [String] = [], binds: [SQLValue] = []
-                if let kind, kind != existing.kind { sets.append("kind=?"); binds.append(.text(kind.rawValue)); existing.kind = kind }
-                if let title, title != existing.title { sets.append("title=?"); binds.append(.text(title)); existing.title = title }
-                if !sets.isEmpty {
-                    try runWrite("UPDATE task_links SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(existing.id)])
-                    try runWrite("UPDATE tasks SET updated_at=? WHERE id=?;", [.int(now), .int(taskId)])
-                }
-                result = (existing, false)
-            } else {
-                let link = try insertLinkUnlocked(taskId: taskId, url: url, kind: kind ?? LinkKind.infer(from: url),
-                                                  title: title, author: author, source: source)
-                logEvent(taskId, "link", "", url)
-                try refreshLinkMirrorUnlocked(taskId, bump: true)
-                result = (link, true)
-            }
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return result
-        } catch {
-            exec("ROLLBACK;")
-            throw error
+        return try inWriteTransaction {
+            try addLinkUnlocked(taskId: taskId, url: url, given: given, kind: kind, title: title, author: author,
+                                source: source)
         }
+    }
+
+    /// addLink's write (`url` normalized, `given` as typed but trimmed, labels checked),
+    /// inside the caller's lock and transaction.
+    private func addLinkUnlocked(taskId: Int64, url: String, given: String, kind: LinkKind?, title: String?,
+                                 author: NoteAuthor?, source: String?) throws -> (link: TaskLink, created: Bool) {
+        guard getTaskUnlocked(taskId) != nil else { throw StoreError.notFound("task \(taskId)") }
+        try mergeLegacyLinkUnlocked(taskId)
+        let now = Int64(Date().timeIntervalSince1970)
+        // A link carried in from the legacy column keeps its exact text (".../7/"), so
+        // the URL as given finds it too.
+        if var existing = try linksUnlocked(taskId).first(where: { $0.url == url || $0.url == given }) {
+            var sets: [String] = [], binds: [SQLValue] = []
+            if let kind, kind != existing.kind { sets.append("kind=?"); binds.append(.text(kind.rawValue)); existing.kind = kind }
+            if let title, title != existing.title { sets.append("title=?"); binds.append(.text(title)); existing.title = title }
+            if !sets.isEmpty {
+                try runWrite("UPDATE task_links SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(existing.id)])
+                try runWrite("UPDATE tasks SET updated_at=? WHERE id=?;", [.int(now), .int(taskId)])
+                if kind != nil { try refreshLinkMirrorUnlocked(taskId, bump: false) }
+            }
+            return (existing, false)
+        }
+        let link = try insertLinkUnlocked(taskId: taskId, url: url, kind: kind ?? LinkKind.infer(from: url),
+                                          title: title, author: author, source: source)
+        logEvent(taskId, "link", "", url)
+        try refreshLinkMirrorUnlocked(taskId, bump: true)
+        return (link, true)
     }
 
     /// Remove a task's link by its URL (matched as `normalizedLinkURL` stores it). Logged
     /// to the history; bumps `updated_at`. Returns the removed link; none such is notFound.
     @discardableResult
     public func removeLink(taskId: Int64, url: String) throws -> TaskLink {
+        let given = url.trimmingCharacters(in: .whitespacesAndNewlines)
         let url = try Self.normalizedLinkURL(url)
         return try removeLink { [self] in
             guard getTaskUnlocked(taskId) != nil else { throw StoreError.notFound("task \(taskId)") }
-            return try linksUnlocked(taskId).first { $0.url == url }
+            try mergeLegacyLinkUnlocked(taskId)
+            let links = try linksUnlocked(taskId)
+            return links.first { $0.url == url } ?? links.first { $0.url == given }
         }
     }
 
     /// Remove a link by its id; see `removeLink(taskId:url:)`. With `taskId`, a link on
-    /// another task is an error and nothing is removed.
+    /// another task is an error and nothing is removed. With `url` (the link as the caller
+    /// last read it), a link whose URL changed since is notFound, not removed: a legacy
+    /// write replaces the primary link in place, under the same id.
     @discardableResult
-    public func removeLink(id: Int64, taskId: Int64? = nil) throws -> TaskLink {
+    public func removeLink(id: Int64, taskId: Int64? = nil, url: String? = nil) throws -> TaskLink {
         try removeLink { [self] in
-            guard let link = try readLinks("SELECT \(Self.linkCols) FROM task_links WHERE id=?;", [.int(id)]).first else {
-                return nil
-            }
+            guard var link = try linkUnlocked(id) else { return nil }
             if let taskId, link.taskId != taskId { throw StoreError.invalid("link \(id) is not on that task") }
+            try mergeLegacyLinkUnlocked(link.taskId)
+            guard let current = try linkUnlocked(id) else { return nil }
+            link = current
+            if let url, link.url != url { return nil }
             return link
         }
+    }
+
+    /// Change a link's kind, by its id. A link removed meanwhile (or whose URL changed, when
+    /// `url` is given) is notFound: it is not added back. Logs nothing (as addLink's kind
+    /// change); bumps the task's `updated_at` and refreshes the mirror (the primary link is
+    /// the first that is not a branch, so a kind change can move it).
+    @discardableResult
+    public func setLinkKind(id: Int64, kind: LinkKind, url: String? = nil) throws -> TaskLink {
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            guard let found = try linkUnlocked(id) else { throw StoreError.notFound("link \(id)") }
+            try mergeLegacyLinkUnlocked(found.taskId)
+            guard var link = try linkUnlocked(id), url == nil || link.url == url else {
+                throw StoreError.notFound("link \(id)")
+            }
+            guard link.kind != kind else { return link }
+            try runWrite("UPDATE task_links SET kind=? WHERE id=?;", [.text(kind.rawValue), .int(id)])
+            try refreshLinkMirrorUnlocked(link.taskId, bump: true)
+            link.kind = kind
+            return link
+        }
+    }
+
+    private func linkUnlocked(_ id: Int64) throws -> TaskLink? {
+        try readLinks("SELECT \(Self.linkCols) FROM task_links WHERE id=?;", [.int(id)]).first
     }
 
     /// The removal both `removeLink`s share: `find` reads the link inside the BEGIN
@@ -2482,7 +2568,7 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         do {
             try beginImmediate()
-            guard let link = try find() else { throw StoreError.notFound("link") }
+            guard let link = try find() else { throw StoreError.notFound("link (removed or changed meanwhile)") }
             try runWrite("DELETE FROM task_links WHERE id=?;", [.int(link.id)])
             logEvent(link.taskId, "link", link.url, "")
             try refreshLinkMirrorUnlocked(link.taskId, bump: true)
@@ -2546,10 +2632,15 @@ public final class Store: @unchecked Sendable {
     /// `raw` is added when the task has none. So for a task with at most one link it is
     /// exactly the old single field.
     /// Returns whether a link changed; the mirror is refreshed either way.
+    /// `raw` is stored as given (`legacyLinkURL`): callers pass it normalized when it is new
+    /// input, as is when it comes from the legacy column.
     @discardableResult
-    private func setLegacyLinkUnlocked(taskId: Int64, raw: String?, author: NoteAuthor?, log: Bool, bump: Bool) throws -> Bool {
-        let primary = try linksUnlocked(taskId).first { $0.kind != .branch }
-        let url = raw.flatMap(Self.lenientLinkURL)
+    private func setLegacyLinkUnlocked(taskId: Int64, raw: String?, author: NoteAuthor?, log: Bool, bump: Bool,
+                                       mergePending: Bool = true) throws -> Bool {
+        if mergePending { try mergeLegacyLinkUnlocked(taskId) }
+        let links = try linksUnlocked(taskId)
+        let primary = links.first { $0.kind != .branch }
+        let url = raw.flatMap(Self.legacyLinkURL)
         var changed = false
         if let url {
             if let first = primary {
@@ -2561,6 +2652,13 @@ public final class Store: @unchecked Sendable {
                     if log { logEvent(taskId, "link", first.url, url) }
                     changed = true
                 }
+            } else if let same = links.first(where: { $0.url == url }) {
+                // Only branch links, one of them this URL (UNIQUE per task): it becomes the
+                // primary link rather than a second row.
+                try runWrite("UPDATE task_links SET kind=? WHERE id=?;",
+                             [.text(LinkKind.infer(from: url).rawValue), .int(same.id)])
+                if log { logEvent(taskId, "link", "", url) }
+                changed = true
             } else {
                 _ = try insertLinkUnlocked(taskId: taskId, url: url, kind: LinkKind.infer(from: url),
                                            title: nil, author: author, source: nil)
@@ -2579,6 +2677,7 @@ public final class Store: @unchecked Sendable {
     /// Copy a task's links onto another (a duplicate, or a recurring task's next
     /// occurrence), in order, keeping kind, title, author and source.
     private func copyLinksUnlocked(from: Int64, to: Int64) throws {
+        try mergeLegacyLinkUnlocked(from)
         try runWrite("INSERT OR IGNORE INTO task_links (task_id, kind, url, title, author, source, created_at) "
                      + "SELECT ?, kind, url, title, author, source, ? FROM task_links WHERE task_id=? ORDER BY id;",
                      [.int(to), .double(Date().timeIntervalSince1970), .int(from)])
@@ -2597,7 +2696,8 @@ public final class Store: @unchecked Sendable {
     /// column is not carried in: the next link write refills it from the primary link.
     private func syncLegacyLinks() {
         let pendingSQL = "SELECT id, link FROM tasks WHERE link IS NOT NULL AND trim(link) <> '' AND NOT EXISTS "
-            + "(SELECT 1 FROM task_links l WHERE l.task_id = tasks.id AND l.url = tasks.link);"
+            + "(SELECT 1 FROM task_links l WHERE l.task_id = tasks.id AND l.url = tasks.link "
+            + "AND l.kind <> '\(LinkKind.branch.rawValue)');"
         func pending() throws -> [(id: Int64, link: String)] {
             let stmt = try prepare(pendingSQL, [])
             defer { sqlite3_finalize(stmt) }
@@ -2613,14 +2713,47 @@ public final class Store: @unchecked Sendable {
         do {
             guard try !pending().isEmpty else { return }
             try beginImmediate()
+            // One savepoint per task: a row that fails is left for the next try and logged,
+            // without undoing the others.
             for row in try pending() {
-                try setLegacyLinkUnlocked(taskId: row.id, raw: row.link, author: nil, log: false, bump: false)
+                exec("SAVEPOINT legacy_link;")
+                do {
+                    try setLegacyLinkUnlocked(taskId: row.id, raw: row.link, author: nil, log: false, bump: false,
+                                              mergePending: false)
+                    exec("RELEASE legacy_link;")
+                } catch {
+                    exec("ROLLBACK TO legacy_link;"); exec("RELEASE legacy_link;")
+                    NSLog("QuestBits: legacy link of task \(row.id) not carried in: \(error)")
+                }
             }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
         } catch {
             exec("ROLLBACK;")
             NSLog("QuestBits: legacy link sync failed: \(error)")
         }
+    }
+
+    /// Carry in what an older binary wrote while this store is open (it cannot see 1.5.0
+    /// tables): legacy links (`syncLegacyLinks`) and the fields `repairStatusFields` fixes
+    /// (a claim left on a task it closed, a milestone of the project it moved a task out
+    /// of). Both only read unless something needs it. The app calls this when another
+    /// process wrote to the database; every store does it at open.
+    public func syncOlderBinaryWrites() {
+        lock.lock(); defer { lock.unlock() }
+        syncLegacyLinks()
+        repairStatusFields()
+    }
+
+    /// Before a link write on `taskId`, inside the caller's transaction: a legacy value an
+    /// older binary wrote since the last sync (the column holds a URL the task's links do
+    /// not) is applied first, as that binary meant it, so the write does not overwrite it
+    /// with the stale list (`refreshLinkMirrorUnlocked`).
+    private func mergeLegacyLinkUnlocked(_ taskId: Int64) throws {
+        guard let raw = queryString("SELECT link FROM tasks WHERE id=?;", [.int(taskId)]),
+              Self.legacyLinkURL(raw) != nil,
+              queryInt("SELECT EXISTS(SELECT 1 FROM task_links WHERE task_id=? AND url=? AND kind <> ?);",
+                       [.int(taskId), .text(raw), .text(LinkKind.branch.rawValue)]) == 0 else { return }
+        try setLegacyLinkUnlocked(taskId: taskId, raw: raw, author: nil, log: false, bump: false, mergePending: false)
     }
 
     // MARK: - Milestones (1.5.0)
@@ -2633,7 +2766,8 @@ public final class Store: @unchecked Sendable {
                COALESCE(SUM(t.status = '\(TaskStatus.done.rawValue)'), 0),
                COALESCE(SUM(t.status != '\(TaskStatus.dropped.rawValue)'), 0),
                COALESCE(SUM(t.status NOT IN \(closedStatusSQL)), 0)
-        FROM milestones m JOIN projects p ON p.id = m.project_id LEFT JOIN tasks t ON t.milestone_id = m.id
+        FROM milestones m JOIN projects p ON p.id = m.project_id
+        LEFT JOIN tasks t ON t.milestone_id = m.id AND t.project_id = m.project_id
         """
     /// Projects in sidebar order (as `boardOrderSQL`), then each project's milestones.
     private static let milestoneOrderSQL =
@@ -2699,34 +2833,34 @@ public final class Store: @unchecked Sendable {
                                  targetDate: Date?, reuse: Bool) throws -> (milestone: Milestone, created: Bool) {
         let name = try Self.normalizedMilestoneName(raw)
         lock.lock(); defer { lock.unlock() }
-        do {
-            try beginImmediate()
-            if let existing = queryInt("SELECT id FROM milestones WHERE project_id=? AND name=? COLLATE NOCASE;",
-                                       [.int(projectId), .text(name)]) {
-                guard reuse else {
-                    let code = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "\(projectId)"
-                    throw StoreError.invalid("project \(code) already has a milestone named \(name)")
-                }
-                let m = try milestoneUnlocked(existing)
-                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-                return (m, false)
-            }
-            try requireActiveProjectUnlocked(projectId)
-            let now = Date().timeIntervalSince1970
-            try runWrite(
-                """
-                INSERT INTO milestones (project_id, name, detail, acceptance, sort_order, target_date, created_at, updated_at)
-                VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM milestones WHERE project_id=?), ?, ?, ?);
-                """,
-                [.int(projectId), .text(name), .text(detail), .text(acceptance), .int(projectId),
-                 targetDate.map { .double($0.timeIntervalSince1970) } ?? .null, .double(now), .double(now)])
-            let m = try milestoneUnlocked(lastInsertId())
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return (m, true)
-        } catch {
-            exec("ROLLBACK;")
-            throw error
+        return try inWriteTransaction {
+            try ensureMilestoneUnlocked(projectId: projectId, name: name, detail: detail, acceptance: acceptance,
+                                        targetDate: targetDate, reuse: reuse)
         }
+    }
+
+    /// ensureMilestone's check and write (`name` already normalized), inside the caller's
+    /// lock and transaction.
+    private func ensureMilestoneUnlocked(projectId: Int64, name: String, detail: String, acceptance: String,
+                                         targetDate: Date?, reuse: Bool) throws -> (milestone: Milestone, created: Bool) {
+        if let existing = queryInt("SELECT id FROM milestones WHERE project_id=? AND name=? COLLATE NOCASE;",
+                                   [.int(projectId), .text(name)]) {
+            guard reuse else {
+                let code = queryString("SELECT code FROM projects WHERE id=?;", [.int(projectId)]) ?? "\(projectId)"
+                throw StoreError.invalid("project \(code) already has a milestone named \(name)")
+            }
+            return (try milestoneUnlocked(existing), false)
+        }
+        try requireActiveProjectUnlocked(projectId)
+        let now = Date().timeIntervalSince1970
+        try runWrite(
+            """
+            INSERT INTO milestones (project_id, name, detail, acceptance, sort_order, target_date, created_at, updated_at)
+            VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM milestones WHERE project_id=?), ?, ?, ?);
+            """,
+            [.int(projectId), .text(name), .text(detail), .text(acceptance), .int(projectId),
+             targetDate.map { .double($0.timeIntervalSince1970) } ?? .null, .double(now), .double(now)])
+        return (try milestoneUnlocked(lastInsertId()), true)
     }
 
     /// Change a milestone (only given fields). `targetDate` .some(nil) clears it. `closed`
@@ -3286,38 +3420,39 @@ public final class Store: @unchecked Sendable {
         var seen = Set<Int64>()
         let tasks = taskIds.filter { seen.insert($0).inserted }
         lock.lock(); defer { lock.unlock() }
-        do {
-            try beginImmediate()
-            if let key = prov.key, let existing = queryInt(
-                "SELECT id FROM project_pages WHERE project_id=? AND source_key=?;", [.int(projectId), .text(key)]) {
-                let p = try pageUnlocked(existing)
-                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-                return (p, false)
-            }
-            try requireActiveProjectUnlocked(projectId)
-            try requireTasksUnlocked(tasks)
-            let now = Date().timeIntervalSince1970
-            func opt(_ s: String?) -> SQLValue { s.map(SQLValue.text) ?? .null }
-            try runWrite(
-                """
-                INSERT INTO project_pages (project_id, kind, title, body, outcome, decided_on, author, session_id,
-                    source, source_key, source_author, source_session, source_timestamp, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                [.int(projectId), .text(kind.rawValue), .text(title), .text(body), opt(outcome), opt(decided),
-                 .text(author.rawValue), opt(session), opt(prov.source), opt(prov.key), opt(prov.author),
-                 opt(prov.session), prov.timestamp.map { .double($0.timeIntervalSince1970) } ?? .null,
-                 .double(now), .double(now)])
-            let id = lastInsertId()
-            for t in tasks { try runWrite("INSERT INTO page_tasks (page_id, task_id) VALUES (?, ?);", [.int(id), .int(t)]) }
-            try logPageEventUnlocked(id, "created", "", title, author: author, sessionId: session, ts: now)
-            let p = try pageUnlocked(id)
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return (p, true)
-        } catch {
-            exec("ROLLBACK;")
-            throw error
+        return try inWriteTransaction {
+            try createPageUnlocked(projectId: projectId, kind: kind, title: title, body: body, outcome: outcome,
+                                   decided: decided, tasks: tasks, author: author, session: session, prov: prov)
         }
+    }
+
+    /// createPage's check and write (arguments already checked), inside the caller's lock
+    /// and transaction.
+    private func createPageUnlocked(projectId: Int64, kind: PageKind, title: String, body: String, outcome: String?,
+                                    decided: String?, tasks: [Int64], author: NoteAuthor, session: String?,
+                                    prov: PageProvenance) throws -> (page: ProjectPage, created: Bool) {
+        if let key = prov.key, let existing = queryInt(
+            "SELECT id FROM project_pages WHERE project_id=? AND source_key=?;", [.int(projectId), .text(key)]) {
+            return (try pageUnlocked(existing), false)
+        }
+        try requireActiveProjectUnlocked(projectId)
+        try requireTasksUnlocked(tasks)
+        let now = Date().timeIntervalSince1970
+        func opt(_ s: String?) -> SQLValue { s.map(SQLValue.text) ?? .null }
+        try runWrite(
+            """
+            INSERT INTO project_pages (project_id, kind, title, body, outcome, decided_on, author, session_id,
+                source, source_key, source_author, source_session, source_timestamp, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            [.int(projectId), .text(kind.rawValue), .text(title), .text(body), opt(outcome), opt(decided),
+             .text(author.rawValue), opt(session), opt(prov.source), opt(prov.key), opt(prov.author),
+             opt(prov.session), prov.timestamp.map { .double($0.timeIntervalSince1970) } ?? .null,
+             .double(now), .double(now)])
+        let id = lastInsertId()
+        for t in tasks { try runWrite("INSERT INTO page_tasks (page_id, task_id) VALUES (?, ?);", [.int(id), .int(t)]) }
+        try logPageEventUnlocked(id, "created", "", title, author: author, sessionId: session, ts: now)
+        return (try pageUnlocked(id), true)
     }
 
     /// Change a page (only given fields). `body` replaces the text; `append` adds a
@@ -3635,9 +3770,12 @@ public final class Store: @unchecked Sendable {
     /// the question is inserted with a kind=question note; a blocking question moves the
     /// task to waiting on the user, its reason the question — except a task already waiting
     /// (on anyone), which keeps that wait and its reason. The task's project must be active.
+    /// An agent (`actor`) asking on a task another session holds a live claim on leaves its
+    /// status to that session: the question is asked, the task is not parked.
     public func askQuestion(taskId: Int64, kind: QuestionKind, prompt: String, context: String = "",
                             options: [QuestionOption] = [], blocksTask: Bool = true,
-                            sessionId: String? = nil, agentSessionId: String? = nil) throws -> Question {
+                            sessionId: String? = nil, agentSessionId: String? = nil,
+                            actor: ClaimActor = .user) throws -> Question {
         let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { throw StoreError.invalid("question is empty") }
         let options = options.map {
@@ -3663,7 +3801,7 @@ public final class Store: @unchecked Sendable {
         return try inWriteTransaction {
             try askQuestionUnlocked(taskId: taskId, kind: kind, prompt: prompt, context: context,
                                     optionsJSON: optionsJSON, blocksTask: blocksTask,
-                                    sessionId: sessionId, agentSessionId: agentSessionId)
+                                    sessionId: sessionId, agentSessionId: agentSessionId, actor: actor)
         }
     }
 
@@ -3671,7 +3809,8 @@ public final class Store: @unchecked Sendable {
     /// checked): the task must exist and be open, its project active.
     private func askQuestionUnlocked(taskId: Int64, kind: QuestionKind, prompt: String, context: String,
                                      optionsJSON: String, blocksTask: Bool,
-                                     sessionId: String?, agentSessionId: String?) throws -> Question {
+                                     sessionId: String?, agentSessionId: String?,
+                                     actor: ClaimActor = .user) throws -> Question {
         let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
         guard let task = getTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
         guard !task.status.isClosed else { throw StoreError.invalid("\(task.code) is \(task.status.rawValue); reopen it first") }
@@ -3679,7 +3818,7 @@ public final class Store: @unchecked Sendable {
         try requireActiveProjectUnlocked(task.projectId)
         // A blocking question parks the task on the user — unless it already waits
         // (on the user, or a third party): that wait, and its reason, stay as they are.
-        let parks = blocksTask && task.status != .waiting
+        let parks = blocksTask && task.status != .waiting && !claimedByOtherUnlocked(task, actor)
         try runWrite(
             "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at, "
             + "parked, agent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
@@ -3732,8 +3871,10 @@ public final class Store: @unchecked Sendable {
 
     /// The agent takes an answered question back up (resume_question): it becomes resumed,
     /// the answer is logged as a decision note by the user, and the task — unless closed,
-    /// or still held by another open blocking question — moves to in progress.
-    public func resumeQuestion(id: Int64, sessionId: String? = nil) throws -> (question: Question, task: TodoTask) {
+    /// or still held by another open blocking question — moves to in progress. An agent
+    /// (`actor`) leaves the status of a task another session holds a live claim on alone.
+    public func resumeQuestion(id: Int64, sessionId: String? = nil,
+                               actor: ClaimActor = .user) throws -> (question: Question, task: TodoTask) {
         lock.lock(); defer { lock.unlock() }
         do {
             try beginImmediate()
@@ -3747,7 +3888,7 @@ public final class Store: @unchecked Sendable {
                          [.text(QuestionStatus.resumed.rawValue), .double(Date().timeIntervalSince1970), .int(id)])
             _ = try insertNoteUnlocked(taskId: q.taskId, text: "\(q.prompt)\n→ \(q.answer ?? "")", kind: .decision,
                                        author: .user, sessionId: sessionId ?? q.sessionId, questionId: id)
-            try startTaskUnlocked(q.taskId)
+            if let t = getTaskUnlocked(q.taskId), !claimedByOtherUnlocked(t, actor) { try startTaskUnlocked(q.taskId) }
             let saved = try questionUnlocked(id)
             guard let task = getTaskUnlocked(q.taskId) else { throw StoreError.notFound("task \(q.taskId)") }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
@@ -3760,9 +3901,11 @@ public final class Store: @unchecked Sendable {
 
     /// The agent withdraws an open or answered question it no longer needs (it found the
     /// answer itself): cancelled, with a decision note by the agent saying why, and the
-    /// task released as by resumeQuestion.
+    /// task released as by resumeQuestion (and, like there, left alone when another session
+    /// holds a live claim on it and `actor` is an agent).
     @discardableResult
-    public func cancelQuestion(id: Int64, reason: String, sessionId: String? = nil) throws -> Question {
+    public func cancelQuestion(id: Int64, reason: String, sessionId: String? = nil,
+                               actor: ClaimActor = .user) throws -> Question {
         let reason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock(); defer { lock.unlock() }
         do {
@@ -3780,7 +3923,7 @@ public final class Store: @unchecked Sendable {
             let text = "Withdrew question: \(q.prompt)" + (reason.isEmpty ? "" : "\nReason: \(reason)")
             _ = try insertNoteUnlocked(taskId: q.taskId, text: text, kind: .decision, author: .agent,
                                        sessionId: sessionId ?? q.sessionId, questionId: id)
-            if q.blocksTask {
+            if q.blocksTask, let t = getTaskUnlocked(q.taskId), !claimedByOtherUnlocked(t, actor) {
                 try releaseTaskUnlocked(q.taskId)
                 try startTaskUnlocked(q.taskId)
             }
@@ -3858,6 +4001,13 @@ public final class Store: @unchecked Sendable {
         // waiting_since is whole seconds, asked_at is not: compare from the start of that second.
         return queryInt("SELECT EXISTS(SELECT 1 FROM questions WHERE task_id=? AND parked=1 AND asked_at >= ?);",
                         [.int(t.id), .double(since.timeIntervalSince1970.rounded(.down))]) == 1
+    }
+
+    /// Whether `actor` is an agent and another session holds a live claim on `t` (the
+    /// claim rule of applyTaskUpdateUnlocked: that agent may not change its status).
+    private func claimedByOtherUnlocked(_ t: TodoTask, _ actor: ClaimActor) -> Bool {
+        guard case .agent(let holder) = actor, let c = t.claim, c.isLive() else { return false }
+        return holder?.holds(c) != true
     }
 
     /// After a blocking question is answered or withdrawn, for a task a question parked:
@@ -4631,11 +4781,11 @@ public final class Store: @unchecked Sendable {
         if claim && holder == nil { throw StoreError.invalid("claiming needs to know your session") }
         lock.lock(); defer { lock.unlock() }
         let pick = { [self] () throws -> (ClaimResult?, NextTaskSkips) in
-            guard let t = try nextCandidatesUnlocked(projectId: projectId, holderId: holder?.id, now: now, limit: 1).first else {
-                return (nil, try nextSkipsUnlocked(projectId: projectId, holderId: holder?.id, now: now))
+            guard let t = try nextCandidatesUnlocked(projectId: projectId, holder: holder, now: now, limit: 1).first else {
+                return (nil, try nextSkipsUnlocked(projectId: projectId, holder: holder, now: now))
             }
             if claim, let holder { return (try claimUnlocked(t, holder: holder, now: now), NextTaskSkips()) }
-            let expiredOther = t.claim.map { !$0.isLive(at: now) && $0.holder != holder?.id } ?? false
+            let expiredOther = t.claim.map { !$0.isLive(at: now) && holder?.holds($0) != true } ?? false
             return (ClaimResult(task: t, outcome: .unclaimed, previous: expiredOther ? t.claim : nil), NextTaskSkips())
         }
         return claim ? try inWriteTransaction(pick) : try pick()
@@ -4651,7 +4801,7 @@ public final class Store: @unchecked Sendable {
         return try inWriteTransaction {
             guard let t = try readTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
             guard let c = t.claim else { return (t, nil) }
-            if case .agent(let holder) = actor, c.holder != holder?.id {
+            if case .agent(let holder) = actor, holder?.holds(c) != true {
                 throw StoreError.invalid(c.isLive(at: now)
                     ? Self.claimConflict(t, c, now: now)
                     : "\(t.code) is not your claim: \(c.holderName) holds it (expired)")
@@ -4669,29 +4819,55 @@ public final class Store: @unchecked Sendable {
     /// Heartbeat: renew the claims `holder` still holds (live or expired, on open tasks),
     /// all of them or only `taskId`'s, to now + claimTTL. A claim another session took over
     /// is not the holder's any more and is not renewed. Returns the renewed tasks.
+    /// A claim taken under the session's label moves to its session id once that is known
+    /// (`ClaimHolder.holds`), so the session's later calls and the gate find it by id.
     @discardableResult
     public func renewClaims(holder: ClaimHolder, taskId: Int64? = nil, now: Date = Date()) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
         return try inWriteTransaction {
-            var whereSQL = "claimed_by=? AND status NOT IN ('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)')"
-            var binds: [SQLValue] = [.text(holder.id)]
-            if let taskId { whereSQL += " AND id=?"; binds.append(.int(taskId)) }
-            try runWrite("UPDATE tasks SET claim_heartbeat_at=?, claim_expires_at=? WHERE \(whereSQL);",
-                         [.double(now.timeIntervalSince1970), .double(now.addingTimeInterval(Self.claimTTL).timeIntervalSince1970)]
-                         + binds)
-            guard sqlite3_changes(db) > 0 else { return [] }
-            return try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE \(whereSQL) ORDER BY id;", binds)
+            let ids = try ownClaimsUnlocked(holder).map(\.id).filter { taskId == nil || $0 == taskId }
+            guard !ids.isEmpty else { return [] }
+            var sets = ["claim_heartbeat_at=?", "claim_expires_at=?"]
+            var binds: [SQLValue] = [.double(now.timeIntervalSince1970),
+                                     .double(now.addingTimeInterval(Self.claimTTL).timeIntervalSince1970)]
+            if AgentSession.sessionId(in: holder.id) == holder.id {
+                sets += ["claimed_by=?", "claim_label=?"]
+                binds += [.text(holder.id), holder.label.map(SQLValue.text) ?? .null]
+            }
+            let idList = ids.map(String.init).joined(separator: ",")
+            try runWrite("UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id IN (\(idList));", binds)
+            return try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE id IN (\(idList)) ORDER BY id;", [])
         }
     }
 
     /// The open tasks `holderId` (a Claude Code session id, or a session label) holds a
     /// claim on, live or expired, last renewed first.
     public func claimedTasks(holderId: String) throws -> [TodoTask] {
+        try claimedTasks(holder: ClaimHolder(id: holderId))
+    }
+
+    /// The open tasks `holder` holds a claim on (`ClaimHolder.holds`), live or expired,
+    /// last renewed first.
+    public func claimedTasks(holder: ClaimHolder) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
+        return try ownClaimsUnlocked(holder)
+    }
+
+    /// `claimedTasks(holder:)` for a caller that holds the lock: every open claimed task,
+    /// filtered by `ClaimHolder.holds` (claims are few, so the filter runs here, not in SQL).
+    private func ownClaimsUnlocked(_ holder: ClaimHolder?) throws -> [TodoTask] {
+        guard let holder else { return [] }
         return try readTasks(
-            "SELECT \(Self.taskCols) FROM tasks WHERE claimed_by=? "
+            "SELECT \(Self.taskCols) FROM tasks WHERE claimed_by IS NOT NULL "
             + "AND status NOT IN ('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)') "
-            + "ORDER BY claim_heartbeat_at DESC, id;", [.text(holderId)])
+            + "ORDER BY claim_heartbeat_at DESC, id;", []
+        ).filter { $0.claim.map(holder.holds) == true }
+    }
+
+    /// SQL true for the rows of `tasks` whose claim is `holder`'s (`ownClaimsUnlocked`).
+    private func ownClaimSQLUnlocked(_ holder: ClaimHolder?) throws -> String {
+        let ids = try ownClaimsUnlocked(holder).map(\.id)
+        return ids.isEmpty ? "0" : "tasks.id IN (\(ids.map(String.init).joined(separator: ",")))"
     }
 
     /// The task a Claude Code session works on: the one it claimed and renewed last
@@ -4705,7 +4881,7 @@ public final class Store: @unchecked Sendable {
         let outcome: ClaimResult.Outcome
         switch t.claim {
         case nil: outcome = .claimed
-        case let c? where c.holder == holder.id: outcome = .renewed
+        case let c? where holder.holds(c): outcome = .renewed
         case let c? where c.isLive(at: now): throw StoreError.invalid(Self.claimConflict(t, c, now: now))
         case _?: outcome = .tookOver
         }
@@ -4738,25 +4914,27 @@ public final class Store: @unchecked Sendable {
     public func nextTasks(projectId: Int64?, holderId: String?, limit: Int? = nil,
                           now: Date = Date()) throws -> [TodoTask] {
         lock.lock(); defer { lock.unlock() }
-        return try nextCandidatesUnlocked(projectId: projectId, holderId: holderId, now: now, limit: limit)
+        return try nextCandidatesUnlocked(projectId: projectId, holder: holderId.map { ClaimHolder(id: $0) },
+                                          now: now, limit: limit)
     }
 
     /// What next_task passes over in its scope, by reason (read-only).
     public func nextTaskSkips(projectId: Int64?, holderId: String?, now: Date = Date()) throws -> NextTaskSkips {
         lock.lock(); defer { lock.unlock() }
-        return try nextSkipsUnlocked(projectId: projectId, holderId: holderId, now: now)
+        return try nextSkipsUnlocked(projectId: projectId, holder: holderId.map { ClaimHolder(id: $0) }, now: now)
     }
 
     /// `nextTask`'s pick (see there for the rule), best first; caller holds the lock.
-    private func nextCandidatesUnlocked(projectId: Int64?, holderId: String?, now: Date,
+    private func nextCandidatesUnlocked(projectId: Int64?, holder: ClaimHolder?, now: Date,
                                         limit: Int?) throws -> [TodoTask] {
+        let mine = try ownClaimSQLUnlocked(holder)
         let scope = Self.nextScopeSQL(projectId)
         let open = "('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)')"
         let sql = """
             SELECT \(Self.qualifiedTaskCols) FROM tasks \(Self.projectJoinSQL)
             WHERE \(scope.sql)
               AND ((tasks.status='\(TaskStatus.todo.rawValue)'
-                    AND (tasks.claimed_by IS NULL OR tasks.claim_expires_at <= ? OR tasks.claimed_by = ?))
+                    AND (tasks.claimed_by IS NULL OR tasks.claim_expires_at <= ? OR \(mine)))
                    OR (tasks.status='\(TaskStatus.inProgress.rawValue)'
                        AND tasks.claimed_by IS NOT NULL AND tasks.claim_expires_at <= ?))
               AND NOT \(Self.hasOpenDependencySQL("tasks"))
@@ -4766,25 +4944,26 @@ public final class Store: @unchecked Sendable {
             ORDER BY \(Self.treeOrderSQL) LIMIT ?;
             """
         let at = now.timeIntervalSince1970
-        return try readTasks(sql, scope.binds + [.double(at), .text(holderId ?? ""), .double(at),
+        return try readTasks(sql, scope.binds + [.double(at), .double(at),
                                                  .int(Int64(limit.map { max(0, $0) } ?? -1))])   // LIMIT -1 = no limit
     }
 
     /// What next_task passed over in its scope, by reason (`NextTaskSkips`).
-    private func nextSkipsUnlocked(projectId: Int64?, holderId: String?, now: Date) throws -> NextTaskSkips {
+    private func nextSkipsUnlocked(projectId: Int64?, holder: ClaimHolder?, now: Date) throws -> NextTaskSkips {
         let scope = Self.nextScopeSQL(projectId)
+        let mine = try ownClaimSQLUnlocked(holder)
         let todo = "tasks.status='\(TaskStatus.todo.rawValue)'"
         let live = "(tasks.claimed_by IS NOT NULL AND tasks.claim_expires_at > ?)"
         let stmt = try prepare(
             """
-            SELECT COALESCE(SUM(\(todo) AND \(live) AND tasks.claimed_by <> ?), 0),
+            SELECT COALESCE(SUM(\(todo) AND \(live) AND NOT \(mine)), 0),
                    COALESCE(SUM(\(todo) AND \(Self.hasOpenDependencySQL("tasks"))), 0),
                    COALESCE(SUM(tasks.status='\(TaskStatus.waiting.rawValue)'), 0),
                    COALESCE(SUM(tasks.status='\(TaskStatus.inProgress.rawValue)'
                                 AND (tasks.claimed_by IS NULL OR tasks.claim_expires_at > ?)), 0)
             FROM tasks \(Self.projectJoinSQL) WHERE \(scope.sql);
             """,
-            [.double(now.timeIntervalSince1970), .text(holderId ?? ""), .double(now.timeIntervalSince1970)] + scope.binds)
+            [.double(now.timeIntervalSince1970), .double(now.timeIntervalSince1970)] + scope.binds)
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.step(errmsg()) }
         var s = NextTaskSkips()
@@ -4797,9 +4976,12 @@ public final class Store: @unchecked Sendable {
 
     /// End the claims of a session that ended: they expire at `at` (if later), and stay
     /// recorded so a takeover can name the session, and a resumed session can renew them.
+    /// Claims taken under a label that carries the session id (`<id>/<suffix>`) end too.
     private func expireClaimsUnlocked(holderId: String, at: Date) throws {
-        try runWrite("UPDATE tasks SET claim_expires_at=? WHERE claimed_by=? AND claim_expires_at>?;",
-                     [.double(at.timeIntervalSince1970), .text(holderId), .double(at.timeIntervalSince1970)])
+        try runWrite("UPDATE tasks SET claim_expires_at=? WHERE (claimed_by=? OR instr(lower(claimed_by), ?) > 0) "
+                     + "AND claim_expires_at>?;",
+                     [.double(at.timeIntervalSince1970), .text(holderId), .text(holderId.lowercased()),
+                      .double(at.timeIntervalSince1970)])
     }
 
     // MARK: - Dependencies (blocked-by)
@@ -4832,27 +5014,26 @@ public final class Store: @unchecked Sendable {
         // The reachability check + INSERT is a read-modify-write two processes can race
         // on, each adding a reciprocal edge to form a permanent 2-cycle. Serialize them
         // with BEGIN IMMEDIATE and re-check reachability inside the transaction.
-        do {
-            try beginImmediate()
-            for id in [taskId, dependsOnId] where getTaskUnlocked(id) == nil {
-                throw StoreError.notFound("task \(id)")
-            }
-            // If dependsOnId already (transitively) depends on taskId, adding
-            // taskId→dependsOnId would create a cycle.
-            if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
-                throw StoreError.step("adding this dependency would create a cycle")
-            }
-            try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
-            let created = sqlite3_changes(db) == 1
-            if created { logEvent(taskId, "blocked by", "", taskCodeUnlocked(dependsOnId)) }
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return created
-        } catch {
-            // ROLLBACK clears the transaction on any failure (including a BEGIN that hit an
-            // already-open connection), so the shared connection is never left poisoned.
-            exec("ROLLBACK;")
-            throw error
+        // (inWriteTransaction's ROLLBACK clears the transaction on any failure, so the
+        // shared connection is never left poisoned.)
+        return try inWriteTransaction { try addDependencyUnlocked(taskId: taskId, dependsOnId: dependsOnId) }
+    }
+
+    /// addDependency's check and write, inside the caller's lock and transaction.
+    private func addDependencyUnlocked(taskId: Int64, dependsOnId: Int64) throws -> Bool {
+        guard taskId != dependsOnId else { throw StoreError.step("a task cannot depend on itself") }
+        for id in [taskId, dependsOnId] where getTaskUnlocked(id) == nil {
+            throw StoreError.notFound("task \(id)")
         }
+        // If dependsOnId already (transitively) depends on taskId, adding
+        // taskId→dependsOnId would create a cycle.
+        if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
+            throw StoreError.step("adding this dependency would create a cycle")
+        }
+        try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
+        let created = sqlite3_changes(db) == 1
+        if created { logEvent(taskId, "blocked by", "", taskCodeUnlocked(dependsOnId)) }
+        return created
     }
 
     /// Remove the blocked-by edge `taskId`→`dependsOnId` (no-op if absent). Returns
@@ -4892,35 +5073,33 @@ public final class Store: @unchecked Sendable {
     /// returns false when the relation was already there.
     @discardableResult
     public func addRelation(taskId: Int64, otherId: Int64, kind: RelationKind) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        // The reverse-duplicate check (or the dependency's cycle check) + INSERT is a
+        // read-modify-write another process can race on: both inside one BEGIN IMMEDIATE.
+        return try inWriteTransaction { try addRelationUnlocked(taskId: taskId, otherId: otherId, kind: kind) }
+    }
+
+    /// addRelation's check and write, inside the caller's lock and transaction.
+    private func addRelationUnlocked(taskId: Int64, otherId: Int64, kind: RelationKind) throws -> Bool {
         switch kind {
-        case .blockedBy: return try addDependency(taskId: taskId, dependsOnId: otherId)
-        case .blocks: return try addDependency(taskId: otherId, dependsOnId: taskId)
+        case .blockedBy: return try addDependencyUnlocked(taskId: taskId, dependsOnId: otherId)
+        case .blocks: return try addDependencyUnlocked(taskId: otherId, dependsOnId: taskId)
         case .relates, .duplicates, .duplicatedBy: break
         }
         guard taskId != otherId else { throw StoreError.step("a task cannot be related to itself") }
         let row = Self.relationRow(taskId, otherId, kind)
-        lock.lock(); defer { lock.unlock() }
-        do {
-            // The reverse-duplicate check + INSERT is a read-modify-write another process
-            // can race on: both inside one BEGIN IMMEDIATE.
-            try beginImmediate()
-            guard let dup = getTaskUnlocked(row.task) else { throw StoreError.notFound("task \(row.task)") }
-            guard let original = getTaskUnlocked(row.other) else { throw StoreError.notFound("task \(row.other)") }
-            if row.kind == "duplicates", (queryInt(
-                "SELECT EXISTS(SELECT 1 FROM task_relations WHERE task_id=? AND other_id=? AND kind='duplicates');",
-                [.int(row.other), .int(row.task)]) ?? 0) > 0 {
-                throw StoreError.step("\(original.code) is already a duplicate of \(dup.code)")
-            }
-            try runWrite("INSERT OR IGNORE INTO task_relations (task_id, other_id, kind, created_at) VALUES (?, ?, ?, ?);",
-                         [.int(row.task), .int(row.other), .text(row.kind), .double(Date().timeIntervalSince1970)])
-            let created = sqlite3_changes(db) == 1
-            if created { logRelationUnlocked(row, added: true) }
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return created
-        } catch {
-            exec("ROLLBACK;")
-            throw error
+        guard let dup = getTaskUnlocked(row.task) else { throw StoreError.notFound("task \(row.task)") }
+        guard let original = getTaskUnlocked(row.other) else { throw StoreError.notFound("task \(row.other)") }
+        if row.kind == "duplicates", (queryInt(
+            "SELECT EXISTS(SELECT 1 FROM task_relations WHERE task_id=? AND other_id=? AND kind='duplicates');",
+            [.int(row.other), .int(row.task)]) ?? 0) > 0 {
+            throw StoreError.step("\(original.code) is already a duplicate of \(dup.code)")
         }
+        try runWrite("INSERT OR IGNORE INTO task_relations (task_id, other_id, kind, created_at) VALUES (?, ?, ?, ?);",
+                     [.int(row.task), .int(row.other), .text(row.kind), .double(Date().timeIntervalSince1970)])
+        let created = sqlite3_changes(db) == 1
+        if created { logRelationUnlocked(row, added: true) }
+        return created
     }
 
     /// Remove `kind` between `taskId` and `otherId` (the dependency kinds remove the
@@ -5435,6 +5614,117 @@ public final class Store: @unchecked Sendable {
                      [.text(e.sourceKey), .text(e.runId), .text(e.action), .text(e.target), .text(e.fingerprint),
                       .text(e.inverse), .double(e.appliedAt.timeIntervalSince1970)])
         return sqlite3_changes(db) == 1
+    }
+
+    /// One importer write and its ledger row, in one BEGIN IMMEDIATE: `body` re-reads what
+    /// the plan read (so another writer cannot slip in between that check and the write),
+    /// writes through `ImportWriter`, and returns its result with the ledger row to record,
+    /// inverse included; nil records nothing (the target already was as wanted). The check,
+    /// the write and the record of how to undo it land together or not at all, so a crash
+    /// never leaves a write without its inverse. When `key` is already in the ledger nothing
+    /// runs and the result is nil.
+    public func importWrite<T>(key: String,
+                               _ body: (ImportWriter) throws -> (result: T, entry: ImportLedgerEntry?)) throws -> T? {
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            if queryInt("SELECT 1 FROM import_ledger WHERE source_key=?;", [.text(key)]) != nil { return nil }
+            let out = try body(ImportWriter(store: self))
+            if let e = out.entry {
+                try runWrite("INSERT INTO import_ledger (\(Self.ledgerCols)) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                             [.text(e.sourceKey), .text(e.runId), .text(e.action), .text(e.target), .text(e.fingerprint),
+                              .text(e.inverse), .double(e.appliedAt.timeIntervalSince1970)])
+            }
+            return out.result
+        }
+    }
+
+    /// The writes an importer makes inside `importWrite` (the store's lock and transaction
+    /// are held): the store's own checks, plus "only if still unset" for fields the plan
+    /// found empty, so a value set since the plan is never overwritten. Use it only inside
+    /// the `importWrite` body it was given to.
+    public struct ImportWriter {
+        fileprivate let store: Store
+
+        /// Give a project its repo folder, unless it got one since the plan (an error).
+        public func setRepoPathIfUnset(projectId: Int64, path raw: String) throws -> String? {
+            let path = try Store.normalizedRepoPath(raw)
+            if let current = store.queryString("SELECT repo_path FROM projects WHERE id=?;", [.int(projectId)]) {
+                throw StoreError.invalid("the project got a folder since the plan: \(current)")
+            }
+            return try store.setProjectRepoPathUnlocked(id: projectId, path: path)
+        }
+
+        /// `Store.ensureMilestone` (repeat-safe).
+        public func ensureMilestone(projectId: Int64, name: String, detail: String,
+                                    acceptance: String) throws -> (milestone: Milestone, created: Bool) {
+            try store.ensureMilestoneUnlocked(projectId: projectId, name: try Store.normalizedMilestoneName(name),
+                                              detail: detail, acceptance: acceptance, targetDate: nil, reuse: true)
+        }
+
+        /// The id of the project's milestone named `name`, or nil.
+        public func milestoneId(projectId: Int64, name: String) -> Int64? {
+            store.queryInt("SELECT id FROM milestones WHERE project_id=? AND name=? COLLATE NOCASE;",
+                           [.int(projectId), .text(name)])
+        }
+
+        /// Put a task in a milestone: false when it already is in it; an error when it got
+        /// another one since the plan.
+        public func setMilestoneIfUnset(taskId: Int64, milestoneId: Int64) throws -> Bool {
+            guard let t = store.getTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
+            if t.milestoneId == milestoneId { return false }
+            guard t.milestoneId == nil else { throw StoreError.invalid("the task got another milestone since the plan") }
+            try store.applyTaskUpdateUnlocked(id: taskId, milestoneId: .some(milestoneId), actor: .agent(nil),
+                                              spawnRecurrence: false)
+            return true
+        }
+
+        /// `Store.addLink` (repeat-safe: a URL once per task).
+        public func addLink(taskId: Int64, url raw: String, kind: LinkKind?, title: String?, author: NoteAuthor?,
+                            source: String?) throws -> (link: TaskLink, created: Bool) {
+            try store.addLinkUnlocked(taskId: taskId, url: try Store.normalizedLinkURL(raw),
+                                      given: raw.trimmingCharacters(in: .whitespacesAndNewlines), kind: kind,
+                                      title: try Store.linkLabel(title, "title"), author: author,
+                                      source: try Store.linkLabel(source, "source"))
+        }
+
+        /// Set a task's branch: false when it already is that; an error when it got another
+        /// one since the plan.
+        public func setBranchIfUnset(taskId: Int64, branch raw: String, author: NoteAuthor?) throws -> Bool {
+            guard let branch = try Store.normalizedBranch(raw) else { throw StoreError.invalid("branch is empty") }
+            guard let t = store.getTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
+            if t.branch == branch { return false }
+            guard t.branch == nil else { throw StoreError.invalid("the task got another branch since the plan: \(t.branch!)") }
+            try store.applyTaskUpdateUnlocked(id: taskId, branch: .some(branch), author: author, actor: .agent(nil),
+                                              spawnRecurrence: false)
+            return true
+        }
+
+        /// `Store.addRelation` (repeat-safe).
+        public func addRelation(taskId: Int64, otherId: Int64, kind: RelationKind) throws -> Bool {
+            try store.addRelationUnlocked(taskId: taskId, otherId: otherId, kind: kind)
+        }
+
+        /// `Store.createPage` with a provenance key (repeat-safe), as the agent.
+        public func createPage(projectId: Int64, kind: PageKind, title: String, body: String, outcome: String?,
+                               decidedOn: String?, taskIds: [Int64], sessionId: String?,
+                               provenance: PageProvenance) throws -> (page: ProjectPage, created: Bool) {
+            let outcome = Store.blankToNil(outcome)
+            var decided = try Store.blankToNil(decidedOn).map(Store.normalizedDecisionDate)
+            if kind == .note {
+                guard outcome == nil, decided == nil else { throw StoreError.invalid("only a decision has an outcome or decided_on") }
+            } else {
+                decided = decided ?? Store.todayString()
+            }
+            if let key = provenance.key, key.count > 500 { throw StoreError.invalid("source_key is at most 500 characters") }
+            var seen = Set<Int64>()
+            let prov = PageProvenance(source: Store.blankToNil(provenance.source), key: Store.blankToNil(provenance.key),
+                                      author: Store.blankToNil(provenance.author),
+                                      session: Store.blankToNil(provenance.session), timestamp: provenance.timestamp)
+            return try store.createPageUnlocked(projectId: projectId, kind: kind, title: try Store.normalizedPageTitle(title),
+                                                body: Store.pageBody(body), outcome: outcome, decided: decided,
+                                                tasks: taskIds.filter { seen.insert($0).inserted }, author: .agent,
+                                                session: Store.blankToNil(sessionId), prov: prov)
+        }
     }
 
     /// An imported note and its ledger row, in one BEGIN IMMEDIATE: a note is the one import

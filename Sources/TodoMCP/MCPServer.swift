@@ -403,19 +403,19 @@ final class MCPServer: @unchecked Sendable {
 
         case "update_project":
             let pid = try resolveProjectId(args, idKey: "id", codeKey: "code")
-            // The repo folder's form is checked before any write; then the code and the folder
-            // (each may be refused, e.g. taken), so a refusal leaves the name and description
-            // unchanged too.
+            // Every field is checked before any is written, in one transaction: a refusal
+            // (a code or folder already taken) leaves the whole project unchanged.
             let repoPath = try repoPathArg(args)
-            if let repoPath, let path = repoPath { _ = try Store.normalizedRepoPath(path) }
-            var newCode: String?
+            var code: String?
             if let raw = args["new_code"], !(raw is NSNull) {
                 guard let s = raw as? String else { throw MCPError.invalidArg("new_code must be a string") }
-                newCode = try store.setProjectCode(id: pid, code: s)
+                code = s
             }
-            var stored: String??
-            if let repoPath { stored = .some(try store.setProjectRepoPath(id: pid, path: repoPath)) }
-            try store.updateProject(id: pid, name: args["name"] as? String, detail: args["description"] as? String)
+            let name = try optionalStringArg(args, "name") ?? nil
+            let detail = try optionalStringArg(args, "description") ?? nil
+            let edited = try store.editProject(id: pid, name: name, detail: detail, code: code, repoPath: repoPath)
+            let newCode = edited.code
+            let stored = edited.repoPath
             var parts: [String] = []
             if let newCode { parts.append("the project's code is now \(newCode) (its tasks keep their codes)") }
             if let stored { parts.append(stored.map { "its repo folder is \($0)" } ?? "it has no repo folder") }
@@ -540,7 +540,8 @@ final class MCPServer: @unchecked Sendable {
         case "create_task":
             // Optional parent (subtask). If given and no project is specified,
             // the subtask inherits the parent's project.
-            let parentId: Int64? = (args["parent_id"] != nil || args["parent_code"] != nil)
+            // An explicit null parent or project is "not given", as in the other tools.
+            let parentId: Int64? = given(args, "parent_id", "parent_code")
                 ? try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code")
                 : nil
             // Enforce the one-level nesting invariant: a subtask cannot itself be a
@@ -555,7 +556,7 @@ final class MCPServer: @unchecked Sendable {
                 throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
             }
             let projectId: Int64
-            if args["project_id"] != nil || args["project_code"] != nil {
+            if given(args, "project_id", "project_code") {
                 projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
             } else if let parentId {
                 projectId = try store.getTask(id: parentId).projectId
@@ -584,28 +585,12 @@ final class MCPServer: @unchecked Sendable {
 
         case "update_task":
             let id = try resolveTaskId(args)
-            // link uses double-optional: key absent (.none) = leave alone;
-            // key present (.some) = set to the string, or clear if JSON null.
-            let linkArg: String??
-            if args.keys.contains("link") {
-                linkArg = .some(args["link"] as? String)
-            } else {
-                linkArg = .none
-            }
-            // due_date same double-optional semantics: present+null clears it.
-            let dueArg: Date??
-            if args.keys.contains("due_date") {
-                dueArg = .some(parseDate(args["due_date"]))
-            } else {
-                dueArg = .none
-            }
-            // recurrence double-optional: present+null clears it, absent leaves alone.
-            let recurArg: String??
-            if args.keys.contains("recurrence") {
-                recurArg = .some(args["recurrence"] as? String)
-            } else {
-                recurArg = .none
-            }
+            // link, due_date and recurrence are double-optional: key absent (.none) = leave
+            // alone; null (or "") = clear; a value of the wrong type, or a date that does
+            // not parse, is an error (never read as a clear: that would drop the value).
+            let linkArg = try optionalStringArg(args, "link")
+            let dueArg = try dueDateArg(args)
+            let recurArg = try optionalStringArg(args, "recurrence")
             // A subtask must not recur — reject a non-nil recurrence on a task that is a
             // subtask after this update (a parent_code null in it makes it top-level).
             let parent = try parentArg(args)
@@ -797,7 +782,7 @@ final class MCPServer: @unchecked Sendable {
                                   "in_progress": s.inProgress]
             }
             if let holder {
-                let mine = try store.claimedTasks(holderId: holder.id)
+                let mine = try store.claimedTasks(holder: holder)
                     .filter { $0.id != next.result?.task.id }.map { taskHandle(code: $0.code, id: $0.id) }
                 if !mine.isEmpty { out["your_other_claims"] = mine }
             }
@@ -1084,10 +1069,10 @@ final class MCPServer: @unchecked Sendable {
                 taskId: try resolveTaskId(args), kind: kind, prompt: prompt,
                 context: args["context"] as? String ?? "", options: options,
                 blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args),
-                agentSessionId: agentSessionId(args))
+                agentSessionId: agentSessionId(args), actor: .agent(try claimHolder(args)))
             renewOwnClaim(args, taskId: q.taskId)
             var d = questionDict(q)
-            if q.blocksTask { d["task_status"] = TaskStatus.waiting.rawValue }
+            if q.blocksTask { d["task_status"] = (try? store.getTask(id: q.taskId).status.rawValue) ?? TaskStatus.waiting.rawValue }
             return try jsonString(d)
 
         case "get_answers":
@@ -1095,7 +1080,8 @@ final class MCPServer: @unchecked Sendable {
             return try answersJSON(projectId: filter.projectId, sessionId: filter.sessionId)
 
         case "resume_question":
-            let resumed = try store.resumeQuestion(id: try requireInt(args, "id"), sessionId: try sessionArg(args))
+            let resumed = try store.resumeQuestion(id: try requireInt(args, "id"), sessionId: try sessionArg(args),
+                                                   actor: .agent(try claimHolder(args)))
             renewOwnClaim(args, taskId: resumed.task.id)
             var d = questionDict(resumed.question)
             d["task_status"] = resumed.task.status.rawValue
@@ -1103,7 +1089,7 @@ final class MCPServer: @unchecked Sendable {
 
         case "cancel_question":
             let q = try store.cancelQuestion(id: try requireInt(args, "id"), reason: args["reason"] as? String ?? "",
-                                             sessionId: try sessionArg(args))
+                                             sessionId: try sessionArg(args), actor: .agent(try claimHolder(args)))
             return try jsonString(questionDict(q))
 
         case "get_guide":
@@ -1401,7 +1387,7 @@ final class MCPServer: @unchecked Sendable {
     }
 
     private func parseDate(_ v: Any?) -> Date? {
-        if let n = v as? NSNumber { return Date(timeIntervalSince1970: n.doubleValue) }
+        if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { return Date(timeIntervalSince1970: n.doubleValue) }
         guard let s = v as? String, !s.isEmpty else { return nil }
         if let d = ISO8601DateFormatter().date(from: s) { return d }
         let f = DateFormatter()
@@ -1412,12 +1398,20 @@ final class MCPServer: @unchecked Sendable {
         return f.date(from: s)
     }
 
-    /// Parse an integer minutes argument (accepts JSON number or numeric string). nil if absent/invalid.
+    /// Parse an integer minutes argument (accepts JSON number or numeric string). nil if
+    /// absent/invalid. Clamped to 0…`maxMinutes`, so the seconds it becomes cannot overflow.
     private func parseMinutes(_ v: Any?) -> Int? {
-        if let n = v as? NSNumber { return max(0, n.intValue) }
-        if let s = v as? String, let n = Int(s) { return max(0, n) }
+        if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+            let d = n.doubleValue
+            guard d.isFinite else { return nil }
+            return Int(min(max(0, d), Double(Self.maxMinutes)))
+        }
+        if let s = v as? String, let n = Int(s) { return min(max(0, n), Self.maxMinutes) }
         return nil
     }
+
+    /// The largest estimate taken, in minutes (about 19 years).
+    private static let maxMinutes = 10_000_000
 
     private func parseTags(_ v: Any?) -> [String]? {
         if let arr = v as? [String] { return arr }
@@ -1642,6 +1636,15 @@ final class MCPServer: @unchecked Sendable {
 
     /// create/update_milestone `target_date`: absent = .none, null = .some(nil) (clear), a
     /// date (ISO-8601 or yyyy-MM-dd) = that date; anything else is an error, not a clear.
+    /// update_task `due_date`: absent = .none, null or "" = .some(nil) (clear), else a date
+    /// that parses (yyyy-MM-dd, ISO-8601, or epoch seconds); anything else is an error.
+    private func dueDateArg(_ args: [String: Any]) throws -> Date?? {
+        guard let v = args["due_date"] else { return .none }
+        if v is NSNull || (v as? String)?.isEmpty == true { return .some(nil) }
+        guard let d = parseDate(v) else { throw MCPError.invalidArg("due_date must be yyyy-MM-dd or ISO-8601, or null") }
+        return .some(d)
+    }
+
     private func targetDateArg(_ args: [String: Any]) throws -> Date?? {
         guard let v = args["target_date"] else { return .none }
         if v is NSNull { return .some(nil) }
@@ -1658,7 +1661,7 @@ final class MCPServer: @unchecked Sendable {
         var ids: [Int64] = []
         if let arr = args["ids"] as? [Any] {
             for v in arr {
-                if let n = v as? NSNumber { ids.append(n.int64Value) }
+                if let n = Self.integer(v) { ids.append(n) }
                 else if let s = v as? String, let n = Int64(s) { ids.append(n) }
                 else { throw MCPError.invalidArg("ids: \(v) is not a task id") }
             }
@@ -1691,7 +1694,7 @@ final class MCPServer: @unchecked Sendable {
         }
         guard let arr = args["ids"] as? [Any] else { throw MCPError.invalidArg("ids must be an array of task ids") }
         return try arr.map { v in
-            if let n = v as? NSNumber { return n.int64Value }
+            if let n = Self.integer(v) { return n }
             if let s = v as? String, let n = Int64(s) { return n }
             throw MCPError.invalidArg("ids: \(v) is not a task id")
         }
@@ -1704,7 +1707,7 @@ final class MCPServer: @unchecked Sendable {
 
     /// Resolve a task id from arbitrary `<idKey>` (int) or `<codeKey>` (string code).
     private func resolveTaskId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
-        if let n = args[idKey] as? NSNumber { return n.int64Value }
+        if let n = Self.integer(args[idKey]) { return n }
         if let s = args[idKey] as? String, let n = Int64(s) { return n }
         if let code = args[codeKey] as? String {
             guard let id = store.taskId(forCode: code) else { throw StoreError.notFound("task \(code)") }
@@ -1724,7 +1727,7 @@ final class MCPServer: @unchecked Sendable {
 
     /// Resolve a project id from `<idKey>` (int) or `<codeKey>` (string code).
     private func resolveProjectId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
-        if let n = args[idKey] as? NSNumber { return n.int64Value }
+        if let n = Self.integer(args[idKey]) { return n }
         if let s = args[idKey] as? String, let n = Int64(s) { return n }
         if let code = args[codeKey] as? String {
             guard let id = store.projectId(forCode: code) else { throw StoreError.notFound("project \(code)") }
@@ -1911,8 +1914,14 @@ final class MCPServer: @unchecked Sendable {
         return v
     }
 
+    /// A JSON number as an id or count: JSON true/false is not one (NSNumber covers both).
+    private static func integer(_ v: Any?) -> Int64? {
+        guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        return n.int64Value
+    }
+
     private func requireInt(_ args: [String: Any], _ key: String) throws -> Int64 {
-        if let n = args[key] as? NSNumber { return n.int64Value }
+        if let n = Self.integer(args[key]) { return n }
         if let s = args[key] as? String, let n = Int64(s) { return n }
         throw MCPError.missingArg(key)
     }

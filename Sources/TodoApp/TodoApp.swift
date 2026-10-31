@@ -9,8 +9,9 @@ struct TodoAppMain: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: MainWindow.id) {
             ContentView()
+                .background(MainWindowHook())
                 .environmentObject(delegate.model)
                 .frame(minWidth: 820, minHeight: 520)
                 // DESIGN.md defines light tokens only — lock the app to light appearance.
@@ -306,12 +307,46 @@ struct MenuBarContent: View {
     }
 
     /// Bring the main window forward (recreating window behavior of the old
-    /// status-item click), keeping the app's activation working as before.
+    /// status-item click), keeping the app's activation working as before. The main
+    /// window, not just any window (Settings may be open); once it was closed (the app
+    /// keeps running), a new one opens.
     static func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        for window in NSApp.windows where window.canBecomeKey {
+        if let window = MainWindow.window, window.isVisible || window.isMiniaturized {
+            if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
-            return
+        } else if let open = MainWindow.open {
+            open(id: MainWindow.id)
+        }
+    }
+}
+
+/// The main window (the WindowGroup's), as its content last reported it, and how to open
+/// a new one: `MenuBarContent.showMainWindow` needs both outside any view.
+@MainActor
+enum MainWindow {
+    static let id = "main"
+    static weak var window: NSWindow?
+    static var open: OpenWindowAction?
+}
+
+/// Reports the window the main content sits in, and keeps the openWindow action.
+private struct MainWindowHook: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        WindowReader().onAppear { MainWindow.open = openWindow }
+    }
+
+    private struct WindowReader: NSViewRepresentable {
+        func makeNSView(context: Context) -> NSView { Reader() }
+        func updateNSView(_ nsView: NSView, context: Context) {}
+
+        final class Reader: NSView {
+            override func viewDidMoveToWindow() {
+                super.viewDidMoveToWindow()
+                if let window { MainWindow.window = window }
+            }
         }
     }
 }

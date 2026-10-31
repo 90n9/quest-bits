@@ -23,7 +23,7 @@ struct ImportItem {
         case branch(taskId: Int64, branch: String)
         case relation(taskId: Int64, otherId: Int64, kind: RelationKind)
         case page(projectId: Int64, kind: PageKind, title: String, body: String, taskIds: [Int64],
-                  outcome: String?, decidedOn: String?, source: String)
+                  outcome: String?, decidedOn: String?, source: String, timestamp: Date?)
     }
 
     var key: String
@@ -446,8 +446,11 @@ struct ImportPlanner {
             item.state = .noop
             item.reason = "a page with this source key exists: never rewritten"
         } else {
+            // When the original was written: the source file's last change (the closest the
+            // file says), nil without a source.
+            let written = pg.source.flatMap { files[$0.file]?.modified }
             item.op = .page(projectId: p.id, kind: kind, title: pg.title, body: body, taskIds: taskIds,
-                            outcome: pg.outcome, decidedOn: pg.decidedOn, source: label ?? "")
+                            outcome: pg.outcome, decidedOn: pg.decidedOn, source: label ?? "", timestamp: written)
         }
         add(item)
     }
@@ -579,7 +582,8 @@ struct ImportPlanner {
                     item.state = .noop
                 } else {
                     item.op = .page(projectId: p.id, kind: .note, title: title, body: text, taskIds: tasks.map(\.id),
-                                    outcome: nil, decidedOn: nil, source: source)
+                                    outcome: nil, decidedOn: nil, source: source,
+                                    timestamp: events.last.flatMap { ImportSources.date($0.createdAt) })
                 }
             }
             finish(&item)
