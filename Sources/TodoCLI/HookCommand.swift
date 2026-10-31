@@ -20,7 +20,8 @@ enum HookCommand {
         summary: "Claude Code hook: record the session from the event JSON on stdin (always exits 0).",
         details: """
         Register each as a command hook on the Claude Code event of the same name, with the
-        full path of this binary. Reads the hook's JSON on stdin (session_id, cwd, ...).
+        full path of this binary (Settings → Claude Code Hooks in the app does this).
+        Reads the hook's JSON on stdin (session_id, cwd, ...).
           session-start       SessionStart: records the session as running and, when cwd belongs to
                               a project, prints "QuestBits session: <id>" for the agent's context
             --brief           also print `brief` for that folder first
@@ -79,10 +80,25 @@ enum HookCommand {
                   let project = try store.listProjects(includeArchived: false).first(where: { $0.id == pid })
             else { return "" }
             var lines = ""
-            if args.has("brief") { lines = try BriefCommand.render(project, store: store, next: BriefCommand.defaultNext) + "\n" }
+            if args.has("brief") {
+                lines = capped(try BriefCommand.render(project, store: store, next: BriefCommand.defaultNext),
+                               code: project.code) + "\n"
+            }
             return lines + sessionLine(session.id)
         }
         if !out.isEmpty { ctx.write(out) }
+    }
+
+    /// Claude Code keeps at most 10,000 characters of a hook's stdout in context (more is
+    /// saved to a file and only a preview is shown), so a brief with a long project guide is
+    /// cut at a line boundary well below that, leaving room for the session line.
+    static let briefLimit = 8_000
+
+    static func capped(_ brief: String, code: String) -> String {
+        guard brief.count > briefLimit else { return brief }
+        var kept = String(brief.prefix(briefLimit))
+        if let lastBreak = kept.lastIndex(of: "\n") { kept = String(kept[..<lastBreak]) }
+        return kept + "\n\n…brief cut here; get_guide \(code) and list_tasks have the rest.\n"
     }
 
     /// What the agent reads at session start (plain stdout of a SessionStart hook joins

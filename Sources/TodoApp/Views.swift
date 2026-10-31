@@ -2861,6 +2861,7 @@ struct SettingsView: View {
                 }
             }
             CLISettingsSection()
+            HookSettingsSection()
             Section {
                 Button("Edit Guide for All Projects…") { showGuide = true }
             } header: {

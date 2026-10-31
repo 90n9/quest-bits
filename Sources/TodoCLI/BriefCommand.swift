@@ -22,6 +22,7 @@ enum BriefCommand {
     static let listCap = 10          // in progress / waiting lines shown before "…and N more"
     static let milestoneCap = 5
     static let decisionCap = 3
+    static let guideCap = 3_000      // characters of the project guide; the work comes after it
 
     static func run(_ args: CLIArgs, _ ctx: CLIContext) throws -> Int32 {
         guard args.positionals.isEmpty else { throw CLIError.usage("unexpected argument '\(args.positionals[0])'") }
@@ -60,7 +61,7 @@ enum BriefCommand {
 
         if let guide = try store.guide(projectId: p.id),
            !guide.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            out += ["", "## Project guide", guide.markdown.trimmingCharacters(in: .whitespacesAndNewlines)]
+            out += ["", "## Project guide", guideExcerpt(guide.markdown, code: p.code)]
         }
         section(&out, "In progress", inProgress, rel)
         section(&out, "Waiting on you", waitingOnUser, rel)
@@ -78,6 +79,16 @@ enum BriefCommand {
         out += try wiki(p, store: store)
         out += ["", "Details: get_task <code>; wiki: search_pages / get_page (QuestBits MCP)."]
         return out.joined(separator: "\n") + "\n"
+    }
+
+    /// The project guide, cut at a line boundary after `guideCap` characters so a long guide
+    /// never pushes the work out of a session-start hook's context (capped by Claude Code).
+    static func guideExcerpt(_ markdown: String, code: String) -> String {
+        let text = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count > guideCap else { return text }
+        var kept = String(text.prefix(guideCap))
+        if let lastBreak = kept.lastIndex(of: "\n") { kept = String(kept[..<lastBreak]) }
+        return kept + "\n…the guide goes on: get_guide \(code) has all of it."
     }
 
     private static func section(_ out: inout [String], _ title: String, _ tasks: [TodoTask], _ rel: TaskRelations) {

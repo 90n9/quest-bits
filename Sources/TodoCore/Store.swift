@@ -1412,13 +1412,21 @@ public final class Store: @unchecked Sendable {
 
     public func getTask(id: Int64) throws -> TodoTask {
         lock.lock(); defer { lock.unlock() }
-        guard let t = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        // A failed SELECT (e.g. "no such column" on a database the CLI opened read-only
+        // before it was migrated) is thrown, not reported as a missing task, so
+        // `CLIContext.withStore` can retry with migrations.
+        guard let t = try readTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
         return t
     }
 
     /// Read a task without taking the lock — for use inside already-locked methods.
     private func getTaskUnlocked(_ id: Int64) -> TodoTask? {
-        guard let stmt = try? prepare("SELECT \(Self.taskCols) FROM tasks WHERE id=?;", [.int(id)]) else { return nil }
+        (try? readTaskUnlocked(id)) ?? nil
+    }
+
+    /// `getTaskUnlocked` that throws when the SELECT itself fails.
+    private func readTaskUnlocked(_ id: Int64) throws -> TodoTask? {
+        let stmt = try prepare("SELECT \(Self.taskCols) FROM tasks WHERE id=?;", [.int(id)])
         defer { sqlite3_finalize(stmt) }
         return sqlite3_step(stmt) == SQLITE_ROW ? taskFromRow(stmt) : nil
     }
