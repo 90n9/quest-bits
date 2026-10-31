@@ -114,6 +114,11 @@ struct ProjectOverview: View {
                     stat("Waiting for your answer", n)
                     if n > 0 { link("Answer…", .questions) }
                 }
+                section("Repo folder") {
+                    Text(project.repoPath ?? "None").font(Theme.Fonts.caption)
+                        .foregroundStyle(project.repoPath == nil ? Theme.Colors.steel : Theme.Colors.slate)
+                        .textSelection(.enabled)
+                }
                 section("Agent guide") {
                     Text(guideLabel).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
                     link("Open Guide", .guide)
@@ -121,7 +126,7 @@ struct ProjectOverview: View {
                 Text("Created \(fmtDateTime(project.createdAt))")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                 HStack(spacing: 8) {
-                    Button("Edit name & code…") { editing = true }
+                    Button("Edit project…") { editing = true }
                         .buttonStyle(QBSecondaryButtonStyle(compact: true))
                     if project.isArchived {
                         Button("Unarchive") { model.setArchived(project.id, false) }
@@ -139,8 +144,8 @@ struct ProjectOverview: View {
         .qbParchment()
         .sheet(isPresented: $editing) {
             ProjectSheet(title: "Edit Project", projectId: project.id, name: project.name, code: project.code,
-                         showsDescription: false) { v in
-                model.editProject(project.id, name: v.name, detail: nil, code: v.code)
+                         repoPath: project.repoPath ?? "", showsDescription: false) { v in
+                model.editProject(project.id, name: v.name, detail: nil, code: v.code, repoPath: v.repoPath)
             }
         }
         .sheet(isPresented: $archiving) {

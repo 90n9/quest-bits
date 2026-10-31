@@ -289,6 +289,9 @@ public final class Store: @unchecked Sendable {
         // --- Additive migration: archived projects (NULL = active) ---
         if !columnExists("projects", "archived_at") { exec("ALTER TABLE projects ADD COLUMN archived_at REAL;") }
 
+        // --- Additive migration: a project's repo / workspace folder (1.5.0; NULL = none) ---
+        if !columnExists("projects", "repo_path") { exec("ALTER TABLE projects ADD COLUMN repo_path TEXT;") }
+
         // --- Additive migration: questions an agent leaves for the user (ask loop) ---
         // No project column: a question follows its task (and the task's project) on a move.
         exec("""
@@ -564,9 +567,11 @@ public final class Store: @unchecked Sendable {
     /// (by `author`, in the same transaction).
     /// `code` sets the project's code (checked as setProjectCode does); nil or empty
     /// derives one from the name.
+    /// `repoPath` sets its folder (checked as setProjectRepoPath does); nil or empty = none.
     public func createProject(name: String, detail: String = "", code customCode: String? = nil,
-                              guideTemplate: GuideTemplate? = nil,
+                              repoPath rawRepoPath: String? = nil, guideTemplate: GuideTemplate? = nil,
                               author: NoteAuthor = .user, sessionId: String? = nil) throws -> Project {
+        let repoPath = try rawRepoPath.flatMap(Self.normalizedRepoPath)
         lock.lock(); defer { lock.unlock() }
         // The code pick, the end-of-list sort_order and the INSERT are one read-modify-write
         // the app and MCP server can race on (both picking the same code).
@@ -575,10 +580,12 @@ public final class Store: @unchecked Sendable {
             let now = Date()
             let code = try customCode.flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
                 .map { try validProjectCodeUnlocked($0, for: nil) } ?? uniqueProjectCode(from: name)
+            if let repoPath { try requireRepoPathFreeUnlocked(repoPath, for: nil) }
             guard let sortOrder = queryInt("SELECT \(Self.nextProjectSortOrderSQL);", []) else { throw StoreError.step(errmsg()) }
             try runWrite(
-                "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order) VALUES (?, ?, ?, 0, ?, ?);",
-                [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970)), .int(sortOrder)]
+                "INSERT INTO projects (name, code, detail, task_seq, created_at, sort_order, repo_path) VALUES (?, ?, ?, 0, ?, ?, ?);",
+                [.text(name), .text(code), .text(detail), .int(Int64(now.timeIntervalSince1970)), .int(sortOrder),
+                 repoPath.map(SQLValue.text) ?? .null]
             )
             let id = lastInsertId()
             if let guideTemplate {
@@ -589,7 +596,8 @@ public final class Store: @unchecked Sendable {
                      session.map(SQLValue.text) ?? .null, .text(guideTemplate.reason)])
             }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: Int(sortOrder))
+            return Project(id: id, code: code, name: name, detail: detail, createdAt: now, sortOrder: Int(sortOrder),
+                           repoPath: repoPath)
         } catch {
             exec("ROLLBACK;")
             throw error
@@ -642,7 +650,7 @@ public final class Store: @unchecked Sendable {
     }
 
     /// Canonical project column list (order must match `projectFromRow`).
-    private static let projectCols = "id, code, name, detail, created_at, sort_order, archived_at"
+    private static let projectCols = "id, code, name, detail, created_at, sort_order, archived_at, repo_path"
 
     /// Projects in sidebar order: active ones by sort_order (new projects go last), then
     /// archived ones by sort_order; id breaks ties. `includeArchived: false` leaves out
@@ -672,7 +680,8 @@ public final class Store: @unchecked Sendable {
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4)),
             sortOrder: Int(sqlite3_column_int64(stmt, 5)),
             archivedAt: sqlite3_column_type(stmt, 6) == SQLITE_NULL
-                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
+                ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6)),
+            repoPath: colTextOpt(stmt, 7)
         )
     }
 
@@ -766,6 +775,147 @@ public final class Store: @unchecked Sendable {
             exec("ROLLBACK;")
             throw error
         }
+    }
+
+    /// Set (or, with nil or an empty path, clear) a project's repo folder and return it as
+    /// stored: absolute, ~ expanded, `.`/`..` and trailing slashes removed. Symlinks stay
+    /// as typed (find_project resolves them when it compares). No other active project may
+    /// have the same folder; nested folders are fine (the deeper one wins in find_project).
+    /// Checked and written in one BEGIN IMMEDIATE.
+    @discardableResult
+    public func setProjectRepoPath(id: Int64, path raw: String?) throws -> String? {
+        let path = try raw.flatMap(Self.normalizedRepoPath)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            guard queryInt("SELECT id FROM projects WHERE id=?;", [.int(id)]) != nil else {
+                throw StoreError.notFound("project \(id)")
+            }
+            if let path { try requireRepoPathFreeUnlocked(path, for: id) }
+            try runWrite("UPDATE projects SET repo_path=? WHERE id=?;", [path.map(SQLValue.text) ?? .null, .int(id)])
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return path
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Throws when an active project other than `id` already has `path` (compared resolved,
+    /// so a symlink to the same folder counts). Archived projects may share it: find_project
+    /// skips them. Called inside the write transaction.
+    private func requireRepoPathFreeUnlocked(_ path: String, for id: Int64?) throws {
+        let resolved = Self.resolvedPath(path)
+        let stmt = try prepare("SELECT code, repo_path FROM projects WHERE repo_path IS NOT NULL "
+                               + "AND archived_at IS NULL AND id IS NOT ?;", [id.map(SQLValue.int) ?? .null])
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let other = colTextOpt(stmt, 1), Self.resolvedPath(other) == resolved {
+                throw StoreError.invalid("\(path) is already the folder of project \(colText(stmt, 0))")
+            }
+        }
+    }
+
+    /// The active project whose repo folder holds `path` (the folder itself or anything
+    /// under it), or nil. When several do, as with a workspace and a repo inside it, the
+    /// deepest folder wins; a tie (only possible after an unarchive) goes to sidebar order.
+    /// Archived projects and projects without a folder never match. The path must be
+    /// absolute (or start with ~); a relative one is an error.
+    public func findProject(path: String) throws -> Project? {
+        guard Self.isAbsolute(path) else { throw StoreError.invalid("path must be absolute (or start with ~): \(path)") }
+        return Self.bestProject(for: path, among: try listProjects(includeArchived: false))
+    }
+
+    /// find_project's rule over projects already read (no database access), for callers
+    /// that hold a project list: the first of `projects` whose folder contains `path` most
+    /// specifically. Archived projects are skipped here too.
+    public static func bestProject(for path: String, among projects: [Project]) -> Project? {
+        guard isAbsolute(path) else { return nil }
+        let target = resolvedPath(path)
+        var best: (project: Project, depth: Int)?
+        for p in projects where !p.isArchived {
+            guard let root = p.repoPath.map(resolvedPath), pathIsInside(target, root: root) else { continue }
+            let depth = root == "/" ? 0 : root.split(separator: "/").count
+            if depth > (best?.depth ?? -1) { best = (p, depth) }
+        }
+        return best?.project
+    }
+
+    /// Open, in-progress and waiting-on-user task counts of one project (subtasks included),
+    /// as `ProjectCounts` counts them; `done` is left 0.
+    public func openTaskCounts(projectId: Int64) throws -> ProjectCounts {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            """
+            SELECT COALESCE(SUM(status NOT IN \(Self.closedStatusSQL)), 0),
+                   COALESCE(SUM(status = ?), 0),
+                   COALESCE(SUM(status = ? AND waiting_on = ?), 0)
+            FROM tasks WHERE project_id=?;
+            """, [.text(TaskStatus.inProgress.rawValue), .text(TaskStatus.waiting.rawValue),
+                  .text(WaitingOn.user.rawValue), .int(projectId)])
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.step(errmsg()) }
+        var c = ProjectCounts()
+        c.open = Int(sqlite3_column_int64(stmt, 0))
+        c.inProgress = Int(sqlite3_column_int64(stmt, 1))
+        c.waitingOnUser = Int(sqlite3_column_int64(stmt, 2))
+        return c
+    }
+
+    // MARK: Repo paths (pure; shared by the app, MCP server and later the CLI and hooks)
+
+    /// Absolute, or starting with ~ (after trimming).
+    public static func isAbsolute(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.hasPrefix("/") || s == "~" || s.hasPrefix("~/")
+    }
+
+    /// A repo folder as typed, in the form it is stored: trimmed, ~ expanded, `.`/`..` and
+    /// trailing slashes removed; nil when empty (no folder). Symlinks are kept. Throws on
+    /// a relative path, which would depend on whoever reads it.
+    public static func normalizedRepoPath(_ raw: String) throws -> String? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
+        guard isAbsolute(s) else { throw StoreError.invalid("the repo folder must be a full path (starting with / or ~): \(s)") }
+        return lexicalPath(s)
+    }
+
+    /// ~ expanded, `.`/`..`, doubled and trailing slashes removed — by text only (not
+    /// URL.standardized, which also rewrites /private/tmp as /tmp).
+    private static func lexicalPath(_ s: String) -> String {
+        let expanded = (s.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+        var parts: [Substring] = []
+        for part in expanded.split(separator: "/") where part != "." {
+            if part == ".." { _ = parts.popLast() } else { parts.append(part) }
+        }
+        return "/" + parts.joined(separator: "/")
+    }
+
+    /// The path as the file system sees it, for comparing: `lexicalPath`, then symlinks
+    /// resolved and each existing component in its on-disk case (realpath, so a path
+    /// typed in another case on a case-insensitive volume compares equal). Components
+    /// that don't exist (yet) are kept as typed after the deepest one that does.
+    public static func resolvedPath(_ raw: String) -> String {
+        var head = lexicalPath(raw)
+        var tail: [String] = []
+        while true {
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            if realpath(head, &buf) != nil {
+                let base = String(cString: buf)
+                guard !tail.isEmpty else { return base }
+                return (base == "/" ? "" : base) + "/" + tail.reversed().joined(separator: "/")
+            }
+            guard head != "/", !head.isEmpty else { return lexicalPath(raw) }
+            let ns = head as NSString
+            tail.append(ns.lastPathComponent)
+            head = ns.deletingLastPathComponent
+        }
+    }
+
+    /// Is `path` the folder `root` or inside it? Both already `resolvedPath`. Compares by
+    /// whole components: /x/careservice does not contain /x/careservice-2026.
+    public static func pathIsInside(_ path: String, root: String) -> Bool {
+        root == "/" ? path.hasPrefix("/") : (path == root || path.hasPrefix(root + "/"))
     }
 
     public func renameProject(id: Int64, name: String) throws {

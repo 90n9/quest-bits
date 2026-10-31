@@ -486,9 +486,11 @@ final class AppModel: ObservableObject {
 
     // MARK: - Project CRUD
 
-    func addProject(name: String, detail: String = "", code: String? = nil, guideTemplate: GuideTemplate? = nil) {
+    func addProject(name: String, detail: String = "", code: String? = nil, repoPath: String? = nil,
+                    guideTemplate: GuideTemplate? = nil) {
         do {
-            let p = try store.createProject(name: name, detail: detail, code: code, guideTemplate: guideTemplate)
+            let p = try store.createProject(name: name, detail: detail, code: code, repoPath: repoPath,
+                                            guideTemplate: guideTemplate)
             reloadAll()
             selectProject(p.id)
         } catch {
@@ -496,9 +498,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Save the project sheet: the code first (it may be refused, e.g. taken since the
-    /// sheet checked it), then the name and description. `detail` nil leaves it as is.
-    func editProject(_ id: Int64, name: String?, detail: String?, code: String?) {
+    /// Save the project sheet: the code first, then the repo folder (each may be refused,
+    /// e.g. taken since the sheet checked it), then the name and description. `detail` and
+    /// `repoPath` nil leave them as they are; an empty `repoPath` removes the folder.
+    func editProject(_ id: Int64, name: String?, detail: String?, code: String?, repoPath: String? = nil) {
         if let code, code.uppercased() != projects.first(where: { $0.id == id })?.code {
             do {
                 try store.setProjectCode(id: id, code: code)
@@ -508,7 +511,33 @@ final class AppModel: ObservableObject {
                 return
             }
         }
+        if let repoPath {
+            do {
+                try store.setProjectRepoPath(id: id, path: repoPath)
+            } catch {
+                flashToast("Couldn't change the repo folder: \(error)")
+                reloadAll()
+                return
+            }
+        }
         updateProject(id, name: name, detail: detail)
+    }
+
+    /// Why `raw` can't be the repo folder of project `id` (nil: a new project), or nil when
+    /// it can. Empty is fine (no folder). The store checks again when it saves.
+    func repoPathProblem(_ raw: String, for id: Int64?) -> String? {
+        let path: String?
+        do { path = try Store.normalizedRepoPath(raw) } catch { return "Enter a full path, starting with / or ~" }
+        // Unchanged is fine (e.g. shared with a project unarchived since), so the rest of
+        // the project stays editable.
+        guard let path, path != projects.first(where: { $0.id == id })?.repoPath else { return nil }
+        let resolved = Store.resolvedPath(path)
+        if let other = projects.first(where: { p in
+            p.id != id && !p.isArchived && p.repoPath.map(Store.resolvedPath) == resolved
+        }) {
+            return "Already the folder of \(other.name)"
+        }
+        return nil
     }
 
     /// Why `raw` can't be the code of project `id` (nil: a new project), or nil when it

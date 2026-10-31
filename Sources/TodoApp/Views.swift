@@ -293,12 +293,14 @@ struct ProjectSidebar: View {
         }
         .sheet(isPresented: $showNew) {
             ProjectSheet(title: "New Project", picksTemplate: true) { v in
-                model.addProject(name: v.name ?? "", detail: v.detail ?? "", code: v.code, guideTemplate: v.template)
+                model.addProject(name: v.name ?? "", detail: v.detail ?? "", code: v.code, repoPath: v.repoPath,
+                                 guideTemplate: v.template)
             }
         }
         .sheet(item: $editing) { p in
-            ProjectSheet(title: "Edit Project", projectId: p.id, name: p.name, detail: p.detail, code: p.code) { v in
-                model.editProject(p.id, name: v.name, detail: v.detail, code: v.code)
+            ProjectSheet(title: "Edit Project", projectId: p.id, name: p.name, detail: p.detail, code: p.code,
+                         repoPath: p.repoPath ?? "") { v in
+                model.editProject(p.id, name: v.name, detail: v.detail, code: v.code, repoPath: v.repoPath)
             }
         }
         .sheet(isPresented: $showTemplates) { TemplatesSheet() }
@@ -475,6 +477,7 @@ struct ProjectSheet: View {
         var name: String?
         var detail: String?
         var code: String?       // nil: left empty (a new project gets one from its name)
+        var repoPath: String?   // nil: unchanged; "": no folder
         var template: GuideTemplate?
     }
 
@@ -484,16 +487,18 @@ struct ProjectSheet: View {
     @State var name: String = ""
     @State var detail: String = ""
     @State var code: String = ""
+    @State var repoPath: String = ""
     var picksTemplate = false
     var showsDescription = true
     @State private var template: GuideTemplate?
     @State private var detailHeight: CGFloat = 120
     @State private var flush = EditorFlush()
-    @State private var opened: (name: String, detail: String)?
+    @State private var opened: (name: String, detail: String, repoPath: String)?
     let onSave: (Values) -> Void
     @Environment(\.dismiss) private var dismiss
 
     private var codeProblem: String? { model.projectCodeProblem(code, for: projectId) }
+    private var repoProblem: String? { model.repoPathProblem(repoPath, for: projectId) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -501,6 +506,7 @@ struct ProjectSheet: View {
             TextField("Project name", text: $name)
                 .textFieldStyle(.roundedBorder)
             codeField
+            repoField
             if showsDescription { descriptionEditor }
             if picksTemplate { templatePicker }
             HStack {
@@ -511,13 +517,14 @@ struct ProjectSheet: View {
                 Button("Save") { save() }
                     .buttonStyle(QBPrimaryButtonStyle(compact: true))
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || codeProblem != nil)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || codeProblem != nil
+                              || repoProblem != nil)
             }
         }
         .padding(Theme.Spacing.lg)
         .frame(width: 560)
         .qbParchment()
-        .onAppear { if opened == nil { opened = (name, detail) } }
+        .onAppear { if opened == nil { opened = (name, detail, repoPath) } }
     }
 
     private var codeField: some View {
@@ -535,6 +542,37 @@ struct ProjectSheet: View {
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
         }
+    }
+
+    /// The folder find_project maps to this project: typed, or picked with Choose….
+    private var repoField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Repo folder").font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+                TextField("Repo folder", text: $repoPath, prompt: Text("None"))
+                    .textFieldStyle(.roundedBorder)
+                Button("Choose…") { chooseRepoFolder() }
+                    .buttonStyle(QBSecondaryButtonStyle(compact: true))
+            }
+            if let repoProblem {
+                Text(repoProblem).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.coralDark)
+            } else {
+                Text("Agents working in this folder or below it see this project. Leave empty if it has none.")
+                    .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+        }
+    }
+
+    private func chooseRepoFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if let current = try? Store.normalizedRepoPath(repoPath) {
+            panel.directoryURL = URL(fileURLWithPath: current, isDirectory: true)
+        }
+        if panel.runModal() == .OK, let url = panel.url { repoPath = url.path }
     }
 
     private var descriptionEditor: some View {
@@ -558,11 +596,14 @@ struct ProjectSheet: View {
             if let md { detail = md }
             let n = name.trimmingCharacters(in: .whitespaces)
             let c = code.trimmingCharacters(in: .whitespaces)
-            if !n.isEmpty, codeProblem == nil {
+            let r = repoPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !n.isEmpty, codeProblem == nil, repoProblem == nil {
                 let editing = projectId != nil
                 onSave(Values(name: editing && n == opened?.name ? nil : n,
                               detail: editing && detail == opened?.detail ? nil : detail,
-                              code: c.isEmpty ? nil : c, template: template))
+                              code: c.isEmpty ? nil : c,
+                              repoPath: editing ? (r == opened?.repoPath ? nil : r) : (r.isEmpty ? nil : r),
+                              template: template))
             }
             dismiss()
         }

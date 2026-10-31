@@ -86,11 +86,14 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
     public var createdAt: Date
     public var sortOrder: Int
     public var archivedAt: Date?     // nil = active; archived projects keep their code reserved
+    /// The folder the project's work lives in (a repo or a workspace of several), stored
+    /// absolute with ~ expanded; nil = no folder (find_project never maps a path to it).
+    public var repoPath: String?
 
     public var isArchived: Bool { archivedAt != nil }
 
     public init(id: Int64, code: String, name: String, detail: String, createdAt: Date, sortOrder: Int,
-                archivedAt: Date? = nil) {
+                archivedAt: Date? = nil, repoPath: String? = nil) {
         self.id = id
         self.code = code
         self.name = name
@@ -98,6 +101,7 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
         self.createdAt = createdAt
         self.sortOrder = sortOrder
         self.archivedAt = archivedAt
+        self.repoPath = repoPath
     }
 }
 
@@ -521,6 +525,7 @@ public struct ProjectCounts: Hashable, Sendable {
     public var open = 0             // todo, in progress, waiting (not `isClosed`)
     public var done = 0
     public var waitingOnUser = 0    // waiting tasks that wait on the user
+    public var inProgress = 0
 
     /// The work still counted toward progress: `done` out of this.
     public var progressTotal: Int { open + done }
@@ -533,6 +538,7 @@ public struct ProjectCounts: Hashable, Sendable {
         for t in tasks {
             if !t.status.isClosed { out[t.projectId, default: ProjectCounts()].open += 1 }
             if t.status == .done { out[t.projectId, default: ProjectCounts()].done += 1 }
+            if t.status == .inProgress { out[t.projectId, default: ProjectCounts()].inProgress += 1 }
             if t.status == .waiting && t.waitingOn == .user {
                 out[t.projectId, default: ProjectCounts()].waitingOnUser += 1
             }

@@ -276,7 +276,7 @@ final class MCPServer: @unchecked Sendable {
                 code = s
             }
             let p = try store.createProject(name: name, detail: desc, code: code,
-                                            guideTemplate: template,
+                                            repoPath: try repoPathArg(args) ?? nil, guideTemplate: template,
                                             author: .agent, sessionId: try sessionArg(args))
             var d = projectDict(p)
             if let template { d["guide_template"] = template.rawValue }
@@ -288,14 +288,36 @@ final class MCPServer: @unchecked Sendable {
 
         case "update_project":
             let pid = try resolveProjectId(args, idKey: "id", codeKey: "code")
-            // The code first: a refused code leaves the name and description unchanged too.
+            // The repo folder's form is checked before any write; then the code and the folder
+            // (each may be refused, e.g. taken), so a refusal leaves the name and description
+            // unchanged too.
+            let repoPath = try repoPathArg(args)
+            if let repoPath, let path = repoPath { _ = try Store.normalizedRepoPath(path) }
             var newCode: String?
             if let raw = args["new_code"], !(raw is NSNull) {
                 guard let s = raw as? String else { throw MCPError.invalidArg("new_code must be a string") }
                 newCode = try store.setProjectCode(id: pid, code: s)
             }
+            var stored: String??
+            if let repoPath { stored = .some(try store.setProjectRepoPath(id: pid, path: repoPath)) }
             try store.updateProject(id: pid, name: args["name"] as? String, detail: args["description"] as? String)
-            return newCode.map { "updated; the project's code is now \($0) (its tasks keep their codes)" } ?? "updated"
+            var parts: [String] = []
+            if let newCode { parts.append("the project's code is now \(newCode) (its tasks keep their codes)") }
+            if let stored { parts.append(stored.map { "its repo folder is \($0)" } ?? "it has no repo folder") }
+            return parts.isEmpty ? "updated" : "updated; " + parts.joined(separator: "; ")
+
+        case "find_project":
+            let path = try requireString(args, "path")
+            let resolved = Store.resolvedPath(path)
+            guard let p = try store.findProject(path: path) else {
+                return try jsonString(["path": resolved, "project": NSNull()] as [String: Any])
+            }
+            let c = try store.openTaskCounts(projectId: p.id)
+            var d = projectDict(p)
+            d["open"] = c.open
+            d["in_progress"] = c.inProgress
+            d["waiting_on_user"] = c.waitingOnUser
+            return try jsonString(["path": resolved, "project": d] as [String: Any])
 
         case "archive_project", "unarchive_project":
             let archive = tool == "archive_project"
@@ -643,6 +665,7 @@ final class MCPServer: @unchecked Sendable {
         var d: [String: Any] = ["id": p.id, "code": p.code, "name": p.name, "description": p.detail,
                                 "created_at": iso(p.createdAt)]
         if let a = p.archivedAt { d["archived_at"] = iso(a) }
+        if let r = p.repoPath { d["repo_path"] = r }
         // Images in the description, as for a task's detail.
         let files = attachmentFiles(in: p.detail)
         if !files.isEmpty { d["attachments"] = files }
@@ -930,6 +953,15 @@ final class MCPServer: @unchecked Sendable {
             return id
         }
         throw MCPError.missingArg("\(idKey) or \(codeKey)")
+    }
+
+    /// `repo_path` for create/update_project: absent = nil (leave alone), null or "" =
+    /// .some(nil) (no folder), a string = that folder (normalized by the store).
+    private func repoPathArg(_ args: [String: Any]) throws -> String?? {
+        guard let raw = args["repo_path"] else { return .none }
+        if raw is NSNull { return .some(nil) }
+        guard let s = raw as? String else { throw MCPError.invalidArg("repo_path must be a string or null") }
+        return .some(s)
     }
 
     /// Resolve a project id from `<idKey>` (int) or `<codeKey>` (string code).

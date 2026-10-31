@@ -22,6 +22,7 @@ extension MCPServer {
         let parentInt: [String: Any] = ["type": ["integer", "null"], "description": "id form of parent_code"]
         let guideScope: [String: Any] = ["global": ["type": "boolean", "description": "true: the user's guide for every project"] as [String: Any],
                                          "project_id": int, "project_code": str]
+        let repoPathStr: [String: Any] = ["type": ["string", "null"], "description": "absolute folder (or starting with ~) of the project's repo or workspace; stored with ~ expanded"]
         let questionFilter: [String: Any] = ["project_id": int, "project_code": str,
                                              "session": ["type": "string", "description": "only questions asked with this session label"] as [String: Any]]
 
@@ -31,8 +32,8 @@ extension MCPServer {
              "inputSchema": obj(["include_archived": ["type": "boolean", "description": "also list archived projects (default false)"] as [String: Any]])],
 
             ["name": "create_project",
-             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned, or give `code` (1–10 letters A–Z or digits, starting with a letter, not another project's). Optional `guide_template` starts the project's guide (see get_guide) from a template for that kind of project, for the user to edit; pass it only when the user picked the kind.",
-             "inputSchema": obj(["name": str, "description": str, "code": str,
+             "description": "Create a new project. Optional `description` gives context. A short code is auto-generated and returned, or give `code` (1–10 letters A–Z or digits, starting with a letter, not another project's). Optional `repo_path` is the folder its work lives in (see find_project). Optional `guide_template` starts the project's guide (see get_guide) from a template for that kind of project, for the user to edit; pass it only when the user picked the kind.",
+             "inputSchema": obj(["name": str, "description": str, "code": str, "repo_path": repoPathStr,
                                  "guide_template": ["type": "string", "enum": GuideTemplate.allCases.map(\.rawValue),
                                                     "description": "web_app, app, research or animation; omit for an empty guide"] as [String: Any],
                                  "session": sessionStr], required: ["name"])],
@@ -42,8 +43,14 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "code": str, "name": str], required: ["name"])],
 
             ["name": "update_project",
-             "description": "Update a project's `name`, `description` and/or code (identify it by `id` or `code`; `new_code` sets the code: 1–10 letters A–Z or digits, starting with a letter, not another project's). Its tasks keep their codes; new tasks take the new one.",
-             "inputSchema": obj(["id": int, "code": str, "name": str, "description": str, "new_code": str])],
+             "description": "Update a project's `name`, `description`, code and/or repo folder (identify it by `id` or `code`; `new_code` sets the code: 1–10 letters A–Z or digits, starting with a letter, not another project's). Its tasks keep their codes; new tasks take the new one. `repo_path` sets the folder its work lives in (see find_project); null or \"\" removes it.",
+             "inputSchema": obj(["id": int, "code": str, "name": str, "description": str, "new_code": str,
+                                 "repo_path": repoPathStr])],
+
+            ["name": "find_project",
+             "description": "Which project a folder belongs to, e.g. your working directory: the active project whose `repo_path` is that folder or contains it (a subfolder of a repo matches). When folders nest, such as a workspace and a repo inside it, the deepest one wins. Folders compare as the file system sees them: ~ expanded, symlinks resolved, trailing slashes ignored, whole folder names only (/x/app does not contain /x/app-2). Archived projects and projects without a repo_path never match. Returns {path (resolved), project} where project is null or the project (as in list_projects) plus counts of its tasks: open, in_progress, waiting_on_user.",
+             "inputSchema": obj(["path": ["type": "string", "description": "an absolute folder path (or starting with ~)"] as [String: Any]],
+                                required: ["path"])],
 
             ["name": "archive_project",
              "description": "Archive a finished project (identify by `id` or `code`). Its tasks are kept, and it stays usable by id/code, but list_projects and list_tasks without a project leave it out. Its code stays reserved. Returns the project, with `open_tasks` when some are still open. Idempotent.",
