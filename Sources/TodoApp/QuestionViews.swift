@@ -3,18 +3,23 @@ import AppKit
 
 // MARK: - Questions page (ask loop)
 
+/// The Questions page's filter: open questions, or the history (answered, picked up by
+/// the agent, or withdrawn).
+enum QuestionShow: String, CaseIterable, Identifiable {
+    case open = "Open", history = "History"
+    var id: String { rawValue }
+}
+
 /// The content column of the Questions page: every open question in projects not
-/// archived, longest waiting first (on a project's Questions tab, that project's only).
-/// Selecting one opens its card in the detail column.
+/// archived, longest waiting first (on a project's Questions tab, that project's only),
+/// or the history, newest first. Selecting one opens its card in the detail pane.
 struct QuestionListView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
         Group {
             if model.shownQuestions.isEmpty {
-                ContentUnavailableViewCompat(text: model.selectedProject == nil
-                    ? "No questions waiting.\nWhen an agent needs you to decide, it asks here."
-                    : "No questions waiting in this project.")
+                ContentUnavailableViewCompat(text: emptyText)
             } else {
                 List(selection: $model.selectedQuestionId) {
                     ForEach(model.shownQuestions) { q in
@@ -23,13 +28,38 @@ struct QuestionListView: View {
                 }
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) { resumeCommands }
+        .safeAreaInset(edge: .top, spacing: 0) { filterBar }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if model.questionsShow == .open { resumeCommands }
+        }
         .navigationTitle(model.selectedProject?.name ?? "Questions")
         .qbParchment()
     }
 }
 
 extension QuestionListView {
+    private var filterBar: some View {
+        Picker("Show", selection: $model.questionsShow) {
+            ForEach(QuestionShow.allCases) { Text($0.rawValue).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(maxWidth: 240)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(alignment: .bottom) { Divider() }
+        .help("Open questions, or the ones already answered or withdrawn")
+    }
+
+    private var emptyText: String {
+        switch (model.questionsShow, model.selectedProject == nil) {
+        case (.open, true): return "No questions waiting.\nWhen an agent needs you to decide, it asks here."
+        case (.open, false): return "No questions waiting in this project."
+        case (.history, true): return "No answered questions yet."
+        case (.history, false): return "No answered questions in this project yet."
+        }
+    }
+
     /// For a session that stopped waiting (wait_for_answers returns after its time, or
     /// the user stopped it): what to paste there so it picks the answers up.
     var resumeCommands: some View {
@@ -61,8 +91,31 @@ struct QuestionRow: View {
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
             Text(question.prompt).font(Theme.Fonts.bodySmMedium).foregroundStyle(Theme.Colors.ink).lineLimit(2)
+            if question.status != .open {
+                Label(question.historyLine, systemImage: question.status == .cancelled ? "xmark.circle" : "checkmark.circle")
+                    .font(Theme.Fonts.micro)
+                    .foregroundStyle(question.status == .cancelled ? Theme.Colors.steel : Theme.Colors.mossDark)
+                    .lineLimit(1)
+            }
         }
         .padding(.vertical, 3)
+    }
+}
+
+extension Question {
+    /// The chosen option's label and the typed answer, as one line ("" when neither).
+    var answerText: String {
+        let picked = answerChoice.flatMap { options.indices.contains($0) ? options[$0].label : nil }
+        let typed = (answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return [picked, typed.isEmpty || typed == picked ? nil : typed].compactMap { $0 }.joined(separator: " — ")
+    }
+
+    /// A closed question's outcome in the history list.
+    var historyLine: String {
+        switch status {
+        case .cancelled: return "Withdrawn" + (cancelReason.map { ": \($0)" } ?? "")
+        default: return answerText.isEmpty ? "Answered" : answerText
+        }
     }
 }
 
@@ -73,7 +126,11 @@ struct QuestionDetailView: View {
     var body: some View {
         if let id = model.selectedQuestionId, let q = model.shownQuestions.first(where: { $0.id == id }) {
             // A fresh card per question, so a draft answer never carries over.
-            QuestionCard(question: q).id(q.id)
+            if q.status == .open {
+                QuestionCard(question: q).id(q.id)
+            } else {
+                AnsweredQuestionCard(question: q).id(q.id)
+            }
         } else {
             ContentUnavailableViewCompat(text: model.shownQuestions.isEmpty
                 ? "Nothing to answer" : "Pick a question to answer")
@@ -338,5 +395,78 @@ struct WindowReader: NSViewRepresentable {
             // Not during the view update that moved it: set the state on the next turn.
             DispatchQueue.main.async { [weak self] in self?.target = w }
         }
+    }
+}
+
+/// A question from the history, read only: what was asked, the context, and the answer
+/// (or why it was withdrawn), with the task one click away.
+struct AnsweredQuestionCard: View {
+    @EnvironmentObject var model: AppModel
+    let question: Question
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                HStack(spacing: 6) {
+                    CodeBadge(code: question.projectCode)
+                    Button(question.taskCode) { openTask() }
+                        .buttonStyle(QBLinkButtonStyle())
+                        .help("Open the task")
+                    Text(question.taskTitle).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate).lineLimit(1)
+                    Spacer()
+                    Text("asked \(fmtDateTime(question.askedAt))").font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+                }
+                Text(question.prompt)
+                    .font(Theme.Fonts.heading5)
+                    .foregroundStyle(Theme.Colors.ink)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !question.context.isEmpty {
+                    DisclosureGroup("Context") {
+                        Text(question.context)
+                            .font(Theme.Fonts.bodySm).foregroundStyle(Theme.Colors.ink)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 4)
+                    }
+                    .font(Theme.Fonts.bodySmMedium)
+                }
+                outcome
+            }
+            .padding(Theme.Spacing.lg)
+            .frame(maxWidth: 640, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .qbParchment()
+    }
+
+    @ViewBuilder private var outcome: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if question.status == .cancelled {
+                Text("WITHDRAWN").font(Theme.Fonts.microUppercase).foregroundStyle(Theme.Colors.steel)
+                Text(question.cancelReason ?? "The agent withdrew the question.")
+                    .font(Theme.Fonts.bodySm).foregroundStyle(Theme.Colors.ink)
+            } else {
+                Text("YOUR ANSWER").font(Theme.Fonts.microUppercase).foregroundStyle(Theme.Colors.steel)
+                Text(question.answerText.isEmpty ? "—" : question.answerText)
+                    .font(Theme.Fonts.bodyMdMedium).foregroundStyle(Theme.Colors.ink)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: Theme.Spacing.md) {
+                    if let at = question.answeredAt { Text("answered \(fmtDateTime(at))") }
+                    if let at = question.resumedAt { Text("agent picked it up \(fmtDateTime(at))") }
+                }
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .qbCard(padding: Theme.Spacing.md)
+    }
+
+    /// Show the question's task in its project.
+    private func openTask() {
+        guard let pid = model.task(byId: question.taskId)?.projectId else { return }
+        model.selectProject(pid)
+        model.selectedTaskIds = [question.taskId]
     }
 }

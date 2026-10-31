@@ -61,28 +61,36 @@ struct ProjectTabColumn: View {
     var body: some View {
         switch tab {
         case .tasks: EmptyView()
-        case .detail: ProjectOverview(project: project)
+        // Detail and Guide have no list to pick from: one page, the overview (or the
+        // guide's context) beside the editor.
+        case .detail:
+            HStack(spacing: 0) {
+                ProjectOverview(project: project).frame(width: 300)
+                Divider()
+                ProjectDescriptionEditor(project: project).id(project.id)
+            }
+        case .guide:
+            HStack(spacing: 0) {
+                GuideContextView(project: project).frame(width: 300)
+                Divider()
+                GuideEditor(project: project, showsBuiltIn: false).id(project.id)
+                    .padding(Theme.Spacing.lg)
+                    .qbParchment()
+            }
         case .wiki: WikiListView(project: project)
-        case .guide: GuideContextView(project: project)
         case .questions: QuestionListView()
         }
     }
 }
 
-/// The detail column of a project tab other than Tasks.
+/// The detail pane of a project tab with a list (Wiki, Questions), once an item is picked.
 struct ProjectTabDetail: View {
     let project: Project
     let tab: ProjectTab
 
     var body: some View {
         switch tab {
-        case .tasks: EmptyView()
-        case .detail:
-            ProjectDescriptionEditor(project: project).id(project.id)
-        case .guide:
-            GuideEditor(project: project, showsBuiltIn: false).id(project.id)
-                .padding(Theme.Spacing.lg)
-                .qbParchment()
+        case .tasks, .detail, .guide: EmptyView()
         case .wiki: WikiDetailView()
         case .questions: QuestionDetailView()
         }

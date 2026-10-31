@@ -17,6 +17,43 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.6.0] - 2026-10-31
+
+### Added
+
+- **Settings is a page of the main window.** Open it from the sidebar
+  (Settings, under Archived) or with ⌘,. When the window is wide enough the
+  settings sit in two columns, so far less scrolling; there is no separate
+  Settings window any more.
+- **Answered questions stay findable.** The Questions page and a project's
+  Questions tab have Open and History. History lists the questions you
+  answered (with your answer) and the ones an agent withdrew, newest first;
+  pick one to read the question, its context and your answer, and open its
+  task.
+
+### Changed
+
+- **The detail pane opens only when you pick something.** Pages now use the
+  full width: the task list, Waiting on you, Questions, Activity, Decisions
+  and Wiki no longer split into three columns up front or pick their first
+  item for you. Click an item and its detail opens on the right; close it
+  with the button at the top right. The Dashboard and Archived have no pane,
+  and a project's Detail and Guide tabs show the overview beside the editor.
+- **New Dashboard.** It fills the page: today's date, tiles for tasks done
+  today and in 7 days (compared with the day and week before), in progress,
+  waiting on you and new decisions (the last three open their page), tasks
+  completed per day over 14 days, what needs you, each project's progress,
+  and the tasks in progress.
+- **Sidebar order follows what needs you first:** Waiting on you, Questions,
+  Decisions, In Progress, All Tasks, Dashboard, Activity, Templates,
+  Archived, Settings.
+- **New Task sits beside the task list's search,** at the top of the list it
+  adds to, instead of the far corner of the toolbar.
+- **The menu-bar item shows the QuestBits logo** with the ✋ waiting and
+  ⚡ working counts. Since 1.5.0 it showed only the numbers, because the menu
+  bar dropped the symbols.
+- Sidebar rows can be pressed with VoiceOver and other accessibility tools.
+
 ## [1.5.0] - 2026-10-31
 
 ### Added
