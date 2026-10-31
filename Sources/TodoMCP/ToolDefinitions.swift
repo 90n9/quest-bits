@@ -19,6 +19,7 @@ extension MCPServer {
         let noteKindEnum: [String: Any] = ["type": "string", "enum": NoteKind.writable.map(\.rawValue)]
         let branchStr: [String: Any] = ["type": "string", "description": "the git branch the task's work is on now; null clears it"]
         let linkKindEnum: [String: Any] = ["type": "string", "enum": LinkKind.allCases.map(\.rawValue), "description": "what the link points at; guessed from the url when omitted"]
+        let relationKindEnum: [String: Any] = ["type": "string", "enum": RelationKind.allCases.map(\.rawValue), "description": "how the task relates to the other, seen from the task"]
         let sessionStr: [String: Any] = ["type": "string", "description": "optional label for your agent session, recorded with what you write; questions asked with one can be filtered by it"]
         let parentStr: [String: Any] = ["type": ["string", "null"], "description": "code of a top-level task in the same project to make this a subtask of; null makes it a top-level task again"]
         let parentInt: [String: Any] = ["type": ["integer", "null"], "description": "id form of parent_code"]
@@ -81,7 +82,7 @@ extension MCPServer {
              ])],
 
             ["name": "get_task",
-             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, links, branch, due_date, detail, effort or estimate; `links` [{id, kind, url, title, author, source, created_at}] lists the task's links oldest first (kind pr|design|doc|file|branch|other; title, author and source only when known), `link` is the url of the first one that is not a branch (the older single-link field), and `branch` is the git branch the work is on now; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{id, ts, text, kind, author, session, edited_at, question_id}] (kind omitted when \"note\"; author user|agent, absent on notes from before 1.4.0; no `notes` key when there are none), and `more_notes: true` when older notes were left out. Questions still open or answered-but-not-resumed (see ask_user) are in `questions`. `detail` is markdown; images the user attached in the app are linked as `attachments/<file>`, and `attachments` lists those files' absolute paths so you can open them.",
+             "description": "Get a single task by `id` or `code` (e.g. GEN-3). Other tasks are referenced by code (`parent`, `depends_on`). Fields that are empty or default are omitted: no priority, tags, link, links, branch, due_date, detail, effort or estimate; `links` [{id, kind, url, title, author, source, created_at}] lists the task's links oldest first (kind pr|design|doc|file|branch|other; title, author and source only when known), `link` is the url of the first one that is not a branch (the older single-link field), and `branch` is the git branch the work is on now; `blocked` appears only when true; `waiting_on`/`waiting_reason`/`waiting_since` only on waiting tasks. Includes the latest notes (see add_note) newest first as `notes` [{id, ts, text, kind, author, session, edited_at, question_id}] (kind omitted when \"note\"; author user|agent, absent on notes from before 1.4.0; no `notes` key when there are none), and `more_notes: true` when older notes were left out. Questions still open or answered-but-not-resumed (see ask_user) are in `questions`. `relations` (only when it has any) groups the tasks it is related to, across projects, by kind: blocked_by (its dependencies, open or closed), blocks (tasks that depend on it), relates, duplicates (it is a duplicate of these), duplicated_by; each entry is {code, title, status}. `detail` is markdown; images the user attached in the app are linked as `attachments/<file>`, and `attachments` lists those files' absolute paths so you can open them.",
              "inputSchema": obj([
                 "id": int, "code": str,
                 "notes_limit": ["type": "integer", "minimum": 0, "maximum": 100, "description": "how many latest notes to include (default 5, 0 = none, max 100)"] as [String: Any]
@@ -214,6 +215,20 @@ extension MCPServer {
             ["name": "remove_dependency",
              "description": "Remove a blocked-by dependency: task (`id`/`code`) no longer depends on (`depends_on_id`/`depends_on_code`).",
              "inputSchema": obj(["id": int, "code": str, "depends_on_id": int, "depends_on_code": str])],
+
+            ["name": "add_relation",
+             "description": "Relate a task (`id`/`code`) to another (`other_id`/`other_code`), in any project. `kind` is seen from the task: blocked_by (the task depends on the other, same as add_dependency), blocks (the other depends on the task), relates (both ways, stored once), duplicates (the task is a duplicate of the other), duplicated_by (the other is a duplicate of the task). Only blocked_by/blocks block, with the dependency rules: self and cycles are rejected. relates and duplicates never block; a task cannot relate to itself, and two tasks cannot each duplicate the other. Repeat-safe: an existing relation returns created:false. `drop: true` (duplicates/duplicated_by only) also drops the duplicate unless it is already closed, with a summary note. Returns {task, other, kind, created, relations, dropped?} where relations is the task's relations as get_task shows them.",
+             "inputSchema": obj([
+                "id": int, "code": str, "other_id": int, "other_code": str,
+                "kind": relationKindEnum,
+                "drop": ["type": "boolean", "description": "duplicates/duplicated_by only: also set the duplicate's status to dropped"] as [String: Any],
+                "session": sessionStr
+             ], required: ["kind"])],
+
+            ["name": "remove_relation",
+             "description": "Remove a relation between a task (`id`/`code`) and another (`other_id`/`other_code`); `kind` as in add_relation (blocked_by/blocks remove the dependency, relates matches either way round). Returns {task, other, kind, removed, relations}; removed:false when there was none.",
+             "inputSchema": obj(["id": int, "code": str, "other_id": int, "other_code": str, "kind": relationKindEnum],
+                                required: ["kind"])],
 
             ["name": "add_link",
              "description": "Add a link to a task (`id` or `code`): a pull request, design, doc, file, an earlier or extra git branch, or anything else. A task keeps any number of links, oldest first, and one PR may be linked from several tasks. `kind` is guessed from the url when not given (GitHub/GitLab/Bitbucket PRs → pr, claude.ai artifacts and Figma → design, Google Docs/Notion/Confluence → doc, a path → file, else other; branch is never guessed). The url is stored once per task (trimmed, trailing slashes dropped): adding one the task already has adds nothing, sets the `kind`/`title` you give, and returns it with created:false, so repeating a call is safe. `source` records where the link came from (e.g. an import's source key) and is kept on a new link only. The task's working branch is not a link: set it with update_task branch. Returns {task, link: {id, kind, url, title, author, source, created_at}, created}.",

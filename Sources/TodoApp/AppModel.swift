@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     // Ids of tasks currently blocked by an unfinished dependency (for the 🔒 badge).
     // Recomputed alongside the displayed task list.
     @Published var blockedTaskIds: Set<Int64> = []
+    // Open tasks that block open tasks, and how many (the list's "blocks others" mark).
+    @Published private(set) var blockingCounts: [Int64: Int] = [:]
 
     /// Per-project task counts for the sidebar rows, refreshed with the tasks (and so
     /// with every poll). A project with no tasks has no entry.
@@ -126,6 +128,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var selectedTaskQuestions: [Int64: Question] = [:]
     // The selected task's links, oldest first (loaded with its notes).
     @Published private(set) var selectedTaskLinks: [TaskLink] = []
+    // The selected task's relations, by kind (loaded with its notes).
+    @Published private(set) var selectedTaskRelations = RelatedTasks()
     private var notesTaskId: Int64?
     private var notesLimit = AppModel.notesPage
     static let notesPage = 20
@@ -224,6 +228,8 @@ final class AppModel: ObservableObject {
         if kept != selectedTaskIds { selectedTaskIds = kept }
         inProgressTasks = active.filter { $0.status == .inProgress }
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
+        let blocking = (try? store.blockingCounts()) ?? blockingCounts
+        if blocking != blockingCounts { blockingCounts = blocking }
         // Publish only on a change: most polls and effort flushes leave the counts as
         // they were, and the sidebar needn't redraw.
         let counts = ProjectCounts.byProject(all)
@@ -410,6 +416,7 @@ final class AppModel: ObservableObject {
             if !selectedTaskEvents.isEmpty { selectedTaskEvents = [] }
             if !selectedTaskQuestions.isEmpty { selectedTaskQuestions = [:] }
             if !selectedTaskLinks.isEmpty { selectedTaskLinks = [] }
+            if !selectedTaskRelations.isEmpty { selectedTaskRelations = RelatedTasks() }
             return
         }
         do {
@@ -418,12 +425,14 @@ final class AppModel: ObservableObject {
             let questions = Dictionary(uniqueKeysWithValues: try store.questions(
                 statuses: QuestionStatus.allCases, taskId: id).map { ($0.id, $0) })
             let links = try store.links(taskId: id)
+            let relations = try store.relatedTasks(taskId: id)
             let page = Array(rows.prefix(notesLimit)), older = rows.count > notesLimit
             if page != selectedTaskNotes { selectedTaskNotes = page }
             if older != hasOlderNotes { hasOlderNotes = older }
             if events != selectedTaskEvents { selectedTaskEvents = events }
             if questions != selectedTaskQuestions { selectedTaskQuestions = questions }
             if links != selectedTaskLinks { selectedTaskLinks = links }
+            if relations != selectedTaskRelations { selectedTaskRelations = relations }
             notesErrorShown = nil
         } catch {
             if switched {
@@ -432,6 +441,7 @@ final class AppModel: ObservableObject {
                 if !selectedTaskEvents.isEmpty { selectedTaskEvents = [] }
                 if !selectedTaskQuestions.isEmpty { selectedTaskQuestions = [:] }
                 if !selectedTaskLinks.isEmpty { selectedTaskLinks = [] }
+                if !selectedTaskRelations.isEmpty { selectedTaskRelations = RelatedTasks() }
             }
             let message = "\(error)"
             guard notesErrorShown?.taskId != id || notesErrorShown?.error != message else { return }
@@ -819,9 +829,9 @@ final class AppModel: ObservableObject {
         flashToast("Added \(task.code)")
     }
 
-    // MARK: - Dependencies (blocked-by)
+    // MARK: - Task lookup
 
-    /// All tasks across every project (for dependency pickers).
+    /// All tasks across every project (for the relation search).
     func allTasks() -> [TodoTask] {
         (try? store.listTasks(projectId: nil)) ?? []
     }
@@ -831,24 +841,69 @@ final class AppModel: ObservableObject {
         tasks.first(where: { $0.id == id }) ?? (try? store.getTask(id: id))
     }
 
-    /// The ids `taskId` is blocked by.
-    func dependencies(of taskId: Int64) -> [Int64] {
-        (try? store.dependencies(taskId: taskId)) ?? []
-    }
+    // MARK: - Relations
 
-    /// Add a blocked-by edge; surfaces store rejections (self/cycle) as a toast.
-    func addDependency(_ taskId: Int64, dependsOn depId: Int64) {
+    /// Relate `task` to `other` (`kind` seen from `task`); store rejections (self, cycle,
+    /// a reverse duplicate) show as a toast. Returns whether it was added.
+    @discardableResult
+    func addRelation(_ task: TodoTask, to other: TodoTask, kind: RelationKind) -> Bool {
         do {
-            try store.addDependency(taskId: taskId, dependsOnId: depId)
+            if try !store.addRelation(taskId: task.id, otherId: other.id, kind: kind) {
+                flashToast("\(other.code) is already listed")
+            }
             reloadTasks()
+            return true
         } catch {
             flashToast("\(error)")
+            return false
         }
     }
 
-    func removeDependency(_ taskId: Int64, dependsOn depId: Int64) {
-        try? store.removeDependency(taskId: taskId, dependsOnId: depId)
+    func removeRelation(_ taskId: Int64, _ otherId: Int64, kind: RelationKind) {
+        do {
+            try store.removeRelation(taskId: taskId, otherId: otherId, kind: kind)
+        } catch {
+            flashToast("\(error)")
+        }
         reloadTasks()
+    }
+
+    /// Drop `task` as a duplicate of `original` (after the user agreed), with a note.
+    func dropAsDuplicate(_ task: TodoTask, of original: TodoTask) {
+        do {
+            try store.updateTask(id: task.id, status: .dropped, author: .user,
+                                 note: NoteDraft(text: "Dropped as a duplicate of \(original.code).",
+                                                 kind: .summary, author: .user))
+        } catch {
+            flashToast("\(error)")
+        }
+        reloadTasks()
+    }
+
+    /// Show a task from anywhere (e.g. a relation in another project): select it where it
+    /// is listed now, or else open its project with it selected.
+    func openTask(_ id: Int64) {
+        if tasks.contains(where: { $0.id == id }) {
+            selectedTaskIds = [id]
+            return
+        }
+        guard let pid = task(byId: id)?.projectId else { return }
+        selectProject(pid)
+        selectedTaskIds = [id]
+    }
+
+    /// Tasks in any project whose code or title contains `query` (case-insensitive), code
+    /// matches first, at most `limit`, leaving out `excluding`.
+    func searchTasks(_ query: String, excluding: Set<Int64>, limit: Int = 8) -> [TodoTask] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return [] }
+        let hits = allTasks().filter {
+            !excluding.contains($0.id)
+                && ($0.code.localizedCaseInsensitiveContains(q) || $0.title.localizedCaseInsensitiveContains(q))
+        }
+        let byCode = hits.filter { $0.code.localizedCaseInsensitiveContains(q) }
+        let byTitle = hits.filter { !$0.code.localizedCaseInsensitiveContains(q) }
+        return Array((byCode + byTitle).prefix(limit))
     }
 
     // MARK: - Links

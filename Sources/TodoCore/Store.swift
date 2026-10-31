@@ -246,6 +246,21 @@ public final class Store: @unchecked Sendable {
         exec("CREATE INDEX IF NOT EXISTS idx_deps_task ON task_deps(task_id);")
         exec("CREATE INDEX IF NOT EXISTS idx_deps_depends ON task_deps(depends_on_id);")
 
+        // --- Additive migration: non-blocking task relations (1.5.0) ---
+        // kind relates (one row per pair, task_id < other_id, read both ways) or duplicates
+        // (task_id is the duplicate of other_id). Blocking stays in task_deps. No CHECK on
+        // kind, so a later kind needs no table rebuild; Store validates it.
+        exec("""
+        CREATE TABLE IF NOT EXISTS task_relations (
+            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            other_id   INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(task_id, other_id, kind)
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_relations_other ON task_relations(other_id);")
+
         // --- Additive migration: time estimate (compared against effort_seconds) ---
         if !columnExists("tasks", "estimate_seconds") { exec("ALTER TABLE tasks ADD COLUMN estimate_seconds INTEGER NOT NULL DEFAULT 0;") }
 
@@ -2763,8 +2778,10 @@ public final class Store: @unchecked Sendable {
 
     /// Record that `taskId` is blocked by `dependsOnId`. Rejects self-dependency and
     /// any edge that would close a cycle (covers the obvious A→B / B→A case and
-    /// deeper transitive loops). Duplicate edges are ignored.
-    public func addDependency(taskId: Int64, dependsOnId: Int64) throws {
+    /// deeper transitive loops). Duplicate edges are ignored. Returns whether the edge
+    /// is new (false: it was already there).
+    @discardableResult
+    public func addDependency(taskId: Int64, dependsOnId: Int64) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard taskId != dependsOnId else {
             throw StoreError.step("a task cannot depend on itself")
@@ -2774,13 +2791,18 @@ public final class Store: @unchecked Sendable {
         // with BEGIN IMMEDIATE and re-check reachability inside the transaction.
         do {
             try beginImmediate()
+            for id in [taskId, dependsOnId] where getTaskUnlocked(id) == nil {
+                throw StoreError.notFound("task \(id)")
+            }
             // If dependsOnId already (transitively) depends on taskId, adding
             // taskId→dependsOnId would create a cycle.
             if dependsReachesUnlocked(from: dependsOnId, to: taskId) {
                 throw StoreError.step("adding this dependency would create a cycle")
             }
             try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
+            let created = sqlite3_changes(db) == 1
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return created
         } catch {
             // ROLLBACK clears the transaction on any failure (including a BEGIN that hit an
             // already-open connection), so the shared connection is never left poisoned.
@@ -2789,10 +2811,131 @@ public final class Store: @unchecked Sendable {
         }
     }
 
-    /// Remove the blocked-by edge `taskId`→`dependsOnId` (no-op if absent).
-    public func removeDependency(taskId: Int64, dependsOnId: Int64) throws {
+    /// Remove the blocked-by edge `taskId`→`dependsOnId` (no-op if absent). Returns
+    /// whether there was one.
+    @discardableResult
+    public func removeDependency(taskId: Int64, dependsOnId: Int64) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         try runWrite("DELETE FROM task_deps WHERE task_id=? AND depends_on_id=?;", [.int(taskId), .int(dependsOnId)])
+        return sqlite3_changes(db) == 1
+    }
+
+    // MARK: - Relations (blocks / blocked by / relates / duplicates)
+
+    /// The `task_relations` row that stores `kind` between `taskId` and `otherId`:
+    /// relates is one row per pair (lower id first), duplicates points from the duplicate
+    /// to the original. Not for the dependency kinds, which live in `task_deps`.
+    private static func relationRow(_ taskId: Int64, _ otherId: Int64, _ kind: RelationKind)
+        -> (task: Int64, other: Int64, kind: String) {
+        switch kind {
+        case .relates: return (min(taskId, otherId), max(taskId, otherId), "relates")
+        case .duplicatedBy: return (otherId, taskId, "duplicates")
+        default: return (taskId, otherId, "duplicates")
+        }
+    }
+
+    /// Relate `taskId` to `otherId` (any two tasks, across projects). `blockedBy` and
+    /// `blocks` add the dependency edge (`addDependency`, with its cycle guard), so they
+    /// do block; `relates` and `duplicates` never block. A task cannot be related to
+    /// itself, and two tasks cannot each be the duplicate of the other. Repeat-safe:
+    /// returns false when the relation was already there.
+    @discardableResult
+    public func addRelation(taskId: Int64, otherId: Int64, kind: RelationKind) throws -> Bool {
+        switch kind {
+        case .blockedBy: return try addDependency(taskId: taskId, dependsOnId: otherId)
+        case .blocks: return try addDependency(taskId: otherId, dependsOnId: taskId)
+        case .relates, .duplicates, .duplicatedBy: break
+        }
+        guard taskId != otherId else { throw StoreError.step("a task cannot be related to itself") }
+        let row = Self.relationRow(taskId, otherId, kind)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            // The reverse-duplicate check + INSERT is a read-modify-write another process
+            // can race on: both inside one BEGIN IMMEDIATE.
+            try beginImmediate()
+            guard let dup = getTaskUnlocked(row.task) else { throw StoreError.notFound("task \(row.task)") }
+            guard let original = getTaskUnlocked(row.other) else { throw StoreError.notFound("task \(row.other)") }
+            if row.kind == "duplicates", (queryInt(
+                "SELECT EXISTS(SELECT 1 FROM task_relations WHERE task_id=? AND other_id=? AND kind='duplicates');",
+                [.int(row.other), .int(row.task)]) ?? 0) > 0 {
+                throw StoreError.step("\(original.code) is already a duplicate of \(dup.code)")
+            }
+            try runWrite("INSERT OR IGNORE INTO task_relations (task_id, other_id, kind, created_at) VALUES (?, ?, ?, ?);",
+                         [.int(row.task), .int(row.other), .text(row.kind), .double(Date().timeIntervalSince1970)])
+            let created = sqlite3_changes(db) == 1
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return created
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Remove `kind` between `taskId` and `otherId` (the dependency kinds remove the
+    /// edge). Relates is matched either way round. Returns whether there was one.
+    @discardableResult
+    public func removeRelation(taskId: Int64, otherId: Int64, kind: RelationKind) throws -> Bool {
+        switch kind {
+        case .blockedBy: return try removeDependency(taskId: taskId, dependsOnId: otherId)
+        case .blocks: return try removeDependency(taskId: otherId, dependsOnId: taskId)
+        case .relates, .duplicates, .duplicatedBy: break
+        }
+        let row = Self.relationRow(taskId, otherId, kind)
+        lock.lock(); defer { lock.unlock() }
+        try runWrite("DELETE FROM task_relations WHERE task_id=? AND other_id=? AND kind=?;",
+                     [.int(row.task), .int(row.other), .text(row.kind)])
+        return sqlite3_changes(db) == 1
+    }
+
+    /// Every relation of `taskId`, both directions, in one query: its dependencies
+    /// (blocked by, open or closed), the tasks depending on it (blocks), related tasks and
+    /// duplicates either way. Each group is ordered by task id (creation order).
+    public func relatedTasks(taskId: Int64) throws -> RelatedTasks {
+        lock.lock(); defer { lock.unlock() }
+        let cols = "t.id, t.code, t.title, t.status, t.project_id"
+        let stmt = try prepare("""
+            SELECT 'blocked_by', \(cols) FROM task_deps d JOIN tasks t ON t.id = d.depends_on_id WHERE d.task_id = ?1
+            UNION ALL SELECT 'blocks', \(cols) FROM task_deps d JOIN tasks t ON t.id = d.task_id WHERE d.depends_on_id = ?1
+            UNION ALL SELECT 'relates', \(cols) FROM task_relations r
+                JOIN tasks t ON t.id = CASE WHEN r.task_id = ?1 THEN r.other_id ELSE r.task_id END
+                WHERE r.kind = 'relates' AND (r.task_id = ?1 OR r.other_id = ?1)
+            UNION ALL SELECT 'duplicates', \(cols) FROM task_relations r JOIN tasks t ON t.id = r.other_id
+                WHERE r.kind = 'duplicates' AND r.task_id = ?1
+            UNION ALL SELECT 'duplicated_by', \(cols) FROM task_relations r JOIN tasks t ON t.id = r.task_id
+                WHERE r.kind = 'duplicates' AND r.other_id = ?1
+            ORDER BY 1, 2;
+            """, [.int(taskId)])
+        defer { sqlite3_finalize(stmt) }
+        var out = RelatedTasks()
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            if let kind = RelationKind(rawValue: colText(stmt, 0)) {
+                out.byKind[kind, default: []].append(RelatedTask(
+                    id: sqlite3_column_int64(stmt, 1), code: colText(stmt, 2), title: colText(stmt, 3),
+                    status: TaskStatus(rawValue: colText(stmt, 4)) ?? .todo,
+                    projectId: sqlite3_column_int64(stmt, 5)))
+            }
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    /// For each open task that blocks at least one open task, how many it blocks (the
+    /// `blockingEdgeSQL` rule) — one query, for the list's "blocks others" mark.
+    public func blockingCounts() throws -> [Int64: Int] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare(
+            "SELECT d.depends_on_id, COUNT(*) FROM \(Self.depEdgesSQL) WHERE \(Self.blockingEdgeSQL) GROUP BY d.depends_on_id;", [])
+        defer { sqlite3_finalize(stmt) }
+        var out: [Int64: Int] = [:]
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out[sqlite3_column_int64(stmt, 0)] = Int(sqlite3_column_int64(stmt, 1))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
     }
 
     /// SQL list of the closed status values (`TaskStatus.isClosed`), e.g. `('done','dropped')`.
@@ -2815,6 +2958,16 @@ public final class Store: @unchecked Sendable {
     public func isBlocked(taskId: Int64) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return isBlockedUnlocked(taskId)
+    }
+
+    /// A WHERE-clause predicate that is true when the task row aliased `taskAlias` has a
+    /// dependency still open (indexed on task_deps.task_id). For an open task this is
+    /// exactly "blocked"; `AND NOT \(hasOpenDependencySQL("t"))` keeps a task query to
+    /// unblocked tasks without a per-task lookup. `taskAlias` is an internal SQL alias,
+    /// never user input.
+    static func hasOpenDependencySQL(_ taskAlias: String) -> String {
+        "EXISTS(SELECT 1 FROM task_deps d JOIN tasks b ON b.id = d.depends_on_id "
+        + "WHERE d.task_id = \(taskAlias).id AND \(openDependencySQL))"
     }
 
     private func isBlockedUnlocked(_ taskId: Int64) -> Bool {

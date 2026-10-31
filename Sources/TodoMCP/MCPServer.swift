@@ -380,6 +380,8 @@ final class MCPServer: @unchecked Sendable {
             // Questions still in play: open (waiting on the user) or answered (to resume).
             let questions = try store.questions(statuses: [.open, .answered], taskId: task.id)
             if !questions.isEmpty { d["questions"] = questions.map(questionDict) }
+            let relations = try store.relatedTasks(taskId: task.id)
+            if !relations.isEmpty { d["relations"] = relationsDict(relations) }
             return try jsonString(d)
 
         case "inbox":
@@ -590,6 +592,42 @@ final class MCPServer: @unchecked Sendable {
             let dep = try resolveTaskId(args, idKey: "depends_on_id", codeKey: "depends_on_code")
             try store.removeDependency(taskId: tid, dependsOnId: dep)
             return try jsonString(taskDict(store.getTask(id: tid)))
+
+        case "add_relation":
+            let kind = try relationKindArg(args)
+            let tid = try resolveTaskId(args)
+            let other = try resolveTaskId(args, idKey: "other_id", codeKey: "other_code")
+            let drop = try boolArg(args, "drop") ?? false
+            if drop && kind != .duplicates && kind != .duplicatedBy {
+                throw MCPError.invalidArg("drop is only for kind duplicates or duplicated_by")
+            }
+            let created = try store.addRelation(taskId: tid, otherId: other, kind: kind)
+            var dropped: Any?
+            if drop {
+                // The duplicate is dropped (closed, kept with its history) unless already closed.
+                let (dupId, originalId) = kind == .duplicates ? (tid, other) : (other, tid)
+                let dup = try store.getTask(id: dupId)
+                if !dup.status.isClosed {
+                    let original = try store.getTask(id: originalId)
+                    try store.updateTask(id: dupId, status: .dropped, author: .agent,
+                                         note: NoteDraft(text: "Dropped as a duplicate of \(original.code).",
+                                                         kind: .summary, author: .agent, sessionId: try sessionArg(args)))
+                    dropped = taskHandle(code: dup.code, id: dup.id)
+                }
+            }
+            var out = try relationResult(tid, other, kind)
+            out["created"] = created
+            if let dropped { out["dropped"] = dropped }
+            return try jsonString(out)
+
+        case "remove_relation":
+            let kind = try relationKindArg(args)
+            let tid = try resolveTaskId(args)
+            let other = try resolveTaskId(args, idKey: "other_id", codeKey: "other_code")
+            let removed = try store.removeRelation(taskId: tid, otherId: other, kind: kind)
+            var out = try relationResult(tid, other, kind)
+            out["removed"] = removed
+            return try jsonString(out)
 
         case "add_link":
             // Always the agent, as for notes; the app adds links as the user.
@@ -820,6 +858,38 @@ final class MCPServer: @unchecked Sendable {
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
         if let branch = t.branch { d["branch"] = branch }
         return d
+    }
+
+    /// A task's relations as get_task returns them: one key per kind that has any
+    /// (blocked_by, blocks, relates, duplicates, duplicated_by), each a list of
+    /// {code, title, status} (id instead of code for a task without one).
+    private func relationsDict(_ r: RelatedTasks) -> [String: Any] {
+        var d: [String: Any] = [:]
+        for kind in RelationKind.allCases where !r[kind].isEmpty {
+            d[kind.rawValue] = r[kind].map { t -> [String: Any] in
+                var e: [String: Any] = ["title": t.title, "status": t.status.rawValue]
+                if t.code.isEmpty { e["id"] = t.id } else { e["code"] = t.code }
+                return e
+            }
+        }
+        return d
+    }
+
+    /// add_relation / remove_relation output: both tasks by code, the kind, and the
+    /// task's relations after the write (empty object when it has none).
+    private func relationResult(_ taskId: Int64, _ otherId: Int64, _ kind: RelationKind) throws -> [String: Any] {
+        let task = try store.getTask(id: taskId), other = try store.getTask(id: otherId)
+        return ["task": taskHandle(code: task.code, id: task.id), "other": taskHandle(code: other.code, id: other.id),
+                "kind": kind.rawValue, "relations": relationsDict(try store.relatedTasks(taskId: taskId))]
+    }
+
+    /// add_relation / remove_relation `kind` (required).
+    private func relationKindArg(_ args: [String: Any]) throws -> RelationKind {
+        guard given(args, "kind") else { throw MCPError.missingArg("kind") }
+        guard let s = args["kind"] as? String, let k = RelationKind(rawValue: s) else {
+            throw MCPError.invalidArg("kind must be one of: \(RelationKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return k
     }
 
     /// A task link as get_task, add_link and remove_link return it: title, author and

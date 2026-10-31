@@ -1166,6 +1166,7 @@ struct TaskRow: View {
                                 .foregroundStyle(Theme.Colors.coralDark)
                                 .help("Blocked by an unfinished dependency")
                         }
+                        if let n = model.blockingCounts[task.id] { BlocksOthersMark(count: n) }
                         WaitingChip(task: task)
                     }
                     Text(task.title)
@@ -1523,6 +1524,7 @@ struct BoardCard: View {
                     Image(systemName: "flag.fill").font(.caption2).foregroundStyle(qbPriorityColor(task.priority))
                 }
                 CodeBadge(code: task.code)
+                if let n = model.blockingCounts[task.id] { BlocksOthersMark(count: n) }
                 Spacer()
             }
             Text(task.title)
@@ -1617,6 +1619,11 @@ struct TaskDetailView: View {
     // Draft link (not a task field either), cleared with the draft note.
     @State private var newLink = ""
     @State private var newLinkKind: LinkKind?   // nil = let the store guess
+    // Add-relation row (cleared with the draft note), and the offer to drop a duplicate
+    // shown right after one is marked.
+    @State private var relationKind: RelationKind = .relates
+    @State private var relationQuery = ""
+    @State private var dropOffer: DuplicateDropOffer?
     @AppStorage("qbTimelineFilter") private var timelineFilter: TimelineFilter = .all
     @State private var detailHeight: CGFloat = 120   // the Detail editor's content height
 
@@ -1720,7 +1727,7 @@ struct TaskDetailView: View {
                 taskSection
                 dueDateSection
                 tagsSection
-                blockedSection(task)
+                relationsSection(task)
                 linksSection(task)
                 detailSection(task)
                 timelineSection(task)
@@ -1807,49 +1814,89 @@ struct TaskDetailView: View {
         }
     }
 
-    private func blockedSection(_ task: TodoTask) -> some View {
-        QBDetailSection("Blocked By") {
-            let deps = model.dependencies(of: task.id)
-            if deps.isEmpty {
-                Text("No blocking tasks").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
-            } else {
-                ForEach(deps, id: \.self) { depId in
-                    if let dep = model.task(byId: depId) {
-                        HStack(spacing: 8) {
-                            // A closed (done or dropped) dependency no longer blocks.
-                            Image(systemName: dep.status.isClosed ? qbStatusIcon(dep.status) : "circle")
-                                .foregroundStyle(dep.status.isClosed ? qbStatusColor(dep.status) : Theme.Colors.brandYellowDeep)
-                            CodeBadge(code: dep.code)
-                            Text(dep.title).font(Theme.Fonts.bodySm).lineLimit(1)
-                            Spacer()
-                            Button {
-                                model.removeDependency(task.id, dependsOn: depId)
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(Theme.Colors.steel)
-                            .help("Remove dependency")
-                        }
-                    }
-                }
+    /// The task's relations, grouped by kind (Blocked by, Blocks, Related, Duplicates,
+    /// Duplicated by), each a card that opens that task (in any project), then a row to
+    /// find a task by code or title and relate it.
+    private func relationsSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Relations") {
+            let rel = model.selectedTaskRelations
+            if rel.isEmpty {
+                Text("No related tasks").foregroundStyle(Theme.Colors.slate).font(Theme.Fonts.caption)
             }
-            Menu("Add blocking task…") {
-                ForEach(model.projects) { p in
-                    let cands = candidateDeps(for: task).filter { $0.projectId == p.id }
-                    if !cands.isEmpty {
-                        Menu(p.name) {
-                            ForEach(cands, id: \.id) { cand in
-                                Button("\(cand.code)  \(cand.title)") {
-                                    model.addDependency(task.id, dependsOn: cand.id)
-                                }
-                            }
-                        }
-                    }
-                }
+            ForEach(RelationKind.allCases.filter { !rel[$0].isEmpty }, id: \.self) { kind in
+                relationGroup(task, kind, rel[kind])
             }
-            .font(Theme.Fonts.bodySmMedium)
-            .fixedSize()
+            addRelationRow(task)
+        }
+        .alert("Drop the duplicate?",
+               isPresented: Binding(get: { dropOffer != nil }, set: { if !$0 { dropOffer = nil } }),
+               presenting: dropOffer) { offer in
+            Button("Drop \(offer.duplicate.code)", role: .destructive) {
+                model.dropAsDuplicate(offer.duplicate, of: offer.original)
+            }
+            Button("Keep", role: .cancel) {}
+        } message: { offer in
+            Text("\(offer.duplicate.code) is a duplicate of \(offer.original.code). Drop it? It keeps its notes and history.")
+        }
+    }
+
+    private func relationGroup(_ task: TodoTask, _ kind: RelationKind, _ items: [RelatedTask]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(kind.display).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+            ForEach(items) { item in
+                RelationCard(item: item, kind: kind,
+                             onOpen: { model.openTask(item.id) },
+                             onRemove: { model.removeRelation(task.id, item.id, kind: kind) })
+            }
+        }
+    }
+
+    private func addRelationRow(_ task: TodoTask) -> some View {
+        let candidates = relationCandidates(for: task)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Picker("", selection: $relationKind) {
+                    ForEach(RelationKind.allCases, id: \.self) { Text($0.display).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+                TextField("Find a task by code or title…", text: $relationQuery)
+                    .qbField()
+                    .onSubmit { if let first = candidates.first { commitRelation(task, first) } }
+            }
+            ForEach(candidates, id: \.id) { cand in
+                Button { commitRelation(task, cand) } label: { relationCandidateLabel(cand) }
+                    .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func relationCandidateLabel(_ cand: TodoTask) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "plus.circle").foregroundStyle(Theme.Colors.steel)
+            CodeBadge(code: cand.code)
+            Text(cand.title).font(Theme.Fonts.bodySm).lineLimit(1)
+            Spacer()
+        }
+        .contentShape(Rectangle())
+    }
+
+    /// Tasks matching the search, other than this one and those already related this way.
+    /// The store rejects the rest (a dependency cycle, a reverse duplicate) on add.
+    private func relationCandidates(for task: TodoTask) -> [TodoTask] {
+        let existing = Set(model.selectedTaskRelations[relationKind].map(\.id))
+        return model.searchTasks(relationQuery, excluding: existing.union([task.id]))
+    }
+
+    /// Add the relation; after marking a duplicate that is still open, offer to drop it.
+    private func commitRelation(_ task: TodoTask, _ other: TodoTask) {
+        let kind = relationKind
+        guard model.addRelation(task, to: other, kind: kind) else { return }
+        relationQuery = ""
+        if kind == .duplicates, !task.status.isClosed {
+            dropOffer = DuplicateDropOffer(duplicate: task, original: other)
+        } else if kind == .duplicatedBy, !other.status.isClosed {
+            dropOffer = DuplicateDropOffer(duplicate: other, original: task)
         }
     }
 
@@ -2022,13 +2069,6 @@ struct TaskDetailView: View {
         .font(Theme.Fonts.bodySm)
     }
 
-    /// Tasks eligible to become a blocking dependency: any task other than this one
-    /// that isn't already a dependency. The store rejects cycles on add.
-    private func candidateDeps(for task: TodoTask) -> [TodoTask] {
-        let existing = Set(model.dependencies(of: task.id))
-        return model.allTasks().filter { $0.id != task.id && !existing.contains($0.id) }
-    }
-
     // Per-field edits: the editor value differs from `t` (the snapshot, see `base`).
     private func titleEdited(_ t: TodoTask) -> Bool { title != t.title }
     private func detailEdited(_ t: TodoTask) -> Bool { detail != t.detail }
@@ -2062,6 +2102,7 @@ struct TaskDetailView: View {
         if noteDraftTaskId != t.id {
             noteText = ""; noteKind = .note; noteDraftTaskId = t.id
             newLink = ""; newLinkKind = nil
+            relationQuery = ""; dropOffer = nil
         }
         title = t.title; detail = t.detail; branch = t.branch ?? ""; status = t.status
         waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
@@ -2121,6 +2162,60 @@ struct TaskDetailView: View {
             waitingReason: waitingReasonEdited(b) ? .some(waitingReason) : nil,
             branch: branchEdited(b) ? .some(branch.isEmpty ? nil : branch) : nil
         )
+    }
+}
+
+/// A duplicate just marked in the detail, which the user is asked whether to drop.
+struct DuplicateDropOffer {
+    let duplicate: TodoTask
+    let original: TodoTask
+}
+
+/// One related task in the detail's Relations: its status, code and title. A click opens
+/// it (in its own project); the x removes the relation. A dependency still open is marked
+/// as the one blocking this task.
+struct RelationCard: View {
+    let item: RelatedTask
+    let kind: RelationKind
+    let onOpen: () -> Void
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: qbStatusIcon(item.status)).foregroundStyle(qbStatusColor(item.status))
+            CodeBadge(code: item.code)
+            Text(item.title)
+                .font(Theme.Fonts.bodySm)
+                .strikethrough(item.status.isClosed)
+                .foregroundStyle(qbTitleColor(item.status))
+                .lineLimit(1)
+            Spacer()
+            Button(action: onRemove) { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless)
+                .foregroundStyle(Theme.Colors.steel)
+                .help("Remove relation")
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(Theme.Colors.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.md))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onOpen)
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        kind == .blockedBy && !item.status.isClosed ? "Open \(item.code) — still blocking this task" : "Open \(item.code)"
+    }
+}
+
+/// The list's mark on a task that other unfinished tasks are waiting on.
+struct BlocksOthersMark: View {
+    let count: Int
+
+    var body: some View {
+        Image(systemName: "hand.raised.fill")
+            .font(.caption2)
+            .foregroundStyle(Theme.Colors.brandYellowDeep)
+            .help("Blocks \(count) unfinished task\(count == 1 ? "" : "s")")
     }
 }
 

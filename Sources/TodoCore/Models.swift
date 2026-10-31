@@ -380,6 +380,59 @@ public struct TaskLink: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+/// How one task relates to another, seen from the first task. `blockedBy` / `blocks` are
+/// the dependency graph (`task_deps`, the same edges add_dependency writes, cycle-guarded);
+/// `relates` and `duplicates` / `duplicatedBy` are `task_relations` rows and never block.
+/// `relates` is one undirected row; `duplicates` is directed (the duplicate → the original).
+public enum RelationKind: String, Codable, CaseIterable, Sendable {
+    case blockedBy = "blocked_by"   // this task depends on the other
+    case blocks                     // the other task depends on this one
+    case relates                    // related, both ways
+    case duplicates                 // this task is a duplicate of the other
+    case duplicatedBy = "duplicated_by"   // the other task is a duplicate of this one
+
+    public var display: String {
+        switch self {
+        case .blockedBy: return "Blocked by"
+        case .blocks: return "Blocks"
+        case .relates: return "Related"
+        case .duplicates: return "Duplicates"
+        case .duplicatedBy: return "Duplicated by"
+        }
+    }
+
+    /// True for the two kinds stored as dependencies.
+    public var isDependency: Bool { self == .blockedBy || self == .blocks }
+}
+
+/// The other end of a relation: enough to show and open it, across projects.
+public struct RelatedTask: Identifiable, Hashable, Sendable {
+    public let id: Int64
+    public let code: String
+    public let title: String
+    public let status: TaskStatus
+    public let projectId: Int64
+
+    public init(id: Int64, code: String, title: String, status: TaskStatus, projectId: Int64) {
+        self.id = id
+        self.code = code
+        self.title = title
+        self.status = status
+        self.projectId = projectId
+    }
+}
+
+/// Every relation of one task, grouped by kind (`Store.relatedTasks(taskId:)`), each group
+/// oldest task first. A kind with none has no entry.
+public struct RelatedTasks: Hashable, Sendable {
+    public var byKind: [RelationKind: [RelatedTask]] = [:]
+
+    public init() {}
+
+    public subscript(kind: RelationKind) -> [RelatedTask] { byKind[kind] ?? [] }
+    public var isEmpty: Bool { byKind.values.allSatisfy(\.isEmpty) }
+}
+
 /// One saved version of an agent guide (Store.saveGuide). `projectId` nil is the guide
 /// for every project. The newest version of a scope is its guide.
 public struct GuideVersion: Identifiable, Equatable, Sendable {
