@@ -12,13 +12,15 @@ import Foundation
 /// Adding a command: write a `CLICommand` and list it in `CLI.commands`. A command with
 /// subcommands (e.g. `hook session-start`, `hook pre-tool-use`) is one entry whose `run`
 /// switches on `args.positionals.first`; hook input arrives on stdin (`CLIContext.readStdin`).
-/// A command that writes opens the store with `CLIContext.withWritableStore`.
+/// A command that writes opens the store with `CLIContext.withWritableStore`; `import` opens
+/// the database it is given itself (a backup copy for a dry run, see ImportCommand).
 enum CLI {
     static let commands: [CLICommand] = [
         BriefCommand.command,
         ListCommand.command,
         ShowCommand.command,
         ExportCommand.command,
+        ImportCommand.command,
         HookCommand.command
     ]
 

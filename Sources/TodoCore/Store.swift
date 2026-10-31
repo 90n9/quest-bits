@@ -549,6 +549,23 @@ public final class Store: @unchecked Sendable {
         );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_gate_requests_call ON gate_requests(agent_session_id, input_hash);")
+
+        // --- Additive migration: import ledger (1.5.0) ---
+        // One row per source item `questbits import --apply` wrote, keyed by the item's stable
+        // source_key, so a rerun (or a rerun after a crash) skips what is already in. target
+        // names the row written ("task:12", "page:3"), fingerprint the source and intended
+        // write as reviewed, inverse (JSON) what undoing exactly that write would take.
+        exec("""
+        CREATE TABLE IF NOT EXISTS import_ledger (
+            source_key  TEXT PRIMARY KEY,
+            run_id      TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            target      TEXT NOT NULL,
+            fingerprint TEXT NOT NULL DEFAULT '',
+            inverse     TEXT NOT NULL DEFAULT '{}',
+            applied_at  REAL NOT NULL
+        );
+        """)
         pageSearchUsesFTS = migratePageSearchIndex()
 
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
@@ -5088,6 +5105,75 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let json = String(data: try JSONEncoder().encode(s), encoding: .utf8) ?? "{}"
         try runWrite("INSERT INTO settings (key, value) VALUES ('pomodoro', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;", [.text(json)])
+    }
+
+    // MARK: - Import ledger
+
+    private static let ledgerCols = "source_key, run_id, action, target, fingerprint, inverse, applied_at"
+
+    /// The importer's ledger rows, by source_key: every row, or only those for `keys`.
+    public func importLedger(keys: [String]? = nil) throws -> [String: ImportLedgerEntry] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [String: ImportLedgerEntry] = [:]
+        let read = { [self] (sql: String, binds: [SQLValue]) in
+            let stmt = try prepare(sql, binds)
+            defer { sqlite3_finalize(stmt) }
+            while true {
+                let rc = sqlite3_step(stmt)
+                if rc == SQLITE_DONE { break }
+                guard rc == SQLITE_ROW else { throw StoreError.step(errmsg()) }
+                let e = ImportLedgerEntry(sourceKey: colText(stmt, 0), runId: colText(stmt, 1), action: colText(stmt, 2),
+                                          target: colText(stmt, 3), fingerprint: colText(stmt, 4),
+                                          inverse: colText(stmt, 5),
+                                          appliedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6)))
+                out[e.sourceKey] = e
+            }
+        }
+        guard let keys else {
+            try read("SELECT \(Self.ledgerCols) FROM import_ledger;", [])
+            return out
+        }
+        let unique = Array(Set(keys))
+        for start in stride(from: 0, to: unique.count, by: 500) {
+            let chunk = Array(unique[start..<min(start + 500, unique.count)])
+            try read("SELECT \(Self.ledgerCols) FROM import_ledger WHERE source_key IN (\(Self.placeholders(chunk.count)));",
+                     chunk.map { .text($0) })
+        }
+        return out
+    }
+
+    /// Record a write the importer made through a repeat-safe call (addLink, ensureMilestone,
+    /// createPage with a provenance key, setProjectRepoPath...): after a crash between that
+    /// call and this row, the rerun repeats the call, which adds nothing, then records it.
+    /// Returns false when the key was already in the ledger (the row is left as it was).
+    @discardableResult
+    public func recordImport(_ e: ImportLedgerEntry) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        try runWrite("INSERT OR IGNORE INTO import_ledger (\(Self.ledgerCols)) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                     [.text(e.sourceKey), .text(e.runId), .text(e.action), .text(e.target), .text(e.fingerprint),
+                      .text(e.inverse), .double(e.appliedAt.timeIntervalSince1970)])
+        return sqlite3_changes(db) == 1
+    }
+
+    /// An imported note and its ledger row, in one BEGIN IMMEDIATE: a note is the one import
+    /// write that is not repeat-safe by itself, so the ledger is checked and written in the
+    /// same transaction. When `entry.sourceKey` is already in the ledger nothing is written
+    /// and the result is nil. The ledger row gets target "task:<id>" and the note id as its
+    /// inverse. The note is the agent's (author agent); where it came from belongs in `text`.
+    @discardableResult
+    public func addImportedNote(taskId: Int64, text: String, kind: NoteKind = .note, sessionId: String? = nil,
+                                entry: ImportLedgerEntry) throws -> TaskNote? {
+        let body = try Self.noteBody(text)
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            if queryInt("SELECT 1 FROM import_ledger WHERE source_key=?;", [.text(entry.sourceKey)]) != nil { return nil }
+            let note = try insertNoteUnlocked(taskId: taskId, text: body, kind: kind, author: .agent, sessionId: sessionId)
+            try runWrite("INSERT INTO import_ledger (\(Self.ledgerCols)) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                         [.text(entry.sourceKey), .text(entry.runId), .text(entry.action), .text("task:\(taskId)"),
+                          .text(entry.fingerprint), .text("{\"delete_note\":\(note.id)}"),
+                          .double(entry.appliedAt.timeIntervalSince1970)])
+            return note
+        }
     }
 }
 

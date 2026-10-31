@@ -563,6 +563,26 @@ public struct PageProvenance: Hashable, Sendable {
     public var isEmpty: Bool { self == PageProvenance() }
 }
 
+/// One row of the importer's ledger (`import_ledger`): a source item that
+/// `questbits import --apply` wrote. `sourceKey` is the item's stable identity, so a rerun
+/// skips it; `target` the row written ("task:12", "milestone:3"); `fingerprint` the source
+/// and intended write as reviewed; `inverse` (JSON) what undoing that write would take.
+public struct ImportLedgerEntry: Hashable, Sendable {
+    public var sourceKey: String
+    public var runId: String
+    public var action: String
+    public var target: String
+    public var fingerprint: String
+    public var inverse: String
+    public var appliedAt: Date
+
+    public init(sourceKey: String, runId: String, action: String, target: String = "",
+                fingerprint: String = "", inverse: String = "{}", appliedAt: Date = Date()) {
+        self.sourceKey = sourceKey; self.runId = runId; self.action = action; self.target = target
+        self.fingerprint = fingerprint; self.inverse = inverse; self.appliedAt = appliedAt
+    }
+}
+
 /// A wiki page of one project (`project_pages`): a decision or a note, markdown `body`.
 /// A decision also has `decidedOn` (yyyy-MM-dd) and `outcome` (what was decided; the body
 /// says why); notes have neither. `tasks` are the tasks it refers to, in any project.
