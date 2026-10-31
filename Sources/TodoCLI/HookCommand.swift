@@ -95,7 +95,7 @@ enum HookCommand {
                                  process: kind == .end ? nil : ClaudeProcess.host(),
                                  notificationType: kind == .notify ? field("notification_type") : nil,
                                  message: kind == .notify ? field("message") : nil)
-        let out = try ctx.withWritableStore { store -> String in
+        let out = try ctx.withWritableStore(ChangeOrigin(.hook, agentSessionId: sid)) { store -> String in
             let session = try store.recordSession(event)
             guard kind == .start, let session else { return "" }
             // Tidy up: sessions whose Claude Code process closed without a SessionEnd.

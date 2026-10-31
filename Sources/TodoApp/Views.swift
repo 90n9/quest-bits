@@ -21,6 +21,9 @@ struct ContentView: View {
                 } else if model.showInbox {
                     InboxListView()
                         .navigationSplitViewColumnWidth(min: 300, ideal: 380)
+                } else if model.showActivity {
+                    ActivityListView()
+                        .navigationSplitViewColumnWidth(min: 320, ideal: 400)
                 } else if model.showQuestions {
                     QuestionListView()
                         .navigationSplitViewColumnWidth(min: 260, ideal: 320)
@@ -45,6 +48,8 @@ struct ContentView: View {
                     ContentUnavailableViewCompat(text: "Find an archived project to open or unarchive it")
                 } else if model.showInbox {
                     InboxDetailView()
+                } else if model.showActivity {
+                    ActivityDetailView()
                 } else if model.showQuestions {
                     QuestionDetailView()
                 } else if model.showDashboard {
@@ -215,6 +220,17 @@ struct ProjectSidebar: View {
             .help("Questions, approvals, tasks and sessions waiting on you")
     }
 
+    /// "Activity": what was done, by you and your agents (ActivityListView).
+    private var activityRow: some View {
+        Label { Text("Activity") } icon: { QBIcon(name: "lucide-scroll") }
+            .font(Theme.Fonts.bodySmMedium)
+            .foregroundStyle(model.showActivity ? Theme.Colors.brandBlue : Theme.Colors.ink)
+            .contentShape(Rectangle())
+            .onTapGesture { model.selectActivity() }
+            .listRowBackground(sidebarRowCard(model.showActivity))
+            .help("What you and your agents did: changes, notes and wiki edits")
+    }
+
     private func inboxBadge(_ n: Int) -> some View {
         Text("\(n)")
             .font(Theme.Fonts.micro)
@@ -239,6 +255,7 @@ struct ProjectSidebar: View {
                         .onTapGesture { model.selectSmartView(v) }
                         .listRowBackground(sidebarRowCard(model.smartView == v))
                 }
+                activityRow
                 Label { Text("Dashboard") } icon: { QBIcon(name: "lucide-castle") }
                     .font(Theme.Fonts.bodySmMedium)
                     .foregroundStyle(model.showDashboard ? Theme.Colors.brandBlue : Theme.Colors.ink)
@@ -353,6 +370,7 @@ struct ProjectSidebar: View {
     /// True while the selected sidebar item is an archived project.
     private var selectedIsArchived: Bool {
         guard model.smartView == nil, !model.showDashboard, !model.showQuestions, !model.showArchived, !model.showInbox,
+              !model.showActivity,
               let sel = model.selectedProjectId else { return false }
         return model.archivedProjects.contains { $0.id == sel }
     }
@@ -392,13 +410,14 @@ struct ProjectSidebar: View {
         .tag(p.id)
         .listRowBackground(sidebarRowCard(
             model.smartView == nil && !model.showDashboard && !model.showQuestions && !model.showArchived
-                && !model.showInbox
+                && !model.showInbox && !model.showActivity
                 && model.selectedProjectId == p.id))
         .help(p.detail.isEmpty ? p.name : p.detail)
         .contextMenu {
             Button("Copy Code (\(p.code))") { model.copyCode(p.code) }
             Button("Edit…") { editing = p }
             Button("Edit Guide…") { guideProject = p }
+            Button("Show Activity") { model.selectActivity(projectId: p.id) }
             // No new tasks in an archived project (the store refuses them too).
             if !p.isArchived {
                 if model.templates.isEmpty {
@@ -2409,6 +2428,7 @@ struct HistoryRow: View {
         VStack(alignment: .leading, spacing: 1) {
             HStack {
                 Text(label).font(Theme.Fonts.captionBold).foregroundStyle(Theme.Colors.ink)
+                if let by { Text(by).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel).lineLimit(1) }
                 Spacer()
                 Text(fmtDateTime(event.timestamp)).font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
@@ -2427,18 +2447,18 @@ struct HistoryRow: View {
         return qbWaitingOnLabel(on)
     }
 
-    private var label: String {
-        switch event.field {
-        case "created": return "Created"
-        case "status": return "Status"
-        case "waiting on": return "Waiting on"
-        case "priority": return "Priority"
-        case "due date": return "Due date"
-        case "tags": return "Tags"
-        case "link": return "Link"
-        case "estimate": return "Estimate"
-        case "project": return "Moved project"
-        default: return event.field.capitalized
+    private var label: String { TaskEvent.label(forField: event.field) }
+
+    /// Who made the change, when recorded: "you" (the app) or "agent" (MCP, a hook), with
+    /// the agent's session label; nothing on older rows.
+    private var by: String? {
+        guard let source = event.source else { return nil }
+        switch source {
+        case .app: return "by you"
+        case .mcp, .hook:
+            let session = event.sessionLabel ?? event.agentSessionId.map { "session \($0.prefix(8))" }
+            return session.map { "by agent · \($0)" } ?? "by agent"
+        case .cli, .importer: return "by \(source.display)"
         }
     }
 }

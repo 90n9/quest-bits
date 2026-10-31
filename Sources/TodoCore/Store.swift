@@ -34,6 +34,23 @@ public final class Store: @unchecked Sendable {
     /// has no FTS5 (or trigram tokenizer), and it falls back to LIKE. Set at open.
     public private(set) var pageSearchUsesFTS = false
 
+    /// Where this store's writes come from, recorded with every task change, note and page
+    /// change (`ChangeOrigin`; the activity feed). Each binary sets it once it opens the
+    /// store; the MCP server sets it again per call, with the call's session. nil records
+    /// NULL (unknown). Read under `lock` by the writers.
+    public var origin: ChangeOrigin? {
+        get { lock.lock(); defer { lock.unlock() }; return _origin }
+        set { lock.lock(); _origin = newValue; lock.unlock() }
+    }
+    private var _origin: ChangeOrigin?
+
+    /// The origin's three columns as bound values (source, agent_session_id, session_label).
+    private var originBinds: [SQLValue] {
+        [_origin.map { .text($0.source.rawValue) } ?? .null,
+         _origin?.agentSessionId.map(SQLValue.text) ?? .null,
+         _origin?.sessionLabel.map(SQLValue.text) ?? .null]
+    }
+
     /// Images attached to task details: files in `attachments/` next to the database,
     /// referenced from the markdown as `attachments/<name>` (`Store.attachmentPrefix`).
     public var attachmentsURL: URL {
@@ -568,6 +585,22 @@ public final class Store: @unchecked Sendable {
             applied_at  REAL NOT NULL
         );
         """)
+
+        // --- Additive migration: where each change came from (1.5.0, the activity feed) ---
+        // source: ChangeSource raw value (app|mcp|cli|hook|import), NULL = unknown (rows from
+        // before, or written by an older binary). agent_session_id: the Claude Code session
+        // (agent_sessions.id) when known; session_label: the `session` label an agent passed
+        // (notes and page history already keep theirs in session_id). By-time indexes for
+        // the feed, which reads the newest rows across tasks.
+        for table in ["task_history", "task_notes", "page_history"] {
+            if !columnExists(table, "source") { exec("ALTER TABLE \(table) ADD COLUMN source TEXT;") }
+            if !columnExists(table, "agent_session_id") { exec("ALTER TABLE \(table) ADD COLUMN agent_session_id TEXT;") }
+        }
+        if !columnExists("task_history", "session_label") { exec("ALTER TABLE task_history ADD COLUMN session_label TEXT;") }
+        exec("CREATE INDEX IF NOT EXISTS idx_history_ts ON task_history(ts);")
+        exec("CREATE INDEX IF NOT EXISTS idx_notes_ts ON task_notes(ts);")
+        exec("CREATE INDEX IF NOT EXISTS idx_page_history_ts ON page_history(ts);")
+        exec("CREATE INDEX IF NOT EXISTS idx_notes_history ON task_notes(history_id) WHERE history_id IS NOT NULL;")
         pageSearchUsesFTS = migratePageSearchIndex()
 
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
@@ -1520,8 +1553,9 @@ public final class Store: @unchecked Sendable {
     private func logEvent(_ taskId: Int64, _ field: String, _ old: String, _ new: String) -> Int64? {
         do {
             try runWrite(
-                "INSERT INTO task_history (task_id, ts, field, old_value, new_value) VALUES (?, ?, ?, ?, ?);",
-                [.int(taskId), .int(Int64(Date().timeIntervalSince1970)), .text(field), .text(old), .text(new)]
+                "INSERT INTO task_history (task_id, ts, field, old_value, new_value, source, agent_session_id, session_label) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                [.int(taskId), .int(Int64(Date().timeIntervalSince1970)), .text(field), .text(old), .text(new)] + originBinds
             )
             return lastInsertId()
         } catch {
@@ -1531,7 +1565,8 @@ public final class Store: @unchecked Sendable {
 
     public func taskHistory(taskId: Int64) throws -> [TaskEvent] {
         lock.lock(); defer { lock.unlock() }
-        let stmt = try prepare("SELECT id, task_id, ts, field, old_value, new_value FROM task_history WHERE task_id=? ORDER BY ts DESC, id DESC;", [.int(taskId)])
+        let stmt = try prepare("SELECT id, task_id, ts, field, old_value, new_value, source, agent_session_id, session_label "
+                               + "FROM task_history WHERE task_id=? ORDER BY ts DESC, id DESC;", [.int(taskId)])
         defer { sqlite3_finalize(stmt) }
         var out: [TaskEvent] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -1541,8 +1576,70 @@ public final class Store: @unchecked Sendable {
                 timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
                 field: colText(stmt, 3),
                 oldValue: colText(stmt, 4),
-                newValue: colText(stmt, 5)
+                newValue: colText(stmt, 5),
+                source: colTextOpt(stmt, 6).flatMap(ChangeSource.init(rawValue:)),
+                agentSessionId: colTextOpt(stmt, 7),
+                sessionLabel: colTextOpt(stmt, 8)
             ))
+        }
+        return out
+    }
+
+    /// How many characters of a value or note text the activity feed reads.
+    public static let activityValueLimit = 300
+
+    /// The activity feed: task changes, notes and wiki page changes, newest first, at most
+    /// `limit` in all. `projectId` nil = every project not archived; `from`/`to` keep
+    /// entries with from <= ts < to. Each table is read newest first through its ts index
+    /// and cut to `limit` before the three are merged, so a long history stays fast.
+    public func activity(projectId: Int64? = nil, from: Date? = nil, to: Date? = nil,
+                         limit: Int = 300) throws -> [ActivityEvent] {
+        lock.lock(); defer { lock.unlock() }
+        let n = Self.activityValueLimit
+        let scope = projectId == nil ? "pr.archived_at IS NULL" : "pr.id = ?1"
+        // Unused when every project is read: ?1 stays bound to NULL.
+        func window(_ t: String) -> String { "\(t).ts >= ?2 AND \(t).ts < ?3" }
+        // Columns: kind, row id, ts, project id, project code, subject id, task code,
+        // title, page kind, field, old, new, source, agent session, label, author. A change
+        // with no source (from before 1.5.0) takes the author of the note written with it
+        // (a status change's note), when there is one.
+        let stmt = try prepare("""
+            SELECT * FROM (SELECT 'change', h.id, h.ts, pr.id, pr.code, t.id, t.code, t.title, NULL, h.field,
+                    substr(h.old_value, 1, \(n)), substr(h.new_value, 1, \(n)), h.source, h.agent_session_id,
+                    COALESCE(h.session_label, (SELECT session_id FROM task_notes WHERE history_id = h.id LIMIT 1)),
+                    (SELECT author FROM task_notes WHERE history_id = h.id LIMIT 1)
+                FROM task_history h JOIN tasks t ON t.id = h.task_id JOIN projects pr ON pr.id = t.project_id
+                WHERE \(scope) AND \(window("h")) ORDER BY h.ts DESC, h.id DESC LIMIT ?4)
+            UNION ALL SELECT * FROM (SELECT 'note', nt.id, nt.ts, pr.id, pr.code, t.id, t.code, t.title, NULL, nt.kind,
+                    '', substr(nt.text, 1, \(n)), nt.source, nt.agent_session_id, nt.session_id, nt.author
+                FROM task_notes nt JOIN tasks t ON t.id = nt.task_id JOIN projects pr ON pr.id = t.project_id
+                WHERE \(scope) AND \(window("nt")) ORDER BY nt.ts DESC, nt.id DESC LIMIT ?4)
+            UNION ALL SELECT * FROM (SELECT 'page', ph.id, ph.ts, pr.id, pr.code, pg.id, NULL, pg.title, pg.kind, ph.field,
+                    substr(ph.old_value, 1, \(n)), substr(ph.new_value, 1, \(n)), ph.source, ph.agent_session_id,
+                    ph.session_id, ph.author
+                FROM page_history ph JOIN project_pages pg ON pg.id = ph.page_id JOIN projects pr ON pr.id = pg.project_id
+                WHERE \(scope) AND \(window("ph")) ORDER BY ph.ts DESC, ph.id DESC LIMIT ?4)
+            ORDER BY 3 DESC, 1, 2 DESC LIMIT ?4;
+            """, [projectId.map(SQLValue.int) ?? .null,
+                  .double(from?.timeIntervalSince1970 ?? 0),
+                  .double(to?.timeIntervalSince1970 ?? Double(Int32.max) * 1000),
+                  .int(Int64(max(1, limit)))])
+        defer { sqlite3_finalize(stmt) }
+        var out: [ActivityEvent] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let kind = ActivityEvent.Kind(rawValue: colText(stmt, 0)) else { continue }
+            let subjectId = sqlite3_column_int64(stmt, 5)
+            let subject: ActivitySubject = kind == .page
+                ? .page(id: subjectId, title: colText(stmt, 7), kind: PageKind(rawValue: colText(stmt, 8)) ?? .note)
+                : .task(id: subjectId, code: colText(stmt, 6), title: colText(stmt, 7))
+            let source = colTextOpt(stmt, 12).flatMap(ChangeSource.init(rawValue:))
+            out.append(ActivityEvent(
+                kind: kind, rowId: sqlite3_column_int64(stmt, 1),
+                timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                projectId: sqlite3_column_int64(stmt, 3), projectCode: colText(stmt, 4), subject: subject,
+                field: colText(stmt, 9), oldValue: colText(stmt, 10), newValue: colText(stmt, 11), source: source,
+                actor: .of(source: source, author: colTextOpt(stmt, 15).flatMap(NoteAuthor.init(rawValue:)),
+                           sessionId: colTextOpt(stmt, 13), label: colTextOpt(stmt, 14))))
         }
         return out
     }
@@ -2786,11 +2883,12 @@ public final class Store: @unchecked Sendable {
         guard sqlite3_changes(db) == 1 else { throw StoreError.notFound("task \(taskId)") }
         let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
         try runWrite(
-            "INSERT INTO task_notes (task_id, ts, kind, text, author, session_id, history_id, question_id) "
-            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            "INSERT INTO task_notes (task_id, ts, kind, text, author, session_id, history_id, question_id, "
+            + "source, agent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
             [.int(taskId), .double(now.timeIntervalSince1970), .text(kind.rawValue), .text(text),
              .text(author.rawValue), session.map(SQLValue.text) ?? .null,
-             statusEventId.map(SQLValue.int) ?? .null, questionId.map(SQLValue.int) ?? .null])
+             statusEventId.map(SQLValue.int) ?? .null, questionId.map(SQLValue.int) ?? .null]
+                + originBinds.prefix(2))
         return TaskNote(id: lastInsertId(), taskId: taskId, timestamp: now, kind: kind, text: text,
                         author: author, sessionId: session, statusEventId: statusEventId, questionId: questionId)
     }
@@ -3425,10 +3523,10 @@ public final class Store: @unchecked Sendable {
 
     private func logPageEventUnlocked(_ pageId: Int64, _ field: String, _ old: String, _ new: String,
                                       author: NoteAuthor, sessionId: String?, ts: TimeInterval) throws {
-        try runWrite("INSERT INTO page_history (page_id, ts, field, old_value, new_value, author, session_id) "
-                     + "VALUES (?, ?, ?, ?, ?, ?, ?);",
+        try runWrite("INSERT INTO page_history (page_id, ts, field, old_value, new_value, author, session_id, "
+                     + "source, agent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                      [.int(pageId), .double(ts), .text(field), .text(old), .text(new), .text(author.rawValue),
-                      sessionId.map(SQLValue.text) ?? .null])
+                      sessionId.map(SQLValue.text) ?? .null] + originBinds.prefix(2))
     }
 
     private func readPages(_ sql: String, _ binds: [SQLValue]) throws -> [ProjectPage] {
@@ -4529,6 +4627,7 @@ public final class Store: @unchecked Sendable {
             }
             try runWrite("INSERT OR IGNORE INTO task_deps (task_id, depends_on_id) VALUES (?, ?);", [.int(taskId), .int(dependsOnId)])
             let created = sqlite3_changes(db) == 1
+            if created { logEvent(taskId, "blocked by", "", taskCodeUnlocked(dependsOnId)) }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return created
         } catch {
@@ -4545,7 +4644,14 @@ public final class Store: @unchecked Sendable {
     public func removeDependency(taskId: Int64, dependsOnId: Int64) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         try runWrite("DELETE FROM task_deps WHERE task_id=? AND depends_on_id=?;", [.int(taskId), .int(dependsOnId)])
-        return sqlite3_changes(db) == 1
+        guard sqlite3_changes(db) == 1 else { return false }
+        logEvent(taskId, "blocked by", taskCodeUnlocked(dependsOnId), "")
+        return true
+    }
+
+    /// A task's code for a history row, or "#id" when it is gone.
+    private func taskCodeUnlocked(_ id: Int64) -> String {
+        queryString("SELECT code FROM tasks WHERE id=?;", [.int(id)]) ?? "#\(id)"
     }
 
     // MARK: - Relations (blocks / blocked by / relates / duplicates)
@@ -4591,6 +4697,7 @@ public final class Store: @unchecked Sendable {
             try runWrite("INSERT OR IGNORE INTO task_relations (task_id, other_id, kind, created_at) VALUES (?, ?, ?, ?);",
                          [.int(row.task), .int(row.other), .text(row.kind), .double(Date().timeIntervalSince1970)])
             let created = sqlite3_changes(db) == 1
+            if created { logRelationUnlocked(row, added: true) }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return created
         } catch {
@@ -4612,7 +4719,17 @@ public final class Store: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         try runWrite("DELETE FROM task_relations WHERE task_id=? AND other_id=? AND kind=?;",
                      [.int(row.task), .int(row.other), .text(row.kind)])
-        return sqlite3_changes(db) == 1
+        guard sqlite3_changes(db) == 1 else { return false }
+        logRelationUnlocked(row, added: false)
+        return true
+    }
+
+    /// History for a relation added or removed, on the row's first task only (one row per
+    /// change): "relates to" / "duplicate of" with the other task's code as the value.
+    private func logRelationUnlocked(_ row: (task: Int64, other: Int64, kind: String), added: Bool) {
+        let field = row.kind == "relates" ? "relates to" : "duplicate of"
+        let other = taskCodeUnlocked(row.other)
+        logEvent(row.task, field, added ? "" : other, added ? other : "")
     }
 
     /// Every relation of `taskId`, both directions, in one query: its dependencies

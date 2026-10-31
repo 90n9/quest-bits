@@ -287,14 +287,23 @@ public struct TaskEvent: Identifiable, Codable, Hashable, Sendable {
     public var field: String          // "status", "priority", "created", …
     public var oldValue: String
     public var newValue: String
+    /// Where the change came from, and the agent's session (`ChangeOrigin`); nil on rows
+    /// from before 1.5.0 (unknown).
+    public var source: ChangeSource?
+    public var agentSessionId: String?
+    public var sessionLabel: String?
 
-    public init(id: Int64, taskId: Int64, timestamp: Date, field: String, oldValue: String, newValue: String) {
+    public init(id: Int64, taskId: Int64, timestamp: Date, field: String, oldValue: String, newValue: String,
+                source: ChangeSource? = nil, agentSessionId: String? = nil, sessionLabel: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.timestamp = timestamp
         self.field = field
         self.oldValue = oldValue
         self.newValue = newValue
+        self.source = source
+        self.agentSessionId = agentSessionId
+        self.sessionLabel = sessionLabel
     }
 }
 

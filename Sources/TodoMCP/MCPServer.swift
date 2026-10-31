@@ -37,6 +37,7 @@ final class MCPServer: @unchecked Sendable {
             FileHandle.standardError.write("todo-mcp: failed to open store: \(error)\n".data(using: .utf8)!)
             exit(1)
         }
+        store.origin = ChangeOrigin(.mcp)
     }
 
     func run() {
@@ -115,7 +116,10 @@ final class MCPServer: @unchecked Sendable {
     private func handleToolCall(id: Any?, params: [String: Any]) {
         let name = params["name"] as? String ?? ""
         let args = params["arguments"] as? [String: Any] ?? [:]
-        touchSession(args, .mcp)
+        // What this call writes is recorded as the agent's, with its session (the activity
+        // feed). Calls run one at a time here; the wait thread writes no history.
+        let sid = touchSession(args, .mcp)
+        store.origin = ChangeOrigin(.mcp, agentSessionId: sid, sessionLabel: (try? sessionArg(args)) ?? nil)
         do {
             let text = try invoke(tool: name, args: args)
             respondText(id: id, text)
@@ -706,7 +710,11 @@ final class MCPServer: @unchecked Sendable {
         case "get_task_history":
             let id = try resolveTaskId(args)
             let events = try store.taskHistory(taskId: id).map { e -> [String: Any] in
-                ["timestamp": iso(e.timestamp), "field": e.field, "old": e.oldValue, "new": e.newValue]
+                var d: [String: Any] = ["timestamp": iso(e.timestamp), "field": e.field, "old": e.oldValue, "new": e.newValue]
+                if let source = e.source { d["source"] = source.rawValue }
+                if let sid = e.agentSessionId { d["claude_session"] = sid }
+                if let label = e.sessionLabel { d["session"] = label }
+                return d
             }
             return try jsonString(events)
 

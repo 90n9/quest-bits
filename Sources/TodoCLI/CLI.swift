@@ -231,9 +231,12 @@ struct CLIContext: Sendable {
     }
 
     /// For commands that write (the hooks): the normal open, migrations included. Call it
-    /// only when `databaseExists`: it creates a missing database.
-    func withWritableStore<T>(_ body: (Store) throws -> T) throws -> T {
-        try body(try Store(url: dbURL))
+    /// only when `databaseExists`: it creates a missing database. What it writes is recorded
+    /// as from `origin` (a hook passes `.hook` with its Claude Code session).
+    func withWritableStore<T>(_ origin: ChangeOrigin = ChangeOrigin(.cli), _ body: (Store) throws -> T) throws -> T {
+        let store = try Store(url: dbURL)
+        store.origin = origin
+        return try body(store)
     }
 
     static func needsMigration(_ error: StoreError) -> Bool {

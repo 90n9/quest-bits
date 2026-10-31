@@ -80,6 +80,20 @@ final class AppModel: ObservableObject {
     /// terminal, open questions, tasks waiting on the user); the detail acts on the selection.
     @Published var showInbox = false
     @Published var inboxSelection: InboxItemID?
+    /// Activity page: the content column lists what was done (task changes, notes, wiki
+    /// edits), newest first, a row per run of one actor's entries on one task or page; the
+    /// detail column shows the selected row's entries. Filters: project, day, who.
+    @Published var showActivity = false
+    @Published var activityProjectId: Int64? { didSet { if activityProjectId != oldValue { reloadActivity(resetLimit: true) } } }
+    @Published var activityDay: ActivityDay = .any { didSet { if activityDay != oldValue { reloadActivity(resetLimit: true) } } }
+    @Published var activityWho: ActivityWho = .everyone { didSet { if activityWho != oldValue { regroupActivity() } } }
+    @Published private(set) var activityGroups: [ActivityGroup] = []
+    /// Whether older entries than those read may exist (the read hit its limit).
+    @Published private(set) var activityHasMore = false
+    @Published var activitySelection: ActivityGroup.ID?
+    private var activityEvents: [ActivityEvent] = []
+    private var activityLimit = AppModel.activityPage
+    static let activityPage = 300
     /// What waits on the user now, refreshed with the questions (so with every poll) and
     /// republished only when it changed. `waitingOnYou.count` is the one count of it: the
     /// sidebar badge, and what the menu bar and notifications show.
@@ -111,7 +125,8 @@ final class AppModel: ObservableObject {
     /// The project page is shown (not a smart view, the dashboard or the Questions page),
     /// so its tabs are.
     var selectedProject: Project? {
-        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, !showInbox, let id = selectedProjectId else { return nil }
+        guard smartView == nil, !showDashboard, !showQuestions, !showArchived, !showInbox, !showActivity,
+              let id = selectedProjectId else { return nil }
         return projects.first { $0.id == id }
     }
 
@@ -171,6 +186,7 @@ final class AppModel: ObservableObject {
     init() {
         // App + MCP share the default DB location.
         let store = (try? Store()) ?? { fatalError("cannot open store") }()
+        store.origin = ChangeOrigin(.app)   // every change made here is the user's
         self.store = store
         self.settings = (try? store.loadSettings()) ?? .standard
         reloadAll()
@@ -190,6 +206,7 @@ final class AppModel: ObservableObject {
         }
         reloadTasks()
         if showDashboard { reloadDashboard() }
+        if showActivity { reloadActivity() }
         reloadWiki()
     }
 
@@ -307,6 +324,7 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showArchived = false
         showInbox = false
+        showActivity = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -319,6 +337,7 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showArchived = false
         showInbox = false
+        showActivity = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
@@ -331,6 +350,7 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showArchived = false
         showInbox = false
+        showActivity = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -343,6 +363,7 @@ final class AppModel: ObservableObject {
         showDashboard = false
         showArchived = false
         showInbox = false
+        showActivity = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -353,6 +374,7 @@ final class AppModel: ObservableObject {
 
     func selectInbox() {
         showInbox = true
+        showActivity = false
         showQuestions = false
         showDashboard = false
         showArchived = false
@@ -363,6 +385,62 @@ final class AppModel: ObservableObject {
         inboxSelection = nil
         reloadQuestions()
         inboxSelection = inboxItems.first
+    }
+
+    /// Show the Activity page, for one project or (nil) every project not archived.
+    func selectActivity(projectId: Int64? = nil) {
+        showActivity = true
+        showInbox = false
+        showQuestions = false
+        showDashboard = false
+        showArchived = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        activitySelection = nil
+        if activityProjectId != projectId { activityProjectId = projectId } else { reloadActivity(resetLimit: true) }
+    }
+
+    /// Reread the feed with the filters (on every DB change while the page shows). The
+    /// selection stays while its row is there, else moves to the newest row.
+    func reloadActivity(resetLimit: Bool = false) {
+        guard showActivity else { return }
+        if resetLimit { activityLimit = Self.activityPage }
+        let range = activityDay.range()
+        guard let events = try? store.activity(projectId: activityProjectId, from: range?.from, to: range?.to,
+                                               limit: activityLimit) else { return }
+        activityHasMore = events.count >= activityLimit
+        activityEvents = events
+        regroupActivity()
+    }
+
+    /// Older entries: read a page more.
+    func loadMoreActivity() {
+        activityLimit += Self.activityPage
+        reloadActivity()
+    }
+
+    private func regroupActivity() {
+        let groups = ActivityGroup.group(activityEvents.filter(activityWho.matches))
+        if groups != activityGroups { activityGroups = groups }
+        if activitySelection.map({ id in !groups.contains { $0.id == id } }) ?? true {
+            activitySelection = groups.first?.id
+        }
+    }
+
+    /// Open what a feed row is about: its task, or its page on the project's Wiki tab.
+    func openActivity(_ group: ActivityGroup) {
+        switch group.subject {
+        case .task(let id, _, _):
+            // Its project's list first: `tasks` still holds the list shown before this page.
+            selectProject(group.projectId)
+            openTask(id)
+        case .page(let id, _, _):
+            selectProject(group.projectId)
+            selectProjectTab(.wiki)
+            wikiSelection = .page(id)
+        }
     }
 
     /// Open what an inbox item is about: a question's or a task's task, a session's project.
@@ -427,6 +505,7 @@ final class AppModel: ObservableObject {
         showQuestions = false
         showDashboard = false
         showInbox = false
+        showActivity = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []

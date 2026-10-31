@@ -121,6 +121,7 @@ enum ImportCommand {
             let copy = outDir.appendingPathComponent("rehearsal-after.sqlite")
             try ImportSources.backup(dbURL, to: copy)
             let store = try Store(url: copy)
+            store.origin = ChangeOrigin(.importer, sessionLabel: config.session)
             let items = try plan(store)
             try write("plan.json", try Fmt.json(planJSON(items)))
             // Rehearsal on the copy: apply everything planned, then plan and apply again.
@@ -162,6 +163,7 @@ enum ImportCommand {
             let backup = outDir.appendingPathComponent("backup-before-apply-\(stamp).sqlite")
             try ImportSources.backup(dbURL, to: backup)
             let store = try Store(url: dbURL)
+            store.origin = ChangeOrigin(.importer, sessionLabel: config.session)
             let items = try plan(store)
             let results = ImportApplier(store: store, runId: "apply-\(stamp)", session: config.session, reviewed: reviewed)
                 .apply(items)

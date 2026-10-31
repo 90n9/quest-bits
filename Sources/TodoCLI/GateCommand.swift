@@ -48,7 +48,7 @@ enum GateCommand {
               attention.at <= at
         else { return }
         do {
-            _ = try ctx.withWritableStore { try $0.clearSessionAttention(id: sid, at: at) }
+            _ = try ctx.withWritableStore(ChangeOrigin(.hook, agentSessionId: sid)) { try $0.clearSessionAttention(id: sid, at: at) }
         } catch {
             debug("the session's attention could not be cleared")
         }
@@ -120,7 +120,7 @@ enum GateCommand {
             context: context(tool: tool, input: toolInput, cwd: cwd, project: project, rule: rule,
                              detail: detail, session: sid))
         do {
-            let outcome = try ctx.withWritableStore { try $0.gateRequest(record) }
+            let outcome = try ctx.withWritableStore(ChangeOrigin(.hook, agentSessionId: sid)) { try $0.gateRequest(record) }
             return decision(outcome, rule: rule, detail: detail, session: sid)
         } catch {
             debug("the gate request could not be written")

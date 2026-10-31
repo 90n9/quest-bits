@@ -243,7 +243,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "reason": str, "session": sessionStr], required: ["id"])],
 
             ["name": "get_task_history",
-             "description": "Get the change history (status changes, etc.) for a task by `id` or `code`, newest first.",
+             "description": "Get the change history (status changes, links, claims, dependencies and relations, etc.) for a task by `id` or `code`, newest first: [{timestamp, field, old, new, source?, claude_session?, session?}]. `source` is where the change came from (app = the user in QuestBits, mcp = an agent, hook, cli, import), absent on changes from before 1.5.0; `claude_session` the agent's Claude Code session id and `session` its label, when known.",
              "inputSchema": obj(["id": int, "code": str])],
 
             ["name": "add_dependency",
