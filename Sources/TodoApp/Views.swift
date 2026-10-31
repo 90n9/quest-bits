@@ -2252,7 +2252,7 @@ struct TaskDetailView: View {
         if noteDraftTaskId != t.id {
             noteText = ""; noteKind = .note; noteDraftTaskId = t.id
             newLink = ""; newLinkKind = nil
-            relationQuery = ""; dropOffer = nil
+            relationQuery = ""; relationKind = .relates; dropOffer = nil
         }
         title = t.title; detail = t.detail; branch = t.branch ?? ""; status = t.status
         waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
