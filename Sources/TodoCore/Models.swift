@@ -106,7 +106,10 @@ public struct Project: Identifiable, Codable, Hashable, Sendable {
 }
 
 /// A task belongs to a project. `detail` holds the task's spec (progress goes in
-/// `TaskNote`s, appended without rewriting the task); `link` an optional URL.
+/// `TaskNote`s, appended without rewriting the task). `link` is the URL of its primary
+/// `TaskLink`, the first that is not a branch (the legacy single link, kept in step by
+/// the store); `branch` the git
+/// branch the work is on now, nil when none.
 public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var id: Int64
     public var code: String          // short human handle, e.g. "GEN-3"
@@ -130,6 +133,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var createdAt: Date
     public var updatedAt: Date
     public var sortOrder: Int
+    public var branch: String?
 
     public init(
         id: Int64,
@@ -153,7 +157,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         parentId: Int64? = nil,
         createdAt: Date,
         updatedAt: Date,
-        sortOrder: Int
+        sortOrder: Int,
+        branch: String? = nil
     ) {
         self.id = id
         self.code = code
@@ -177,6 +182,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.sortOrder = sortOrder
+        self.branch = branch
     }
 }
 
@@ -304,6 +310,74 @@ public enum NoteAuthor: String, Codable, CaseIterable, Sendable {
     case user, agent
 
     public var display: String { self == .user ? "You" : "Agent" }
+}
+
+/// What a task link points at. Persisted as the raw value; `task_links.kind` has no
+/// CHECK, so a new kind needs no table rebuild (the store validates it).
+public enum LinkKind: String, Codable, CaseIterable, Sendable {
+    case pr        // a pull / merge request
+    case design    // a design or artifact (Figma, claude.ai artifact)
+    case doc       // a document on the web (Google Docs, Notion, Confluence)
+    case file      // a local file or folder
+    case branch    // a git branch name: an earlier or extra branch (the working one is TodoTask.branch)
+    case other
+
+    public var display: String {
+        switch self {
+        case .pr: return "Pull request"
+        case .design: return "Design"
+        case .doc: return "Doc"
+        case .file: return "File"
+        case .branch: return "Branch"
+        case .other: return "Link"
+        }
+    }
+
+    /// The kind a link gets when none is given, guessed from its text. `branch` is never
+    /// guessed: a bare "feat/x" reads as `other` unless the caller says so.
+    public static func infer(from url: String) -> LinkKind {
+        let s = url.lowercased()
+        if (s.contains("github.com/") && s.contains("/pull/"))
+            || s.contains("/merge_requests/") || (s.contains("bitbucket.org/") && s.contains("/pull-requests/")) {
+            return .pr
+        }
+        if s.contains("claude.ai/artifact") || s.contains("claude.ai/code/artifact") || s.contains("figma.com/") {
+            return .design
+        }
+        if s.contains("docs.google.com/") || s.contains("notion.so") || s.contains("notion.site")
+            || s.contains("atlassian.net/wiki") || s.contains("confluence") {
+            return .doc
+        }
+        if s.hasPrefix("/") || s.hasPrefix("~/") || s.hasPrefix("file://") { return .file }
+        return .other
+    }
+}
+
+/// One of a task's links (`task_links`), oldest first: the first that is not a branch is
+/// its primary link, the legacy single `link`. A URL is stored once per task; the same URL may sit on many tasks (one
+/// PR covering several). `author` is nil on links carried over from the legacy column;
+/// `source` is free-form provenance (e.g. an importer's source key), nil when not given.
+public struct TaskLink: Identifiable, Codable, Hashable, Sendable {
+    public let id: Int64
+    public let taskId: Int64
+    public var kind: LinkKind
+    public var url: String
+    public var title: String?
+    public var author: NoteAuthor?
+    public var source: String?
+    public var createdAt: Date
+
+    public init(id: Int64, taskId: Int64, kind: LinkKind, url: String, title: String? = nil,
+                author: NoteAuthor? = nil, source: String? = nil, createdAt: Date) {
+        self.id = id
+        self.taskId = taskId
+        self.kind = kind
+        self.url = url
+        self.title = title
+        self.author = author
+        self.source = source
+        self.createdAt = createdAt
+    }
 }
 
 /// One saved version of an agent guide (Store.saveGuide). `projectId` nil is the guide

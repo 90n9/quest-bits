@@ -124,6 +124,8 @@ final class AppModel: ObservableObject {
     // and every question asked on it (by id, for the question notes).
     @Published private(set) var selectedTaskEvents: [TaskEvent] = []
     @Published private(set) var selectedTaskQuestions: [Int64: Question] = [:]
+    // The selected task's links, oldest first (loaded with its notes).
+    @Published private(set) var selectedTaskLinks: [TaskLink] = []
     private var notesTaskId: Int64?
     private var notesLimit = AppModel.notesPage
     static let notesPage = 20
@@ -407,6 +409,7 @@ final class AppModel: ObservableObject {
             if hasOlderNotes { hasOlderNotes = false }
             if !selectedTaskEvents.isEmpty { selectedTaskEvents = [] }
             if !selectedTaskQuestions.isEmpty { selectedTaskQuestions = [:] }
+            if !selectedTaskLinks.isEmpty { selectedTaskLinks = [] }
             return
         }
         do {
@@ -414,11 +417,13 @@ final class AppModel: ObservableObject {
             let events = try store.taskHistory(taskId: id)
             let questions = Dictionary(uniqueKeysWithValues: try store.questions(
                 statuses: QuestionStatus.allCases, taskId: id).map { ($0.id, $0) })
+            let links = try store.links(taskId: id)
             let page = Array(rows.prefix(notesLimit)), older = rows.count > notesLimit
             if page != selectedTaskNotes { selectedTaskNotes = page }
             if older != hasOlderNotes { hasOlderNotes = older }
             if events != selectedTaskEvents { selectedTaskEvents = events }
             if questions != selectedTaskQuestions { selectedTaskQuestions = questions }
+            if links != selectedTaskLinks { selectedTaskLinks = links }
             notesErrorShown = nil
         } catch {
             if switched {
@@ -426,6 +431,7 @@ final class AppModel: ObservableObject {
                 if hasOlderNotes { hasOlderNotes = false }
                 if !selectedTaskEvents.isEmpty { selectedTaskEvents = [] }
                 if !selectedTaskQuestions.isEmpty { selectedTaskQuestions = [:] }
+                if !selectedTaskLinks.isEmpty { selectedTaskLinks = [] }
             }
             let message = "\(error)"
             guard notesErrorShown?.taskId != id || notesErrorShown?.error != message else { return }
@@ -669,12 +675,13 @@ final class AppModel: ObservableObject {
     func updateTask(_ task: TodoTask, title: String? = nil, detail: String? = nil, link: String?? = nil,
                     status: TaskStatus? = nil, priority: Priority? = nil, dueDate: Date?? = nil, tags: [String]? = nil,
                     recurrence: String?? = nil, estimateSeconds: Int? = nil,
-                    waitingOn: WaitingOn? = nil, waitingReason: String?? = nil) {
+                    waitingOn: WaitingOn? = nil, waitingReason: String?? = nil, branch: String?? = nil) {
         let on = status == .waiting ? (waitingOn ?? task.waitingOn ?? .user) : waitingOn
         do {
             try store.updateTask(id: task.id, title: title, detail: detail, link: link, status: status,
                                  priority: priority, dueDate: dueDate, tags: tags, recurrence: recurrence,
-                                 estimateSeconds: estimateSeconds, waitingOn: on, waitingReason: waitingReason)
+                                 estimateSeconds: estimateSeconds, waitingOn: on, waitingReason: waitingReason,
+                                 branch: branch, author: .user)
         } catch {
             flashToast("Couldn't save \(task.code): \(error)")
         }
@@ -842,6 +849,66 @@ final class AppModel: ObservableObject {
     func removeDependency(_ taskId: Int64, dependsOn depId: Int64) {
         try? store.removeDependency(taskId: taskId, dependsOnId: depId)
         reloadTasks()
+    }
+
+    // MARK: - Links
+
+    /// Add a link to a task as the user; `kind` nil lets the store guess it. A URL the
+    /// task already has is not added twice (a toast says so). Returns false (with a
+    /// toast) if the store rejected it.
+    @discardableResult
+    func addLink(_ task: TodoTask, url: String, kind: LinkKind?) -> Bool {
+        do {
+            let added = try store.addLink(taskId: task.id, url: url, kind: kind, author: .user)
+            if !added.created { flashToast("\(task.code) already has this link") }
+        } catch {
+            flashToast("Couldn't add the link: \(error)")
+            return false
+        }
+        reloadTasks()
+        return true
+    }
+
+    /// Change what a link is marked as (the store's add-again path updates the kind).
+    func setLinkKind(_ link: TaskLink, _ kind: LinkKind) {
+        do {
+            try store.addLink(taskId: link.taskId, url: link.url, kind: kind, author: .user)
+        } catch {
+            flashToast("Couldn't change the link: \(error)")
+        }
+        reloadTasks()
+    }
+
+    func removeLink(_ link: TaskLink) {
+        do {
+            try store.removeLink(id: link.id)
+        } catch {
+            flashToast("Couldn't remove the link: \(error)")
+        }
+        reloadTasks()
+    }
+
+    /// Open a link: a web or mail URL in its app; a file path is shown in Finder (never
+    /// opened: an agent may have written it). Anything else — a branch name, a custom
+    /// scheme — is copied to the clipboard instead.
+    func openLink(_ link: TaskLink) {
+        let s = link.url
+        if link.kind != .branch, let url = URL(string: s), let scheme = url.scheme?.lowercased(),
+           ["http", "https", "mailto"].contains(scheme) {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        if link.kind != .branch, s.hasPrefix("/") || s.hasPrefix("~/") || s.lowercased().hasPrefix("file://") {
+            let path = s.lowercased().hasPrefix("file://") ? (URL(string: s)?.path ?? "") : (s as NSString).expandingTildeInPath
+            if !path.isEmpty, FileManager.default.fileExists(atPath: path) {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                return
+            }
+            flashToast("Not found: \(s)")
+            return
+        }
+        copyToClipboard(s)
+        flashToast("Copied \(s)")
     }
 
     // MARK: - Command actions (keyboard shortcuts)

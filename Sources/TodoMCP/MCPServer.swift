@@ -448,7 +448,9 @@ final class MCPServer: @unchecked Sendable {
                 tags: parseTags(args["tags"]) ?? [],
                 recurrence: args["recurrence"] as? String,
                 parentId: parentId,
-                estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60
+                estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60,
+                branch: try optionalStringArg(args, "branch") ?? nil,
+                author: .agent
             )
             return try jsonString(taskDict(task))
 
@@ -499,6 +501,8 @@ final class MCPServer: @unchecked Sendable {
                 waitingOn: try parseWaitingOn(args["waiting_on"]),
                 waitingReason: try waitingReasonArg(args),
                 parentId: parent,
+                branch: try optionalStringArg(args, "branch"),
+                author: .agent,
                 note: note
             )
             return try jsonString(taskDict(store.getTask(id: id)))
@@ -586,6 +590,36 @@ final class MCPServer: @unchecked Sendable {
             let dep = try resolveTaskId(args, idKey: "depends_on_id", codeKey: "depends_on_code")
             try store.removeDependency(taskId: tid, dependsOnId: dep)
             return try jsonString(taskDict(store.getTask(id: tid)))
+
+        case "add_link":
+            // Always the agent, as for notes; the app adds links as the user.
+            guard let url = args["url"] as? String else { throw MCPError.missingArg("url") }
+            let tid = try resolveTaskId(args)
+            var kind: LinkKind?
+            if given(args, "kind") {
+                guard let s = args["kind"] as? String, let k = LinkKind(rawValue: s) else {
+                    throw MCPError.invalidArg("kind must be one of \(LinkKind.allCases.map(\.rawValue).joined(separator: ", "))")
+                }
+                kind = k
+            }
+            let added = try store.addLink(taskId: tid, url: url, kind: kind,
+                                          title: try optionalStringArg(args, "title") ?? nil, author: .agent,
+                                          source: try optionalStringArg(args, "source") ?? nil)
+            return try jsonString(["task": try store.getTask(id: tid).code, "link": linkDict(added.link),
+                                   "created": added.created] as [String: Any])
+
+        case "remove_link":
+            let removed: TaskLink
+            if given(args, "link_id") {
+                guard !given(args, "url") else { throw MCPError.invalidArg("give url (with the task) or link_id, not both") }
+                // A task given as well must be the link's own (checked before anything is removed).
+                removed = try store.removeLink(id: try requireInt(args, "link_id"),
+                                               taskId: given(args, "id", "code") ? try resolveTaskId(args) : nil)
+            } else {
+                guard let url = args["url"] as? String else { throw MCPError.missingArg("url or link_id") }
+                removed = try store.removeLink(taskId: try resolveTaskId(args), url: url)
+            }
+            return try jsonString(["task": try store.getTask(id: removed.taskId).code, "removed": linkDict(removed)] as [String: Any])
 
         case "list_templates":
             return try jsonString(store.listTemplates().map(templateDict))
@@ -705,7 +739,8 @@ final class MCPServer: @unchecked Sendable {
     /// read degrades the output (numeric `parent_id`, no deps) instead of failing the call.
     private func taskDicts(_ tasks: [TodoTask]) -> [[String: Any]] {
         let rel = (try? store.taskRelations(for: tasks)) ?? TaskRelations()
-        return tasks.map { taskDict($0, rel) }
+        let links = (try? store.links(taskIds: tasks.map(\.id))) ?? [:]
+        return tasks.map { taskDict($0, rel, links: links[$0.id]) }
     }
 
     /// The serializer for read-only tools (list_tasks, get_task): nothing was written, so
@@ -714,7 +749,9 @@ final class MCPServer: @unchecked Sendable {
     /// view — only what an agent needs to pick a task; get_task has the rest.
     private func readTaskDicts(_ tasks: [TodoTask], compact: Bool = false) throws -> [[String: Any]] {
         let rel = try store.taskRelations(for: tasks)
-        return tasks.map { compact ? compactTaskDict($0, rel) : taskDict($0, rel) }
+        if compact { return tasks.map { compactTaskDict($0, rel) } }
+        let links = try store.links(taskIds: tasks.map(\.id))
+        return tasks.map { taskDict($0, rel, links: links[$0.id]) }
     }
 
     /// How output refers to another task: its code, or its numeric id if it has no code.
@@ -727,7 +764,7 @@ final class MCPServer: @unchecked Sendable {
         taskDicts([t])[0]
     }
 
-    private func taskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
+    private func taskDict(_ t: TodoTask, _ rel: TaskRelations, links: [TaskLink]? = nil) -> [String: Any] {
         var d: [String: Any] = [
             "id": t.id,
             "code": t.code,
@@ -742,6 +779,8 @@ final class MCPServer: @unchecked Sendable {
         if let since = t.waitingSince { d["waiting_since"] = iso(since) }
         if !t.detail.isEmpty { d["detail"] = t.detail }
         if let link = t.link, !link.isEmpty { d["link"] = link }
+        if let links, !links.isEmpty { d["links"] = links.map(linkDict) }
+        if let branch = t.branch { d["branch"] = branch }
         if t.priority != Priority.none { d["priority"] = t.priority.rawValue }
         if let due = t.dueDate { d["due_date"] = iso(due) }
         if !t.tags.isEmpty { d["tags"] = t.tags }
@@ -762,7 +801,8 @@ final class MCPServer: @unchecked Sendable {
     }
 
     /// The compact list shape: code, title, status, plus priority, parent, blocked_by
-    /// (the open dependencies blocking it), tags, due_date and waiting_on only when set.
+    /// (the open dependencies blocking it), tags, due_date, waiting_on and branch only
+    /// when set. No links (get_task has them).
     /// No detail or timestamps; ids only where a task has no code (`taskHandle`).
     private func compactTaskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
         var d: [String: Any] = ["code": t.code, "title": t.title, "status": t.status.rawValue]
@@ -778,6 +818,17 @@ final class MCPServer: @unchecked Sendable {
         if !t.tags.isEmpty { d["tags"] = t.tags }
         if let due = t.dueDate { d["due_date"] = iso(due) }
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
+        if let branch = t.branch { d["branch"] = branch }
+        return d
+    }
+
+    /// A task link as get_task, add_link and remove_link return it: title, author and
+    /// source only when known.
+    private func linkDict(_ l: TaskLink) -> [String: Any] {
+        var d: [String: Any] = ["id": l.id, "kind": l.kind.rawValue, "url": l.url, "created_at": iso(l.createdAt)]
+        if let title = l.title { d["title"] = title }
+        if let author = l.author { d["author"] = author.rawValue }
+        if let source = l.source { d["source"] = source }
         return d
     }
 
@@ -1183,6 +1234,16 @@ final class MCPServer: @unchecked Sendable {
         guard let v = args["waiting_reason"] else { return .none }
         if v is NSNull { return .some(nil) }
         guard let s = v as? String else { throw MCPError.invalidArg("waiting_reason must be a string or null") }
+        return .some(s)
+    }
+
+    /// An optional string argument, double-optional: absent = .none (leave alone),
+    /// null = .some(nil) (clear), a string = itself. Any other value is rejected rather
+    /// than read as a clear.
+    private func optionalStringArg(_ args: [String: Any], _ key: String) throws -> String?? {
+        guard let v = args[key] else { return .none }
+        if v is NSNull { return .some(nil) }
+        guard let s = v as? String else { throw MCPError.invalidArg("\(key) must be a string or null") }
         return .some(s)
     }
 

@@ -1182,6 +1182,7 @@ struct TaskRow: View {
                         if task.link != nil && !(task.link?.isEmpty ?? true) {
                             Image(systemName: "link").font(.caption2).foregroundStyle(Theme.Colors.steel)
                         }
+                        if let branch = task.branch { BranchChip(name: branch) }
                         if task.effortSeconds > 0 {
                             Label(fmtEffort(task.effortSeconds), systemImage: "hourglass")
                                 .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
@@ -1594,7 +1595,7 @@ struct TaskDetailView: View {
 
     @State private var title = ""
     @State private var detail = ""
-    @State private var link = ""
+    @State private var branch = ""
     @State private var status: TaskStatus = .todo
     @State private var waitingOn: WaitingOn = .user   // used only while status is Waiting
     @State private var waitingReason = ""
@@ -1613,6 +1614,9 @@ struct TaskDetailView: View {
     @State private var noteText = ""
     @State private var noteKind: NoteKind = .note
     @State private var noteDraftTaskId: Int64?
+    // Draft link (not a task field either), cleared with the draft note.
+    @State private var newLink = ""
+    @State private var newLinkKind: LinkKind?   // nil = let the store guess
     @AppStorage("qbTimelineFilter") private var timelineFilter: TimelineFilter = .all
     @State private var detailHeight: CGFloat = 120   // the Detail editor's content height
 
@@ -1652,7 +1656,11 @@ struct TaskDetailView: View {
         let text = content
             .onChange(of: title) { _, _ in autosave() }
             .onChange(of: detail) { _, _ in autosave() }
-            .onChange(of: link) { _, _ in autosave() }
+            .onChange(of: branch) { _, v in
+                // A branch name has no spaces: drop them as typed rather than fail the save.
+                let name = v.filter { !$0.isWhitespace }
+                if name != v { branch = name } else { autosave() }
+            }
             .onChange(of: waitingOn) { _, _ in autosave() }
             .onChange(of: waitingReason) { _, _ in autosave() }
         return text
@@ -1713,7 +1721,7 @@ struct TaskDetailView: View {
                 dueDateSection
                 tagsSection
                 blockedSection(task)
-                linkSection
+                linksSection(task)
                 detailSection(task)
                 timelineSection(task)
                 estimateSection(task)
@@ -1845,14 +1853,49 @@ struct TaskDetailView: View {
         }
     }
 
-    private var linkSection: some View {
-        QBDetailSection("Link") {
-            HStack {
-                TextField("https://…", text: $link).qbField()
-                if let url = URL(string: link), !link.isEmpty {
-                    Link(destination: url) { Image(systemName: "arrow.up.right.square") }
+    /// The working branch (mono, edited in place like the other fields) and the task's
+    /// links, oldest first, with a row to add one.
+    private func linksSection(_ task: TodoTask) -> some View {
+        QBDetailSection("Links") {
+            labeledRow("Branch") {
+                TextField("none", text: $branch)
+                    .font(Theme.Fonts.codeBadge)
+                    .qbField()
+                    .frame(maxWidth: 280)
+                if !branch.isEmpty {
+                    Button { model.copyCode(branch) } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Theme.Colors.steel)
+                        .help("Copy branch name")
                 }
             }
+            ForEach(model.selectedTaskLinks) { LinkRow(link: $0) }
+            addLinkRow(task)
+        }
+    }
+
+    private func addLinkRow(_ task: TodoTask) -> some View {
+        HStack(spacing: 8) {
+            TextField("Add a link: PR, design, doc, file…", text: $newLink)
+                .qbField()
+                .onSubmit { commitLink(task) }
+            Picker("", selection: $newLinkKind) {
+                Text("Auto").tag(LinkKind?.none)
+                ForEach(LinkKind.allCases, id: \.self) { Text($0.display).tag(LinkKind?.some($0)) }
+            }
+            .labelsHidden()
+            .fixedSize()
+            Button("Add") { commitLink(task) }
+                .buttonStyle(QBPrimaryButtonStyle(compact: true))
+                .disabled(newLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private func commitLink(_ task: TodoTask) {
+        guard !newLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if model.addLink(task, url: newLink, kind: newLinkKind) {
+            newLink = ""
+            newLinkKind = nil
         }
     }
 
@@ -1989,7 +2032,7 @@ struct TaskDetailView: View {
     // Per-field edits: the editor value differs from `t` (the snapshot, see `base`).
     private func titleEdited(_ t: TodoTask) -> Bool { title != t.title }
     private func detailEdited(_ t: TodoTask) -> Bool { detail != t.detail }
-    private func linkEdited(_ t: TodoTask) -> Bool { link != (t.link ?? "") }
+    private func branchEdited(_ t: TodoTask) -> Bool { branch != (t.branch ?? "") }
     private func statusEdited(_ t: TodoTask) -> Bool { status != t.status }
     private func priorityEdited(_ t: TodoTask) -> Bool { priority != t.priority }
     private func dueEdited(_ t: TodoTask) -> Bool {
@@ -2016,8 +2059,11 @@ struct TaskDetailView: View {
     /// Fill every editor field from `t` and make it the snapshot.
     private func load(_ t: TodoTask) {
         base = t
-        if noteDraftTaskId != t.id { noteText = ""; noteKind = .note; noteDraftTaskId = t.id }
-        title = t.title; detail = t.detail; link = t.link ?? ""; status = t.status
+        if noteDraftTaskId != t.id {
+            noteText = ""; noteKind = .note; noteDraftTaskId = t.id
+            newLink = ""; newLinkKind = nil
+        }
+        title = t.title; detail = t.detail; branch = t.branch ?? ""; status = t.status
         waitingOn = t.waitingOn ?? .user; waitingReason = t.waitingReason ?? ""
         priority = t.priority
         hasDue = t.dueDate != nil
@@ -2035,7 +2081,7 @@ struct TaskDetailView: View {
         guard let b = base, b.id == t.id else { return load(t) }
         if !titleEdited(b) { title = t.title }
         if !detailEdited(b) { detail = t.detail }
-        if !linkEdited(b) { link = t.link ?? "" }
+        if !branchEdited(b) { branch = t.branch ?? "" }
         if !waitingOnEdited(b) { waitingOn = t.waitingOn ?? .user }   // before status: reads it
         if !waitingReasonEdited(b) { waitingReason = t.waitingReason ?? "" }
         if !statusEdited(b) { status = t.status }
@@ -2055,7 +2101,7 @@ struct TaskDetailView: View {
     /// The store write reloads the tasks, and the resulting sync() moves the snapshot.
     private func autosave() {
         guard let b = base, let t = currentTask, b.id == t.id else { return }
-        let edits = [titleEdited(b), detailEdited(b), linkEdited(b), statusEdited(b), priorityEdited(b),
+        let edits = [titleEdited(b), detailEdited(b), branchEdited(b), statusEdited(b), priorityEdited(b),
                      dueEdited(b), tagsEdited(b), recurrenceEdited(b), estimateEdited(b),
                      waitingOnEdited(b), waitingReasonEdited(b)]
         guard edits.contains(true) else { return }
@@ -2063,7 +2109,6 @@ struct TaskDetailView: View {
             t,
             title: titleEdited(b) ? title : nil,
             detail: detailEdited(b) ? detail : nil,
-            link: linkEdited(b) ? .some(link.isEmpty ? nil : link) : nil,
             // Status and waiting fields go only when edited, so ordinary edits on a
             // waiting task skip the store's waiting check. Any other status clears them.
             status: statusEdited(b) ? status : nil,
@@ -2073,8 +2118,101 @@ struct TaskDetailView: View {
             recurrence: recurrenceEdited(b) ? .some(recurrence == "none" ? nil : recurrence) : nil,
             estimateSeconds: estimateEdited(b) ? estimateMinutes * 60 : nil,
             waitingOn: waitingOnEdited(b) ? waitingOn : nil,
-            waitingReason: waitingReasonEdited(b) ? .some(waitingReason) : nil
+            waitingReason: waitingReasonEdited(b) ? .some(waitingReason) : nil,
+            branch: branchEdited(b) ? .some(branch.isEmpty ? nil : branch) : nil
         )
+    }
+}
+
+/// One of a task's links in the detail: an icon for its kind and its title (or url, mono
+/// for a branch), with the url under a title. A click opens it (`AppModel.openLink`); the
+/// kind menu re-marks it; the x removes it.
+struct LinkRow: View {
+    @EnvironmentObject var model: AppModel
+    let link: TaskLink
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button { model.openLink(link) } label: { label }
+                .buttonStyle(.plain)
+                .help(link.url)
+            Spacer(minLength: 4)
+            kindMenu
+            Button { model.removeLink(link) } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless)
+                .foregroundStyle(Theme.Colors.steel)
+                .help("Remove link")
+        }
+        .contextMenu {
+            Button("Copy URL") { model.copyCode(link.url) }
+        }
+    }
+
+    private var label: some View {
+        HStack(spacing: 8) {
+            Image(systemName: qbLinkIcon(link.kind))
+                .foregroundStyle(Theme.Colors.brandBlue)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(link.title ?? link.url)
+                    .font(link.kind == .branch && link.title == nil ? Theme.Fonts.codeBadge : Theme.Fonts.bodySm)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if link.title != nil {
+                    Text(link.url)
+                        .font(Theme.Fonts.micro)
+                        .foregroundStyle(Theme.Colors.steel)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var kindMenu: some View {
+        Menu {
+            ForEach(LinkKind.allCases, id: \.self) { k in
+                Button { model.setLinkKind(link, k) } label: {
+                    if k == link.kind { Label(k.display, systemImage: "checkmark") } else { Text(k.display) }
+                }
+            }
+        } label: {
+            Text(link.kind.display).font(Theme.Fonts.micro)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("What this link is")
+    }
+}
+
+/// The SF Symbol for a link kind.
+func qbLinkIcon(_ kind: LinkKind) -> String {
+    switch kind {
+    case .pr: return "arrow.triangle.pull"
+    case .design: return "paintpalette"
+    case .doc: return "doc.text"
+    case .file: return "folder"
+    case .branch: return "arrow.triangle.branch"
+    case .other: return "link"
+    }
+}
+
+/// The branch a task's work is on, as a small mono chip (task rows).
+struct BranchChip: View {
+    let name: String
+    var body: some View {
+        Label(name, systemImage: "arrow.triangle.branch")
+            .font(Theme.Fonts.codeBadge)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Theme.Colors.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.xs))
+            .overlay(RoundedRectangle(cornerRadius: Theme.Radius.xs).stroke(Theme.Colors.hairline, lineWidth: 1))
+            .foregroundStyle(Theme.Colors.steel)
+            .frame(maxWidth: 220, alignment: .leading)
+            .help(name)
     }
 }
 

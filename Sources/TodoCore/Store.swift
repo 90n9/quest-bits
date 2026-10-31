@@ -337,6 +337,27 @@ public final class Store: @unchecked Sendable {
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_guide_versions_project ON guide_versions(project_id, id);")
 
+        // --- Additive migration: typed task links + working branch (1.5.0) ---
+        // A task's links, oldest first; the primary one (first that is not a branch) is
+        // mirrored into the legacy tasks.link column (kept, see syncLegacyLinks). No CHECK on kind or author: the
+        // store validates them, so a new LinkKind needs no table rebuild.
+        exec("""
+        CREATE TABLE IF NOT EXISTS task_links (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL DEFAULT 'other',
+            url        TEXT NOT NULL,
+            title      TEXT,
+            author     TEXT,
+            source     TEXT,
+            created_at REAL NOT NULL,
+            UNIQUE(task_id, url)
+        );
+        """)
+        // The git branch the task's work is on now (NULL = none); earlier branches are links.
+        if !columnExists("tasks", "branch") { exec("ALTER TABLE tasks ADD COLUMN branch TEXT;") }
+        syncLegacyLinks()
+
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
         repairStatusFields()
     }
@@ -942,18 +963,23 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since, branch"
     /// `taskCols` qualified with `tasks.`, for queries that join another table.
     private static let qualifiedTaskCols = taskCols.components(separatedBy: ", ").map { "tasks.\($0)" }.joined(separator: ", ")
     /// How many columns `taskCols` selects: the index of a column a query adds after them.
     private static let taskColCount = Int32(taskCols.components(separatedBy: ", ").count)
 
+    /// `link` (legacy single link) becomes the task's primary link, its kind guessed;
+    /// `author` is recorded on it. `branch` is the working branch (`normalizedBranch`).
     @discardableResult
     public func createTask(projectId: Int64, title: String, detail: String = "", link: String? = nil,
                            status: TaskStatus = .todo, waitingOn: WaitingOn? = nil, waitingReason: String? = nil,
                            priority: Priority = .none,
                            dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
-                           parentId: Int64? = nil, estimateSeconds: Int = 0) throws -> TodoTask {
+                           parentId: Int64? = nil, estimateSeconds: Int = 0,
+                           branch: String? = nil, author: NoteAuthor? = nil) throws -> TodoTask {
+        let link = try link.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : try Self.normalizedLinkURL($0) }
+        let branch = try Self.normalizedBranch(branch)
         lock.lock(); defer { lock.unlock() }
         // The task_seq bump, its read-back and the INSERT are one read-modify-write the
         // app and MCP server can race on (both reading the same seq → duplicate codes).
@@ -963,7 +989,8 @@ public final class Store: @unchecked Sendable {
             let task = try createTaskUnlocked(projectId: projectId, title: title, detail: detail, link: link,
                                               status: status, waitingOn: waitingOn, waitingReason: waitingReason,
                                               priority: priority, dueDate: dueDate, tags: tags,
-                                              recurrence: recurrence, parentId: parentId, estimateSeconds: estimateSeconds)
+                                              recurrence: recurrence, parentId: parentId, estimateSeconds: estimateSeconds,
+                                              branch: branch, author: author)
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return task
         } catch {
@@ -984,6 +1011,7 @@ public final class Store: @unchecked Sendable {
                                     priority: Priority = .none,
                                     dueDate: Date? = nil, tags: [String] = [], recurrence: String? = nil,
                                     parentId: Int64? = nil, estimateSeconds: Int = 0,
+                                    branch: String? = nil, author: NoteAuthor? = nil,
                                     timestampsFrom source: TodoTask? = nil,
                                     enforceNesting: Bool = true) throws -> TodoTask {
         let now = Date()
@@ -1021,11 +1049,11 @@ public final class Store: @unchecked Sendable {
         let ts = Self.statusTimestampExprs(status, now: nowSecs)
         try runWrite(
             """
-            INSERT INTO tasks (project_id, code, title, detail, link, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, started_at, completed_at, waiting_since, created_at, updated_at, sort_order)
+            INSERT INTO tasks (project_id, code, title, detail, branch, status, waiting_on, waiting_reason, priority, due_date, tags, recurrence, parent_id, estimate_seconds, started_at, completed_at, waiting_since, created_at, updated_at, sort_order)
             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \(ts.startedAt), \(ts.completedAt), \(ts.waitingSince), ?, ?, (SELECT COALESCE(MAX(sort_order)+1,0) FROM tasks WHERE project_id=?)
             FROM (SELECT ? AS status, ? AS started_at, ? AS completed_at, NULL AS waiting_since);
             """,
-            [.int(projectId), .text(code), .text(title), .text(detail), link.map(SQLValue.text) ?? .null,
+            [.int(projectId), .text(code), .text(title), .text(detail), branch.map(SQLValue.text) ?? .null,
              .text(status.rawValue), waitingOn.map { .text($0.rawValue) } ?? .null, reason.map(SQLValue.text) ?? .null,
              .text(priority.rawValue), due, .text(encodeTags(tags)),
              effectiveRecurrence.map(SQLValue.text) ?? .null, parentId.map(SQLValue.int) ?? .null,
@@ -1035,6 +1063,8 @@ public final class Store: @unchecked Sendable {
                .text((source?.status ?? .todo).rawValue), secs(source?.startedAt), secs(source?.completedAt)]
         )
         let id = lastInsertId()
+        // The legacy column is written only as the mirror of the primary link.
+        if let link { try setLegacyLinkUnlocked(taskId: id, raw: link, author: author, log: false, bump: false) }
         logEvent(id, "created", "", title)
         if status != .todo { logEvent(id, "status", TaskStatus.todo.display, status.display) }
         if let waitingOn { logEvent(id, "waiting on", "", waitingOn.rawValue) }
@@ -1172,6 +1202,28 @@ public final class Store: @unchecked Sendable {
         guard let stmt = try? prepare("SELECT \(Self.taskCols) FROM tasks WHERE id=?;", [.int(id)]) else { return nil }
         defer { sqlite3_finalize(stmt) }
         return sqlite3_step(stmt) == SQLITE_ROW ? taskFromRow(stmt) : nil
+    }
+
+    /// `logEvent` for a field typed into the app a keystroke at a time (the branch): when
+    /// the task's latest history row is a change of the same field less than a minute old,
+    /// that row takes the new value (and goes when the value is back where it started)
+    /// instead of a row per keystroke. Best-effort, like logEvent.
+    private func logTypedEvent(_ taskId: Int64, _ field: String, _ old: String, _ new: String) {
+        let now = Int64(Date().timeIntervalSince1970)
+        if let stmt = try? prepare("SELECT id, field, ts, old_value FROM task_history WHERE task_id=? ORDER BY id DESC LIMIT 1;",
+                                   [.int(taskId)]) {
+            defer { sqlite3_finalize(stmt) }
+            if sqlite3_step(stmt) == SQLITE_ROW, colText(stmt, 1) == field, now - sqlite3_column_int64(stmt, 2) < 60 {
+                let rowId = sqlite3_column_int64(stmt, 0), first = colText(stmt, 3)
+                if first == new {
+                    try? runWrite("DELETE FROM task_history WHERE id=?;", [.int(rowId)])
+                } else {
+                    try? runWrite("UPDATE task_history SET new_value=?, ts=? WHERE id=?;", [.text(new), .int(now), .int(rowId)])
+                }
+                return
+            }
+        }
+        logEvent(taskId, field, old, new)
     }
 
     /// Append a change-history row (caller already holds the lock). Returns its id, or
@@ -1312,15 +1364,21 @@ public final class Store: @unchecked Sendable {
                            estimateSeconds: Int? = nil,
                            waitingOn: WaitingOn? = nil, waitingReason: String?? = nil,
                            parentId: Int64?? = nil,
+                           branch: String?? = nil, author: NoteAuthor? = nil,
                            note: NoteDraft? = nil) throws {
         let noteText = try note.map { try Self.noteBody($0.text) }
+        // link: .some(nil) or .some("") removes the primary link; see setLegacyLinkUnlocked.
+        let link: String?? = try link.map { v in
+            try v.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : try Self.normalizedLinkURL($0) }
+        }
+        let branch: String?? = try branch.map { try Self.normalizedBranch($0) }
         lock.lock(); defer { lock.unlock() }
         let apply = { [self] (spawnRecurrence: Bool) in
             let eventId = try applyTaskUpdateUnlocked(
                 id: id, title: title, detail: detail, link: link, status: status, priority: priority,
                 dueDate: dueDate, tags: tags, recurrence: recurrence, estimateSeconds: estimateSeconds,
                 waitingOn: waitingOn, waitingReason: waitingReason, parentId: parentId,
-                spawnRecurrence: spawnRecurrence)
+                branch: branch, author: author, spawnRecurrence: spawnRecurrence)
             if let note, let noteText {
                 _ = try insertNoteUnlocked(taskId: id, text: noteText, kind: note.kind, author: note.author,
                                            sessionId: note.sessionId, statusEventId: eventId)
@@ -1332,8 +1390,9 @@ public final class Store: @unchecked Sendable {
         // waiting rule depends on whether the task is already waiting. A note rides along
         // in the same transaction, so the update and its note land together or not at all.
         // A new parent is checked against the parent's row and the task's subtasks.
+        // A legacy link reads the task's links and rewrites them and the mirror.
         let needsTransaction = status != nil || Self.setsWaitingFields(waitingOn, waitingReason) || note != nil
-            || parentId != nil
+            || parentId != nil || link != nil
         guard needsTransaction else { return try apply(true) }
         do {
             try beginImmediate()
@@ -1411,6 +1470,7 @@ public final class Store: @unchecked Sendable {
                                          recurrence: String?? = nil, estimateSeconds: Int? = nil,
                                          waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
                                          waitingReason: String?? = nil, parentId: Int64?? = nil,
+                                         branch: String?? = nil, author: NoteAuthor? = nil,
                                          spawnRecurrence: Bool) throws -> Int64? {
         guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
         // parentId .some(id): make it a subtask of that task; .some(nil): a top-level task.
@@ -1437,7 +1497,10 @@ public final class Store: @unchecked Sendable {
         var binds: [SQLValue] = []
         if let title { sets.append("title=?"); binds.append(.text(title)) }
         if let detail { sets.append("detail=?"); binds.append(.text(detail)) }
-        if let link { sets.append("link=?"); binds.append(link.map(SQLValue.text) ?? .null) }
+        // The legacy link is not a column write: it edits the links (and logs, and bumps
+        // updated_at, when one changed). Checks are done above, so this runs after them.
+        if let link { try setLegacyLinkUnlocked(taskId: id, raw: link, author: author, log: true, bump: true) }
+        if let branch { sets.append("branch=?"); binds.append(branch.map(SQLValue.text) ?? .null) }
         if let status {
             sets.append("status=?"); binds.append(.text(status.rawValue))
             let ts = Self.statusTimestampExprs(status, now: now)
@@ -1487,11 +1550,12 @@ public final class Store: @unchecked Sendable {
            let rule = effectiveRecurrence, !rule.isEmpty,
            let nextDue = Self.advanceDueDate(from: old.dueDate ?? Date(), rule: rule) {
             let spawned = try createTaskUnlocked(
-                projectId: old.projectId, title: old.title, detail: old.detail, link: old.link,
+                projectId: old.projectId, title: old.title, detail: old.detail, link: nil,
                 status: .todo, priority: old.priority, dueDate: nextDue, tags: old.tags, recurrence: rule,
                 estimateSeconds: old.estimateSeconds
             )
             logEvent(spawned.id, "recurrence", "", rule)
+            try copyLinksUnlocked(from: old.id, to: spawned.id)
             // Carry the completed task's checklist: clone each direct subtask as a
             // fresh todo under the new occurrence (title/detail/priority/tags/estimate).
             // spawned is known top-level, so skip the redundant per-subtask nesting check.
@@ -1516,10 +1580,7 @@ public final class Store: @unchecked Sendable {
             logEvent(id, "waiting on", old.waitingOn?.rawValue ?? "", newWaitingOn.rawValue)
         }
         if let priority, priority != old.priority { logEvent(id, "priority", old.priority.display, priority.display) }
-        if let link {
-            let nv = link ?? ""
-            if nv != (old.link ?? "") { logEvent(id, "link", old.link ?? "", nv) }
-        }
+        if let branch, branch != old.branch { logTypedEvent(id, "branch", old.branch ?? "", branch ?? "") }
         if let dueDate {
             let nv = dueDate.map(Self.shortDate) ?? ""
             let ov = old.dueDate.map(Self.shortDate) ?? ""
@@ -1661,11 +1722,13 @@ public final class Store: @unchecked Sendable {
         // Clone all planning fields; effort resets to zero. With keepStatus, started/completed
         // follow the status rule seeded from the source (timestampsFrom), so the copy keeps
         // the original's times rather than being stamped today.
-        return try createTaskUnlocked(
+        // Links come along (all of them, in order); the working branch does not: it is the
+        // state of the original's work, like its effort.
+        let copy = try createTaskUnlocked(
             projectId: targetProject,
             title: t.title,
             detail: t.detail,
-            link: t.link,
+            link: nil,
             status: keepStatus ? t.status : .todo,
             waitingOn: keepStatus ? t.waitingOn : nil,
             waitingReason: keepStatus ? t.waitingReason : nil,
@@ -1677,6 +1740,8 @@ public final class Store: @unchecked Sendable {
             estimateSeconds: t.estimateSeconds,
             timestampsFrom: keepStatus ? t : nil
         )
+        try copyLinksUnlocked(from: t.id, to: copy.id)
+        return getTaskUnlocked(copy.id) ?? copy
     }
 
     /// Move a task to another project, placing it at the end of that project's list.
@@ -1817,6 +1882,295 @@ public final class Store: @unchecked Sendable {
             merged.append(tag)
         }
         return merged
+    }
+
+    // MARK: - Links (1.5.0)
+    //
+    // A task has any number of typed links (`task_links`, oldest first) and one working
+    // branch (`tasks.branch`). Its primary link — the first one that is not a branch name —
+    // is mirrored into the legacy `tasks.link` column, which every link write keeps in
+    // step: older binaries (and the legacy `link` field of create_task / update_task)
+    // still read and write it as a URL. A legacy write means "the task's link is now X":
+    // it replaces the primary link, or adds one (`setLegacyLinkUnlocked`);
+    // `syncLegacyLinks` carries such writes in on every open.
+
+    public static let maxLinkLength = 2048
+    public static let maxBranchLength = 255
+    private static let maxLinkLabelLength = 500
+
+    /// A link's URL (or path, or branch name) as stored: trimmed, one line, at most
+    /// `maxLinkLength` characters; a web URL loses its trailing slashes, so ".../pull/7/"
+    /// and ".../pull/7" are the same link. Empty is an error.
+    public static func normalizedLinkURL(_ raw: String) throws -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { throw StoreError.invalid("link url is empty") }
+        guard !s.contains(where: \.isNewline) else { throw StoreError.invalid("link url must be a single line") }
+        guard s.count <= maxLinkLength else { throw StoreError.invalid("link url is longer than \(maxLinkLength) characters") }
+        if s.contains("://") { while s.hasSuffix("/") && !s.hasSuffix("://") { s.removeLast() } }
+        return s
+    }
+
+    /// `normalizedLinkURL` for a value already in the legacy column, which an older build
+    /// never checked: a value it rejects is kept trimmed rather than dropped. nil = empty.
+    private static func lenientLinkURL(_ raw: String) -> String? {
+        if let s = try? normalizedLinkURL(raw) { return s }
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
+
+    /// A branch name as stored: trimmed, nil when empty (no branch). No whitespace or
+    /// control characters (git allows neither), at most `maxBranchLength` characters.
+    public static func normalizedBranch(_ raw: String?) throws -> String? {
+        guard let s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
+        guard !s.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0)
+                                                  || CharacterSet.controlCharacters.contains($0) }) else {
+            throw StoreError.invalid("branch must be a branch name, with no spaces")
+        }
+        guard s.count <= maxBranchLength else { throw StoreError.invalid("branch is longer than \(maxBranchLength) characters") }
+        return s
+    }
+
+    /// An optional one-line label (a link's title or source): trimmed, nil when empty.
+    private static func linkLabel(_ raw: String?, _ name: String) throws -> String? {
+        guard let s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
+        guard !s.contains(where: \.isNewline) else { throw StoreError.invalid("\(name) must be a single line") }
+        guard s.count <= maxLinkLabelLength else { throw StoreError.invalid("\(name) is longer than \(maxLinkLabelLength) characters") }
+        return s
+    }
+
+    private static let linkCols = "id, task_id, kind, url, title, author, source, created_at"
+
+    /// A task's links, oldest first.
+    public func links(taskId: Int64) throws -> [TaskLink] {
+        lock.lock(); defer { lock.unlock() }
+        return try linksUnlocked(taskId)
+    }
+
+    /// The links of many tasks at once (chunked IN lists), by task id; a task with none
+    /// has no entry. Throws on a read error rather than returning part of them.
+    public func links(taskIds: [Int64]) throws -> [Int64: [TaskLink]] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [Int64: [TaskLink]] = [:]
+        for chunk in Self.chunked(Array(Set(taskIds))) {
+            for link in try readLinks("SELECT \(Self.linkCols) FROM task_links WHERE task_id IN "
+                                      + "(\(Self.placeholders(chunk.count))) ORDER BY task_id, id;", chunk.map { .int($0) }) {
+                out[link.taskId, default: []].append(link)
+            }
+        }
+        return out
+    }
+
+    /// Add a link to a task, in one BEGIN IMMEDIATE. The URL is stored once per task
+    /// (`normalizedLinkURL`): adding one the task already has adds nothing and returns it
+    /// with `created` false, after setting the `kind` and `title` given (nil keeps them).
+    /// A new link without a kind gets `LinkKind.infer`. `source` is provenance kept with
+    /// a new link (an importer's source key); an existing link keeps its own. Logged to
+    /// the task's history and bumps its `updated_at` (an unchanged existing link does neither).
+    @discardableResult
+    public func addLink(taskId: Int64, url: String, kind: LinkKind? = nil, title: String? = nil,
+                        author: NoteAuthor?, source: String? = nil) throws -> (link: TaskLink, created: Bool) {
+        let url = try Self.normalizedLinkURL(url)
+        let title = try Self.linkLabel(title, "title")
+        let source = try Self.linkLabel(source, "source")
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            guard getTaskUnlocked(taskId) != nil else { throw StoreError.notFound("task \(taskId)") }
+            let now = Int64(Date().timeIntervalSince1970)
+            var result: (link: TaskLink, created: Bool)
+            if var existing = try linksUnlocked(taskId).first(where: { $0.url == url }) {
+                var sets: [String] = [], binds: [SQLValue] = []
+                if let kind, kind != existing.kind { sets.append("kind=?"); binds.append(.text(kind.rawValue)); existing.kind = kind }
+                if let title, title != existing.title { sets.append("title=?"); binds.append(.text(title)); existing.title = title }
+                if !sets.isEmpty {
+                    try runWrite("UPDATE task_links SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(existing.id)])
+                    try runWrite("UPDATE tasks SET updated_at=? WHERE id=?;", [.int(now), .int(taskId)])
+                }
+                result = (existing, false)
+            } else {
+                let link = try insertLinkUnlocked(taskId: taskId, url: url, kind: kind ?? LinkKind.infer(from: url),
+                                                  title: title, author: author, source: source)
+                logEvent(taskId, "link", "", url)
+                try refreshLinkMirrorUnlocked(taskId, bump: true)
+                result = (link, true)
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return result
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Remove a task's link by its URL (matched as `normalizedLinkURL` stores it). Logged
+    /// to the history; bumps `updated_at`. Returns the removed link; none such is notFound.
+    @discardableResult
+    public func removeLink(taskId: Int64, url: String) throws -> TaskLink {
+        let url = try Self.normalizedLinkURL(url)
+        return try removeLink { [self] in
+            guard getTaskUnlocked(taskId) != nil else { throw StoreError.notFound("task \(taskId)") }
+            return try linksUnlocked(taskId).first { $0.url == url }
+        }
+    }
+
+    /// Remove a link by its id; see `removeLink(taskId:url:)`. With `taskId`, a link on
+    /// another task is an error and nothing is removed.
+    @discardableResult
+    public func removeLink(id: Int64, taskId: Int64? = nil) throws -> TaskLink {
+        try removeLink { [self] in
+            guard let link = try readLinks("SELECT \(Self.linkCols) FROM task_links WHERE id=?;", [.int(id)]).first else {
+                return nil
+            }
+            if let taskId, link.taskId != taskId { throw StoreError.invalid("link \(id) is not on that task") }
+            return link
+        }
+    }
+
+    /// The removal both `removeLink`s share: `find` reads the link inside the BEGIN
+    /// IMMEDIATE, so a link another process removed meanwhile is notFound, not removed twice.
+    private func removeLink(find: () throws -> TaskLink?) throws -> TaskLink {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            guard let link = try find() else { throw StoreError.notFound("link") }
+            try runWrite("DELETE FROM task_links WHERE id=?;", [.int(link.id)])
+            logEvent(link.taskId, "link", link.url, "")
+            try refreshLinkMirrorUnlocked(link.taskId, bump: true)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return link
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func linksUnlocked(_ taskId: Int64) throws -> [TaskLink] {
+        try readLinks("SELECT \(Self.linkCols) FROM task_links WHERE task_id=? ORDER BY id;", [.int(taskId)])
+    }
+
+    private func readLinks(_ sql: String, _ binds: [SQLValue]) throws -> [TaskLink] {
+        let stmt = try prepare(sql, binds)
+        defer { sqlite3_finalize(stmt) }
+        var out: [TaskLink] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(TaskLink(
+                id: sqlite3_column_int64(stmt, 0), taskId: sqlite3_column_int64(stmt, 1),
+                kind: LinkKind(rawValue: colText(stmt, 2)) ?? .other, url: colText(stmt, 3),
+                title: colTextOpt(stmt, 4), author: colTextOpt(stmt, 5).flatMap(NoteAuthor.init(rawValue:)),
+                source: colTextOpt(stmt, 6), createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 7))))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    /// INSERT one link (the caller has checked the URL is not already on the task).
+    private func insertLinkUnlocked(taskId: Int64, url: String, kind: LinkKind, title: String?,
+                                    author: NoteAuthor?, source: String?) throws -> TaskLink {
+        let now = Date()
+        try runWrite("INSERT INTO task_links (task_id, kind, url, title, author, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
+                     [.int(taskId), .text(kind.rawValue), .text(url), title.map(SQLValue.text) ?? .null,
+                      author.map { .text($0.rawValue) } ?? .null, source.map(SQLValue.text) ?? .null,
+                      .double(now.timeIntervalSince1970)])
+        return TaskLink(id: lastInsertId(), taskId: taskId, kind: kind, url: url, title: title,
+                        author: author, source: source, createdAt: now)
+    }
+
+    /// Set the legacy `tasks.link` to the task's primary link (NULL when it has none);
+    /// `bump` also moves its `updated_at`.
+    private func refreshLinkMirrorUnlocked(_ taskId: Int64, bump: Bool) throws {
+        let first = "(SELECT url FROM task_links WHERE task_id=? AND kind <> '\(LinkKind.branch.rawValue)' ORDER BY id LIMIT 1)"
+        if bump {
+            try runWrite("UPDATE tasks SET link=\(first), updated_at=? WHERE id=?;",
+                         [.int(taskId), .int(Int64(Date().timeIntervalSince1970)), .int(taskId)])
+        } else {
+            try runWrite("UPDATE tasks SET link=\(first) WHERE id=?;", [.int(taskId), .int(taskId)])
+        }
+    }
+
+    /// A legacy single-link write ("the task's link is now `raw`"), inside the caller's
+    /// lock and transaction. nil or empty removes the primary link (the first that is not
+    /// a branch). Otherwise the primary link becomes `raw` in place (kind guessed again,
+    /// title and source cleared; the same URL elsewhere in the list is folded into it), or
+    /// `raw` is added when the task has none. So for a task with at most one link it is
+    /// exactly the old single field.
+    /// Returns whether a link changed; the mirror is refreshed either way.
+    @discardableResult
+    private func setLegacyLinkUnlocked(taskId: Int64, raw: String?, author: NoteAuthor?, log: Bool, bump: Bool) throws -> Bool {
+        let primary = try linksUnlocked(taskId).first { $0.kind != .branch }
+        let url = raw.flatMap(Self.lenientLinkURL)
+        var changed = false
+        if let url {
+            if let first = primary {
+                if first.url != url {
+                    try runWrite("DELETE FROM task_links WHERE task_id=? AND url=?;", [.int(taskId), .text(url)])
+                    try runWrite("UPDATE task_links SET url=?, kind=?, title=NULL, author=?, source=NULL, created_at=? WHERE id=?;",
+                                 [.text(url), .text(LinkKind.infer(from: url).rawValue), author.map { .text($0.rawValue) } ?? .null,
+                                  .double(Date().timeIntervalSince1970), .int(first.id)])
+                    if log { logEvent(taskId, "link", first.url, url) }
+                    changed = true
+                }
+            } else {
+                _ = try insertLinkUnlocked(taskId: taskId, url: url, kind: LinkKind.infer(from: url),
+                                           title: nil, author: author, source: nil)
+                if log { logEvent(taskId, "link", "", url) }
+                changed = true
+            }
+        } else if let first = primary {
+            try runWrite("DELETE FROM task_links WHERE id=?;", [.int(first.id)])
+            if log { logEvent(taskId, "link", first.url, "") }
+            changed = true
+        }
+        try refreshLinkMirrorUnlocked(taskId, bump: bump && changed)
+        return changed
+    }
+
+    /// Copy a task's links onto another (a duplicate, or a recurring task's next
+    /// occurrence), in order, keeping kind, title, author and source.
+    private func copyLinksUnlocked(from: Int64, to: Int64) throws {
+        try runWrite("INSERT OR IGNORE INTO task_links (task_id, kind, url, title, author, source, created_at) "
+                     + "SELECT ?, kind, url, title, author, source, ? FROM task_links WHERE task_id=? ORDER BY id;",
+                     [.int(to), .double(Date().timeIntervalSince1970), .int(from)])
+        try refreshLinkMirrorUnlocked(to, bump: false)
+    }
+
+    /// Carry legacy single links into `task_links`, on every open: the 1.5.0 migration of
+    /// every existing `tasks.link`, then values an older binary still writes to the same
+    /// file (it sets only the legacy column). Each such value goes through
+    /// `setLegacyLinkUnlocked`, as the old field's write meant: it replaces the task's
+    /// primary link, or becomes it. Not logged (the writer logged it, or it predates the
+    /// table); author unknown (NULL). Only reads unless a task needs it (one NOT EXISTS
+    /// scan); the writes run in one BEGIN IMMEDIATE that re-reads the list inside it, so
+    /// the app and MCP server opening together carry each value once. On failure it rolls
+    /// back and logs, and the next open retries. An older binary clearing the legacy
+    /// column is not carried in: the next link write refills it from the primary link.
+    private func syncLegacyLinks() {
+        let pendingSQL = "SELECT id, link FROM tasks WHERE link IS NOT NULL AND trim(link) <> '' AND NOT EXISTS "
+            + "(SELECT 1 FROM task_links l WHERE l.task_id = tasks.id AND l.url = tasks.link);"
+        func pending() throws -> [(id: Int64, link: String)] {
+            let stmt = try prepare(pendingSQL, [])
+            defer { sqlite3_finalize(stmt) }
+            var out: [(id: Int64, link: String)] = []
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                out.append((sqlite3_column_int64(stmt, 0), colText(stmt, 1)))
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+            return out
+        }
+        do {
+            guard try !pending().isEmpty else { return }
+            try beginImmediate()
+            for row in try pending() {
+                try setLegacyLinkUnlocked(taskId: row.id, raw: row.link, author: nil, log: false, bump: false)
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            NSLog("QuestBits: legacy link sync failed: \(error)")
+        }
     }
 
     // MARK: - Notes
@@ -2573,7 +2927,7 @@ public final class Store: @unchecked Sendable {
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
         //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds,
-        //          waiting_on, waiting_reason, waiting_since
+        //          waiting_on, waiting_reason, waiting_since, branch
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
@@ -2604,7 +2958,8 @@ public final class Store: @unchecked Sendable {
             parentId: int64Opt(17),
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13)),
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14)),
-            sortOrder: Int(sqlite3_column_int64(stmt, 15))
+            sortOrder: Int(sqlite3_column_int64(stmt, 15)),
+            branch: colTextOpt(stmt, 22)
         )
     }
 
