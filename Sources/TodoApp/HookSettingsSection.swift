@@ -7,6 +7,7 @@ struct HookSettingsSection: View {
     @State private var status: HookInstaller.Status = .notInstalled
     @State private var error: String?
     @State private var backup: URL?
+    @State private var missing: [String] = []
 
     private var cli: String? { CLIInstaller.bundledCLIPath() }
     private var settings: URL { HookInstaller.settingsURL() }
@@ -19,7 +20,7 @@ struct HookSettingsSection: View {
                 LabeledContent("Backup") { pathText(backup.path) }
             }
             buttons
-            if let message = error ?? unreadableReason {
+            if let message = error ?? unreadableReason ?? missingWarning {
                 Text(message).font(.caption).foregroundStyle(.red)
             }
         } header: {
@@ -46,16 +47,26 @@ struct HookSettingsSection: View {
         }
     }
 
+    /// Our hooks run a CLI that is gone: they do nothing until updated.
+    private var missingWarning: String? {
+        guard let path = missing.first else { return nil }
+        return "The installed hooks run \(tilde(path)), which is no longer there, so they do nothing "
+            + "(the gate is off). Click Update Hooks to use this app, or Uninstall."
+    }
+
     private var unreadableReason: String? {
         if case .unreadable(let why) = status { return homeAsTilde(why) }
         return nil
     }
 
     private var statusText: String {
-        guard cli != nil else { return "Not in this build" }
+        if cli == nil {
+            if case .outdated = status { return "Installed by another copy of QuestBits" }
+            return "Not in this build"
+        }
         switch status {
         case .installed: return "Installed ✓"
-        case .outdated: return "Outdated (update to this app)"
+        case .outdated: return missing.isEmpty ? "Outdated (update to this app)" : "Outdated: the app they run is gone"
         case .notInstalled: return "Not installed"
         case .unreadable: return "Can't read settings.json"
         }
@@ -87,12 +98,13 @@ struct HookSettingsSection: View {
     }
 
     private func refresh() {
-        guard let cli else { status = .notInstalled; return }
         status = HookInstaller.status(settings: settings, cli: cli)
+        missing = HookInstaller.missingCLIs(settings: settings)
     }
 
     private func install() {
         guard let cli else { error = HookInstaller.InstallError.noBundledCLI.description; return }
+        if let why = HookInstaller.unsafeLocation(cli) { error = why; return }
         run("Installed Claude Code hooks") { try HookInstaller.install(settings: settings, cli: cli) }
     }
 

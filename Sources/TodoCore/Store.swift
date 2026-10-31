@@ -1227,11 +1227,17 @@ public final class Store: @unchecked Sendable {
     /// A repo folder as typed, in the form it is stored: trimmed, ~ expanded, `.`/`..` and
     /// trailing slashes removed; nil when empty (no folder). Symlinks are kept. Throws on
     /// a relative path, which would depend on whoever reads it.
+    /// `/` and the home folder itself are refused: every folder under them would belong to
+    /// the project, and its gate would act in all of them.
     public static func normalizedRepoPath(_ raw: String) throws -> String? {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
         guard isAbsolute(s) else { throw StoreError.invalid("the repo folder must be a full path (starting with / or ~): \(s)") }
-        return lexicalPath(s)
+        let path = lexicalPath(s)
+        if path == "/" || resolvedPath(path) == resolvedPath(NSHomeDirectory()) {
+            throw StoreError.invalid("the repo folder can't be / or your home folder; choose the project's own folder: \(s)")
+        }
+        return path
     }
 
     /// ~ expanded, `.`/`..`, doubled and trailing slashes removed — by text only (not
@@ -4113,15 +4119,27 @@ public final class Store: @unchecked Sendable {
         return out
     }
 
-    /// Replace a project's own rules (the app's editor). Returns what was stored.
+    /// Replace a project's own rules (the app's editor). Returns what was stored. With
+    /// `basedOn` (the rules the editor started from), a compare-and-swap: when the stored
+    /// rules differ by then (an agent added one with add_gate_rule), nothing is written and
+    /// `GateRulesChanged` holds the current rules, so a rule is never dropped unseen.
     @discardableResult
-    public func setGateRules(projectId: Int64, rules: [String]) throws -> [String] {
+    public func setGateRules(projectId: Int64, rules: [String], basedOn: [String]? = nil) throws -> [String] {
         let list = try Self.normalizedGateRules(rules)
         lock.lock(); defer { lock.unlock() }
         return try inWriteTransaction {
-            _ = try gateRulesUnlocked(projectId)
+            let current = try gateRulesUnlocked(projectId)
+            if let basedOn, basedOn != current { throw GateRulesChanged(current: current) }
             try writeGateRulesUnlocked(projectId, list)
             return list
+        }
+    }
+
+    /// setGateRules refused: the project's rules are no longer what the editor started from.
+    public struct GateRulesChanged: Error, CustomStringConvertible {
+        public let current: [String]
+        public var description: String {
+            "The rules changed while you were editing (an agent may have added one), so nothing was saved."
         }
     }
 

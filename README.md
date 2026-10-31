@@ -208,7 +208,11 @@ other hook and setting, copies the old file to
 `settings.json.questbits-<flavor>-backup-<timestamp>` first, and writes
 atomically. Each command runs the bundled CLI by its full path and ends with
 `# questbits-hook:prod` (or `:dev`), so the production and dev apps each manage
-only their own entries. After moving the app, click **Update Hooks**.
+only their own entries. If the CLI is gone (the app was moved, deleted or is
+being rebuilt), the hooks do nothing and Claude Code's normal permission flow
+applies; Settings then shows the hooks as outdated. After moving the app, click
+**Update Hooks**. Install refuses to point the hooks at a copy macOS runs from a
+temporary folder or a disk image.
 
 The hooks act only in a folder that belongs to a project (its repo folder):
 
@@ -217,17 +221,30 @@ The hooks act only in a folder that belongs to a project (its repo folder):
 | SessionStart (startup, resume, clear, fork) | records the session and gives it a brief: the project's guide, in progress, waiting on you, next tasks, milestones, latest decisions |
 | SessionStart (compact) | after a compaction, gives the session its own claimed tasks, notes, decisions and questions back |
 | UserPromptSubmit, Stop, SessionEnd | track whether the session is working, waiting or ended (no prompt or reply text is stored) |
-| PreToolUse (Bash and MCP calls) | **the gate**: a risky call is not run; it becomes an approval question |
+| PreToolUse (Bash, Monitor, PowerShell and MCP calls) | **the gate**: a risky call is not run; it becomes an approval question |
 | Notification | a session waiting at its terminal (permission, question, idle) shows in Waiting on you |
 
 **The gate.** Defaults cover git push, gh release, gh pr merge / create, a
-recursive delete outside the repo folder, commands that name the QuestBits
-database, and MCP tools that send Slack or Gmail messages; add a project's own
-rules in the Gate section of its Detail tab (or MCP `add_gate_rule`). A denied
-call becomes an approve question on the session's claimed task (else the
-project's "Agent approvals" task). The agent keeps working; once you approve,
-the exact same call is allowed once, in the same session, within 24 hours.
-Secrets in the call are removed before anything is stored.
+recursive delete outside the repo folder, any sqlite command and commands that
+name the QuestBits database, QuestBits MCP calls that change which project a
+folder belongs to (archive, unarchive, delete, a new repo folder), and MCP
+tools that send Slack or Gmail messages; add a project's own rules in the Gate
+section of its Detail tab (or MCP `add_gate_rule`). It also holds commands that
+make git or gh run something else (`git -c`, `rebase --exec`, `bisect run`,
+HOME or GIT_CONFIG… set for git, `gh api` calls that write, `gh workflow run`)
+and anything it cannot parse. A denied call becomes an approve question on the
+session's claimed task (else the project's "Agent approvals" task) that shows
+the whole call, every rule it matched, and where secrets were hidden. The agent
+keeps working; once you approve, the exact same call is allowed once, in the
+same session, within 24 hours. Secrets in the call are removed before anything
+is stored. When the gate cannot check a call (an error, a crash, too slow), it
+asks in the terminal instead; it never allows on an error.
+
+What the gate does not cover: the commands `make`, `npm run` and similar tools
+run from their own files, git hooks, a script that is changed after you approve
+running it, and an agent that writes its own program to reach the database or
+clicks Approve through UI automation. The gate stops mistakes, not an agent set
+on getting around it. A repo folder can't be `/` or your home folder.
 
 **Manual smoke test** (no restart needed):
 

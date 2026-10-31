@@ -16,14 +16,14 @@ struct GateRulesSection: View {
                 Text(rule).font(Theme.Fonts.caption.monospaced()).foregroundStyle(Theme.Colors.ink)
                     .textSelection(.enabled)
             }
-            Button("Edit rules…") { editing = true }
+            Button("Edit rules…") { load(); editing = true }
                 .buttonStyle(.plain)
                 .font(Theme.Fonts.captionBold).foregroundStyle(Theme.Colors.brandBlue)
         }
         .onAppear(perform: load)
         .onChange(of: project.id) { _, _ in load() }
         .sheet(isPresented: $editing, onDismiss: load) {
-            GateRulesSheet(project: project, rules: rules.joined(separator: "\n"))
+            GateRulesSheet(project: project, original: rules)
         }
     }
 
@@ -37,12 +37,22 @@ struct GateRulesSection: View {
 }
 
 /// Edit a project's own gate rules, one per line; the defaults are listed for reference.
+/// Save only replaces the rules the editor started from (`original`): when an agent added
+/// one meanwhile, nothing is saved, the new rules are added to the text and the user saves
+/// again, so an agent's rule never disappears unseen.
 struct GateRulesSheet: View {
     @EnvironmentObject var model: AppModel
     let project: Project
-    @State var rules: String
+    @State private var original: [String]
+    @State private var rules: String
     @State private var problem: String?
     @Environment(\.dismiss) private var dismiss
+
+    init(project: Project, original: [String]) {
+        self.project = project
+        _original = State(initialValue: original)
+        _rules = State(initialValue: original.joined(separator: "\n"))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -92,10 +102,27 @@ struct GateRulesSheet: View {
 
     private func save() {
         let lines = rules.split(whereSeparator: \.isNewline).map(String.init)
-        if let error = model.setGateRules(projectId: project.id, rules: lines) {
-            problem = error
-        } else {
+        do {
+            try model.setGateRules(projectId: project.id, rules: lines, basedOn: original)
             dismiss()
+        } catch let changed as Store.GateRulesChanged {
+            merge(changed.current)
+        } catch {
+            problem = "\(error)"
         }
+    }
+
+    /// The stored rules changed meanwhile: add the ones the editor did not start with.
+    private func merge(_ current: [String]) {
+        let added = current.filter { !original.contains($0) }
+        let typed = Set(rules.split(whereSeparator: \.isNewline).map {
+            $0.trimmingCharacters(in: .whitespaces).lowercased()
+        })
+        let missing = added.filter { !typed.contains($0.lowercased()) }
+        if !missing.isEmpty { rules += (rules.isEmpty || rules.hasSuffix("\n") ? "" : "\n") + missing.joined(separator: "\n") }
+        original = current
+        problem = "The rules changed while you were editing"
+            + (added.isEmpty ? "" : " (added: " + added.joined(separator: ", ") + ")")
+            + ", so nothing was saved. They are in the list now; check it and save again."
     }
 }

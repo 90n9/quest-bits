@@ -873,21 +873,26 @@ final class AppModel: ObservableObject {
         (try? store.gateRules(projectId: projectId)) ?? []
     }
 
-    /// Replace a project's own gate rules. Returns why they were not saved, or nil.
-    func setGateRules(projectId: Int64, rules: [String]) -> String? {
-        do {
-            try store.setGateRules(projectId: projectId, rules: rules)
-            return nil
-        } catch {
-            return "\(error)"
-        }
+    /// Replace a project's own gate rules, if they are still `basedOn` (what the editor
+    /// started from). Throws `GateRulesChanged` when they changed meanwhile (an agent added
+    /// one), or `StoreError` with why they were not saved.
+    func setGateRules(projectId: Int64, rules: [String], basedOn: [String]) throws {
+        try store.setGateRules(projectId: projectId, rules: rules, basedOn: basedOn)
+    }
+
+    /// Whether question `id` was asked by the gate (QUE-36).
+    func isGateQuestion(_ id: Int64) -> Bool {
+        (try? store.isGateQuestion(id: id)) ?? false
     }
 
     /// Why `raw` can't be the repo folder of project `id` (nil: a new project), or nil when
     /// it can. Empty is fine (no folder). The store checks again when it saves.
     func repoPathProblem(_ raw: String, for id: Int64?) -> String? {
         let path: String?
-        do { path = try Store.normalizedRepoPath(raw) } catch { return "Enter a full path, starting with / or ~" }
+        do { path = try Store.normalizedRepoPath(raw) } catch {
+            return Store.isAbsolute(raw) ? "Choose the project's own folder, not / or your home folder"
+                                         : "Enter a full path, starting with / or ~"
+        }
         // Unchanged is fine (e.g. shared with a project unarchived since), so the rest of
         // the project stays editable.
         guard let path, path != projects.first(where: { $0.id == id })?.repoPath else { return nil }

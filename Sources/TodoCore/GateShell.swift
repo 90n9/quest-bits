@@ -86,6 +86,9 @@ struct ShellParser {
                 else if peek() == "&" { endCommand(pipe: true); i += 2 }
                 else { endCommand(pipe: true); i += 1 }
             case "(", ")":
+                if ch == "(" && word.started && peek() != ")" && !word.text.hasSuffix("=") && globQualifierRunsCode() {
+                    out.problems.append("a zsh glob qualifier that runs code (e: or +)")
+                }
                 endCommand(pipe: false); i += 1
             case "<", ">":
                 if peek() == "(" {
@@ -198,6 +201,20 @@ struct ShellParser {
         // >
         if peek() == ">" || peek() == "|" || peek() == "&" { i += 2 } else { i += 1 }
         pendingRedirect = .other
+    }
+
+    /// At a `(` inside a word (`*(e:'…':)`, `x(+f)`; not `f()` or `a=(…)`): zsh reads it as
+    /// glob qualifiers, where `e` with a delimiter and `+name` run code. Looks ahead only.
+    private func globQualifierRunsCode() -> Bool {
+        var probe = self
+        let inner = probe.balancedParens() ?? String(c[(i + 1)...])
+        let cs = Array(inner)
+        for (k, ch) in cs.enumerated() where k + 1 < cs.count {
+            let n = cs[k + 1]
+            if ch == "+" && (n.isLetter || n == "_") { return true }
+            if ch == "e" && !(n.isLetter || n.isNumber || n == " " || n == ")") { return true }
+        }
+        return false
     }
 
     // MARK: Quotes and expansions

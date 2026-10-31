@@ -72,13 +72,20 @@ _Nothing yet._
     back: the tasks it claimed, their latest notes and decisions, and its
     questions.
   - **Gate approvals.** A risky call (git push, gh release, merging or
-    opening a PR, a recursive delete outside the repo folder, commands on
-    the QuestBits database, sending Slack or Gmail messages, and the
-    project's own rules) is not run: it becomes an approval question in
-    QuestBits, and the agent keeps working. Once you approve, the agent may
-    retry that exact call once, within 24 hours. Edit a project's rules in
-    the Gate section of its Detail tab. In folders that belong to no
-    project, the gate does nothing.
+    opening a PR, a recursive delete outside the repo folder, sqlite and
+    commands on the QuestBits database, QuestBits calls that change which
+    project a folder belongs to, git or gh told to run other commands,
+    sending Slack or Gmail messages, and the project's own rules) is not
+    run: it becomes an approval question in QuestBits that shows the whole
+    call and every rule it matched, and the agent keeps working. Once you
+    approve, the agent may retry that exact call once, within 24 hours. It
+    covers Bash, Monitor and PowerShell commands and MCP calls. When the
+    gate can't check a call, it asks in the terminal; it never allows on an
+    error. Edit a project's rules in the Gate section of its Detail tab. In
+    folders that belong to no project, the gate does nothing. The gate stops
+    mistakes, not an agent set on getting around it: what `make` or
+    `npm run` run, git hooks, and a script edited after you approve it are
+    not checked.
   - A session waiting at its terminal (for a permission, an answer or after
     going idle) shows in QuestBits, with the folder to go back to.
   - Question cards and the Detail tab show each Claude Code session's
@@ -141,7 +148,9 @@ _Nothing yet._
   is removed or rewritten. Existing task links move into the new Links list.
 - If you move QuestBits.app after installing the hooks, open Settings and
   click **Update Hooks**: the hooks run the app's command-line tool by its
-  full path.
+  full path. Until then they do nothing (the gate is off), and Settings says
+  so.
+- A project's repo folder can't be `/` or your home folder.
 
 ## [1.4.3] - 2026-10-31
 

@@ -237,7 +237,7 @@ struct QuestionCard: View {
                 .qbField()
                 .focused($typing)
         } else if !question.context.isEmpty {
-            markdown(question.context)
+            approveContext
                 .padding(Theme.Spacing.sm)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Theme.Colors.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.md))
@@ -274,6 +274,20 @@ struct QuestionCard: View {
                     .disabled(choice == nil && typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .help("Send (⌘↵) and go to the next question")
             }
+        }
+    }
+
+    /// A gate question's context is a tool call: shown as typed (markdown would eat `*`, `_`
+    /// and backslashes), so the user approves exactly what they read.
+    @ViewBuilder private var approveContext: some View {
+        if model.isGateQuestion(question.id) {
+            Text(verbatim: question.context)
+                .font(Theme.Fonts.bodySm.monospaced())
+                .foregroundStyle(Theme.Colors.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            markdown(question.context)
         }
     }
 

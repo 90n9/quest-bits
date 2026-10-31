@@ -8,6 +8,11 @@ import Foundation
 /// whose command runs the bundled CLI by its full path (quoted: the dev bundle's path has
 /// a space). Later steps add a row; installing again then adds it in place.
 ///
+/// Each command first checks that the CLI is still there (`[ -x '<cli>' ] || exit 0`): when
+/// the app was moved, trashed or is being rebuilt, the hook does nothing (exit 0, no output:
+/// Claude Code's normal flow) instead of failing — a failing gate blocks every Bash and MCP
+/// call in every folder. The gate's command also turns a crash of the CLI into "ask".
+///
 /// Ownership: every command this flavor writes ends with the shell comment `marker`
 /// (`# questbits-hook:prod` or `# questbits-hook:dev`; `sh -c` ignores it). A handler
 /// whose command ends with this flavor's marker is ours, wherever the app bundle was when
@@ -31,22 +36,25 @@ enum HookInstaller {
     /// One hook: the Claude Code event, its matcher (nil = no matcher key: the event has
     /// none, or every occurrence), the CLI arguments, the timeout in seconds, and
     /// `onFailure` ("block": a crash, timeout or bad output stops the tool call instead of
-    /// letting it run; Claude Code 2.1.295+, older versions ignore the key).
+    /// letting it run; Claude Code 2.1.295+, older versions ignore the key). `askOnCrash`:
+    /// the command prints a PreToolUse "ask" when the CLI exits with an error.
     struct Row: Equatable {
         let event: String
         let matcher: String?
         let arguments: String
         let timeout: Int
         var onFailure: String? = nil
+        var askOnCrash = false
     }
 
     /// What Install writes. SessionStart `compact` (after an auto or manual compaction) has
     /// a row of its own: it brings back the session's claimed tasks before the brief. Keep
     /// timeouts short: a hook that times out is cancelled, never blocking — except the gate
-    /// (PreToolUse, QUE-36): it runs on every Bash and MCP call (the matcher is a regex,
-    /// anchored so BashOutput and the like stay out), and when it fails the call is blocked,
-    /// never let through. It decides on its own errors itself (ask), so a block means the
-    /// gate could not run at all. Notification (QUE-37): the types that mean the session
+    /// (PreToolUse, QUE-36): it runs on every call of a tool that runs a shell command
+    /// (Bash, Monitor, PowerShell) and every MCP call (the matcher is a regex, anchored so
+    /// BashOutput and the like stay out). It decides on its own errors itself (ask), answers
+    /// ask by itself before its timeout, and its command asks when the CLI crashes; when even
+    /// that fails the call is blocked, never let through. A missing CLI is no decision. Notification (QUE-37): the types that mean the session
     /// waits for the user at its terminal (SessionAttention.needsUser), and the two that
     /// mean an MCP form was answered; auth_success and the others stay out.
     static let rows: [Row] = [
@@ -55,8 +63,8 @@ enum HookInstaller {
         Row(event: "UserPromptSubmit", matcher: nil, arguments: "hook user-prompt-submit", timeout: 5),
         Row(event: "Stop", matcher: nil, arguments: "hook stop", timeout: 5),
         Row(event: "SessionEnd", matcher: nil, arguments: "hook session-end", timeout: 5),
-        Row(event: "PreToolUse", matcher: "^(Bash|mcp__.*)$", arguments: "hook pre-tool-use", timeout: 15,
-            onFailure: "block"),
+        Row(event: "PreToolUse", matcher: "^(Bash|Monitor|PowerShell|mcp__.*)$", arguments: "hook pre-tool-use",
+            timeout: 15, onFailure: "block", askOnCrash: true),
         Row(event: "Notification", matcher: notificationMatcher, arguments: "hook notification", timeout: 5)
     ]
 
@@ -111,8 +119,58 @@ enum HookInstaller {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    /// What the gate's command prints when the CLI exits with an error (a crash).
+    static let crashAsk = #"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","#
+        + #""permissionDecisionReason":"QuestBits gate failed to run, so it asks here instead."}}"#
+
+    /// `[ -x 'cli' ] || exit 0; exec 'cli' <arguments> # marker`. With `askOnCrash` the CLI's
+    /// output is passed on when it exits 0, else `crashAsk` is printed.
     static func command(cli: String, _ row: Row, marker: String = marker) -> String {
-        "\(shellQuote(cli)) \(row.arguments) \(marker)"
+        let q = shellQuote(cli)
+        let check = "[ -x \(q) ] || exit 0; "
+        guard row.askOnCrash else { return check + "exec \(q) \(row.arguments) \(marker)" }
+        return check + "out=$(\(q) \(row.arguments)) && { [ -z \"$out\" ] || printf '%s\\n' \"$out\"; exit 0; }; "
+            + "printf '%s\\n' \(shellQuote(crashAsk)) \(marker)"
+    }
+
+    /// The CLI path a command of ours runs: its first single-quoted word (`shellQuote`).
+    static func cliPath(inCommand command: String) -> String? {
+        let c = Array(command)
+        guard var i = c.firstIndex(of: "'") else { return nil }
+        var out = ""
+        i += 1
+        while i < c.count {
+            if c[i] != "'" { out.append(c[i]); i += 1; continue }
+            // '\'' inside: a quote, and the quoted word goes on.
+            if i + 3 < c.count, c[i + 1] == "\\", c[i + 2] == "'", c[i + 3] == "'" { out.append("'"); i += 4; continue }
+            return out
+        }
+        return nil
+    }
+
+    /// The CLI paths our handlers run that are no longer an executable file (the app was
+    /// moved or deleted since they were written).
+    static func missingCLIs(in root: [String: Any], marker: String = marker) -> [String] {
+        var seen = Set<String>()
+        return owned(in: root, marker: marker).compactMap { cliPath(inCommand: $0.command) }
+            .filter { seen.insert($0).inserted && !FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    static func missingCLIs(settings: URL = settingsURL()) -> [String] {
+        (try? missingCLIs(in: read(targetURL(settings)).root)) ?? []
+    }
+
+    /// Why hooks must not point at `cli`, or nil: a translocated copy (macOS runs a
+    /// quarantined app from a random read-only folder) or a read-only volume (the DMG).
+    static func unsafeLocation(_ cli: String) -> String? {
+        if cli.contains("/AppTranslocation/") {
+            return "macOS is running QuestBits from a temporary copy. Move QuestBits.app to Applications, open it from there, then install the hooks."
+        }
+        let readOnly = (try? URL(fileURLWithPath: cli).resourceValues(forKeys: [.volumeIsReadOnlyKey]))?.volumeIsReadOnly
+        if readOnly == true {
+            return "QuestBits is running from a read-only disk (the disk image?). Copy it to Applications, open it from there, then install the hooks."
+        }
+        return nil
     }
 
     static func desired(cli: String, rows: [Row] = rows, marker: String = marker) -> [Handler] {
@@ -151,12 +209,15 @@ enum HookInstaller {
         return out
     }
 
-    static func status(of root: [String: Any], cli: String, rows: [Row] = rows, marker: String = marker) -> Status {
+    /// With no CLI (a build without one), hooks of ours are always `.outdated`: they can
+    /// still be uninstalled.
+    static func status(of root: [String: Any], cli: String?, rows: [Row] = rows, marker: String = marker) -> Status {
         if root["hooks"] != nil && !(root["hooks"] is [String: Any]) {
             return .unreadable("\"hooks\" in settings.json is not an object.")
         }
         let have = owned(in: root, marker: marker)
         if have.isEmpty { return .notInstalled }
+        guard let cli else { return .outdated }
         return have.sorted() == desired(cli: cli, rows: rows, marker: marker).sorted() ? .installed : .outdated
     }
 
@@ -250,7 +311,7 @@ enum HookInstaller {
         return (data, root)
     }
 
-    static func status(settings: URL = settingsURL(), cli: String) -> Status {
+    static func status(settings: URL = settingsURL(), cli: String?) -> Status {
         do {
             return status(of: try read(try targetURL(settings)).root, cli: cli)
         } catch {
@@ -305,7 +366,7 @@ enum HookInstaller {
         let perms = (try? fm.attributesOfItem(atPath: target.path))?[.posixPermissions] as? NSNumber
         let temp = dir.appendingPathComponent(".\(target.lastPathComponent).questbits-\(UUID().uuidString).tmp")
         do {
-            try out.write(to: temp, options: .withoutOverwriting)
+            try writeNew(out, to: temp)
             if let perms { try fm.setAttributes([.posixPermissions: perms], ofItemAtPath: temp.path) }
             guard rename(temp.path, target.path) == 0 else {
                 throw InstallError.io("Could not replace \(target.path): \(String(cString: strerror(errno)))")
@@ -332,8 +393,24 @@ enum HookInstaller {
             url = dir.appendingPathComponent("\(base)-\(n)")
             n += 1
         }
-        try data.write(to: url, options: .withoutOverwriting)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try writeNew(data, to: url)
         return url
+    }
+
+    /// Creates `url` (it must not exist) readable by the owner only from the start —
+    /// settings.json can hold API keys — and writes `data` to it.
+    static func writeNew(_ data: Data, to url: URL) throws {
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o600))
+        guard fd >= 0 else {
+            throw InstallError.io("Could not create \(url.path): \(String(cString: strerror(errno)))")
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.close()
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw InstallError.io("Could not write \(url.path): \(error.localizedDescription)")
+        }
     }
 }
