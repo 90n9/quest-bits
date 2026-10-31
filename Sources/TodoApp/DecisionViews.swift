@@ -83,11 +83,11 @@ private struct DecisionFilterBar: View {
     @State private var date = Date()
 
     var body: some View {
+        // Rows sized for a ~360pt list column: side by side, the project
+        // name was cut to "All p…" and Mark All as Seen did not fit.
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                projectPicker
-                showPicker
-            }
+            projectPicker
+            showPicker
             HStack(spacing: 8) {
                 dayPicker
                 if case .on = model.decisionsDay { datePicker }
@@ -108,7 +108,7 @@ private struct DecisionFilterBar: View {
             }
         }
         .labelsHidden()
-        .frame(maxWidth: 220)
+        .frame(maxWidth: 280, alignment: .leading)
         .help("Show one project's decisions, or every project's")
     }
 
@@ -146,6 +146,7 @@ private struct DecisionFilterBar: View {
     private var markAllButton: some View {
         Button("Mark All as Seen") { model.markDecisionsSeen(newIds) }
             .buttonStyle(QBGhostButtonStyle())
+            .fixedSize()
             .disabled(newIds.isEmpty)
             .help("Mark every new decision listed here as seen")
     }

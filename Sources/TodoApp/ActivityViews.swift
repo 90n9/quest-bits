@@ -139,11 +139,11 @@ private struct ActivityFilterBar: View {
     @State private var date = Date()
 
     var body: some View {
+        // One control per row where they would not fit side by side in a
+        // ~360pt list column (the project name would be cut to "All p…").
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                projectPicker
-                whoPicker
-            }
+            projectPicker
+            whoPicker
             HStack(spacing: 8) {
                 dayPicker
                 if case .on = model.activityDay { datePicker }
@@ -163,7 +163,7 @@ private struct ActivityFilterBar: View {
             }
         }
         .labelsHidden()
-        .frame(maxWidth: 220)
+        .frame(maxWidth: 280, alignment: .leading)
         .help("Show one project's activity, or every project's")
     }
 
