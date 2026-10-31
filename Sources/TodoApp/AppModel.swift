@@ -44,9 +44,18 @@ final class AppModel: ObservableObject {
     // project/smart-view selection; ignored while the dashboard is showing.
     @Published var boardView = false
 
-    // In-progress tasks across all projects — surfaced in the menu bar dropdown.
+    // In-progress tasks across all projects (the dashboard's count).
     // Refreshed alongside the displayed task list so it tracks status changes.
     @Published var inProgressTasks: [TodoTask] = []
+    /// What is being worked on now, in projects not archived: In Progress tasks, and To Do
+    /// tasks an agent holds a live claim on (next_task / claim_task). Live claims first,
+    /// then the latest changed. The menu bar's "working" count and list; a waiting task
+    /// counts under `waitingOnYou` (or waits on someone else), not here. Republished only
+    /// when it changed.
+    @Published private(set) var workingTasks: [TodoTask] = []
+    // When the first live claim among `workingTasks` runs out: a claim expires without a
+    // DB write, so the poll drops it then, from the list already read.
+    private var nextClaimExpiry: Date?
 
     // Ids of tasks currently blocked by an unfinished dependency (for the 🔒 badge).
     // Recomputed alongside the displayed task list.
@@ -238,6 +247,7 @@ final class AppModel: ObservableObject {
         let kept = selectedTaskIds.filter(shown.contains)
         if kept != selectedTaskIds { selectedTaskIds = kept }
         inProgressTasks = active.filter { $0.status == .inProgress }
+        setWorking(active)
         blockedTaskIds = Set((try? store.blockedTaskIds()) ?? [])
         let blocking = (try? store.blockingCounts()) ?? blockingCounts
         if blocking != blockingCounts { blockingCounts = blocking }
@@ -250,6 +260,19 @@ final class AppModel: ObservableObject {
         syncDueReminders(all)
         reloadQuestions()
         if timeline { reloadNotes() }
+    }
+
+    /// Tasks working now (see `workingTasks`), from `tasks` as read or as last listed.
+    static func working(_ tasks: [TodoTask], now: Date = Date()) -> [TodoTask] {
+        func live(_ t: TodoTask) -> Bool { t.claim?.isLive(at: now) == true }
+        return tasks.filter { $0.status == .inProgress || ($0.status == .todo && live($0)) }
+            .sorted { a, b in live(a) != live(b) ? live(a) : a.updatedAt > b.updatedAt }
+    }
+
+    private func setWorking(_ tasks: [TodoTask], now: Date = Date()) {
+        let working = Self.working(tasks, now: now)
+        if working != workingTasks { workingTasks = working }
+        nextClaimExpiry = working.compactMap { $0.claim.flatMap { $0.isLive(at: now) ? $0.expiresAt : nil } }.min()
     }
 
     /// Refresh the open questions; drop a selection that is no longer open (answered
@@ -441,6 +464,19 @@ final class AppModel: ObservableObject {
             selectProjectTab(.wiki)
             wikiSelection = .page(id)
         }
+    }
+
+    /// The "Waiting on you" page with `item` selected (the menu bar's entries), or its
+    /// first item when `item` is nil or gone.
+    func showInboxItem(_ item: InboxItemID?) {
+        selectInbox()
+        if let item, inboxItems.contains(item) { inboxSelection = item }
+    }
+
+    /// A task selected in its project's list (the menu bar's working entries).
+    func showTask(_ task: TodoTask) {
+        selectProject(task.projectId)
+        selectedTaskIds = [task.id]
     }
 
     /// Open what an inbox item is about: a question's or a task's task, a session's project.
@@ -1501,9 +1537,12 @@ final class AppModel: ObservableObject {
         if stamp > lastDBStamp {
             lastDBStamp = stamp
             reloadAll()   // reloads the selected task's notes too: an agent may have added one
-        } else if !attentionSessions.isEmpty {
+            return
+        }
+        if !attentionSessions.isEmpty {
             // A session's terminal may have closed without a hook firing: no DB write tells.
             rebuildWaitingOnYou()
         }
+        if let expiry = nextClaimExpiry, expiry <= Date() { setWorking(workingTasks) }
     }
 }
