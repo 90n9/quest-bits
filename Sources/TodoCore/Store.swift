@@ -75,8 +75,30 @@ public final class Store: @unchecked Sendable {
                    .appendingPathComponent("db.sqlite", isDirectory: false)
     }
 
-    public init(url: URL = Store.defaultDatabaseURL()) throws {
+    /// `readOnly` (the questbits CLI's reads) opens an existing database as is: no folder or
+    /// database is created, no migration runs, and `query_only` makes SQLite refuse every
+    /// write. (Not SQLITE_OPEN_READONLY: a read-only connection cannot open a WAL database
+    /// whose -shm file is gone, as after the last writer closed; this one may recreate the
+    /// -wal/-shm files, which hold no data of their own.) A database older than this build
+    /// fails on its first read of a newer column ("no such column"); the caller may reopen
+    /// it without `readOnly` to migrate it, as the app does.
+    public init(url: URL = Store.defaultDatabaseURL(), readOnly: Bool) throws {
         self.dbURL = url
+        guard readOnly else { try self.openReadWrite(url); return }
+        if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) != SQLITE_OK {
+            let message = db.map { String(cString: sqlite3_errmsg($0)) } ?? "cannot open"
+            sqlite3_close(db); db = nil
+            throw StoreError.open(message)
+        }
+        exec("PRAGMA query_only=ON;")
+        exec("PRAGMA busy_timeout=5000;")
+    }
+
+    public convenience init(url: URL = Store.defaultDatabaseURL()) throws {
+        try self.init(url: url, readOnly: false)
+    }
+
+    private func openReadWrite(_ url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true

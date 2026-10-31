@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build QuestBits.app entirely with swiftc (no Xcode, no SPM).
-# Compiles the SwiftUI app + the bundled MCP server, assembles the .app bundle,
+# Compiles the SwiftUI app, the bundled MCP server and the questbits CLI, assembles the .app bundle,
 # writes Info.plist, and ad-hoc code-signs ("Sign to Run Locally").
 set -euo pipefail
 
@@ -57,12 +57,19 @@ fi
 
 echo "==> Clean previous bundle"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/mcp-server" "$APP/Contents/Frameworks"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/mcp-server" "$APP/Contents/Resources/cli" \
+    "$APP/Contents/Frameworks"
 
 echo "==> Compile MCP server (todo-mcp)"
 # $DEV_DEFINE is intentionally unquoted: empty for prod, two words for dev.
 swiftc -O $DEV_DEFINE "${CORE[@]}" Sources/TodoMCP/*.swift -lsqlite3 \
     -o "$APP/Contents/Resources/mcp-server/todo-mcp"
+
+echo "==> Compile CLI (questbits)"
+# Same name in both flavors; the dev one reads the dev database (-D DEV_BUILD). Hooks call
+# it by this full path; Settings can link it into ~/.local/bin (questbits / questbits-dev).
+swiftc -O $DEV_DEFINE "${CORE[@]}" Sources/TodoCLI/*.swift -lsqlite3 \
+    -o "$APP/Contents/Resources/cli/questbits"
 
 echo "==> Compile app ($APP_NAME)"
 swiftc -O $DEV_DEFINE "${CORE[@]}" Sources/TodoApp/*.swift -lsqlite3 \
@@ -149,6 +156,8 @@ done
 codesign --force --sign - "$SPARKLE_IN_APP"
 codesign --force --sign - --identifier "$BUNDLE_ID" \
     "$APP/Contents/Resources/mcp-server/todo-mcp"
+codesign --force --sign - --identifier "$BUNDLE_ID.cli" \
+    "$APP/Contents/Resources/cli/questbits"
 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
 
 echo "==> Verify signature"
@@ -156,3 +165,4 @@ codesign --verify --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
 
 echo "==> Done: $APP"
 echo "    MCP binary: $APP/Contents/Resources/mcp-server/todo-mcp"
+echo "    CLI binary: $APP/Contents/Resources/cli/questbits"

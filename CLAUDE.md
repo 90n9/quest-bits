@@ -15,14 +15,15 @@ VERSION=1.2.0 Scripts/build-app.sh  # override bundle version (CI passes the rel
 ```
 
 **Dev vs prod flavor.** Local builds default to a fully isolated **QuestBits Dev** app
-(compiled with `-D DEV_BUILD` into *both* binaries): bundle id `com.local.todoapp.dev`,
+(compiled with `-D DEV_BUILD` into *all three* binaries): bundle id `com.local.todoapp.dev`,
 database `~/Library/Application Support/TodoAppDev/`, MCP registration key
 `mcpServers.quest-bits-dev`, orange DEV badge in the sidebar footer. It never touches
 production data or the prod `todo` registration. CI builds (`GITHUB_ACTIONS=true`)
 and `FLAVOR=prod` produce the production QuestBits.app.
 
-`build-app.sh` compiles two separate binaries and links libsqlite3 (`-lsqlite3`) into each:
+`build-app.sh` compiles three separate binaries and links libsqlite3 (`-lsqlite3`) into each:
 - `Contents/Resources/mcp-server/todo-mcp` ← `Sources/TodoCore/*.swift` + `Sources/TodoMCP/*.swift`
+- `Contents/Resources/cli/questbits` ← `Sources/TodoCore/*.swift` + `Sources/TodoCLI/*.swift` — the CLI (`brief`, `list`, `show`, `export`; new commands go in `CLI.commands`). Read-only on the DB, honours `TODO_DB_PATH` like todo-mcp; hooks call it by this full path, Settings can link it into `~/.local/bin` (`questbits` / `questbits-dev`).
 - `Contents/MacOS/QuestBits` ← `Sources/TodoCore/*.swift` + `Sources/TodoApp/*.swift` (+ Sparkle.framework)
 
 The task **Detail editor** is a web view running Milkdown (Notion-style blocks over markdown): `Editor/` holds its npm package (`src/main.js`, `src/theme.css`, `index.html`), and `build-app.sh` runs `npm ci` (when the lockfile changed) and esbuild into `Contents/Resources/Editor/`, so builds need Node/npm. Swift side: `TodoApp/MarkdownEditor.swift`. Detail stays markdown; images are files in `attachments/` next to the DB, linked as `attachments/<name>`.
@@ -46,7 +47,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_proje
   | TODO_DB_PATH=/tmp/qb-test.sqlite "$MCP"
 ```
 
-- **Only `todo-mcp` reads `TODO_DB_PATH`** (`TodoMCP/MCPServer.swift`), and only when it is set on the `todo-mcp` process itself — put it after the `|`, not before `echo`. Always set it for MCP tests so you don't touch real data.
+- **Only `todo-mcp` and the `questbits` CLI read `TODO_DB_PATH`** (`TodoMCP/MCPServer.swift`, `TodoCLI/CLI.swift`), and only when it is set on that process itself — put it after the `|`, not before `echo`. Always set it for MCP tests so you don't touch real data.
 - **The app and a bare `Store()` ignore `TODO_DB_PATH`** and always open the real DB: `~/Library/Application Support/TodoApp/db.sqlite`, or `TodoAppDev/` when compiled with `-D DEV_BUILD`. Opening it runs migrations on it. A test script or harness that compiles `TodoCore` must call `Store(url:)` with a throwaway path (e.g. under `/tmp`), never `Store()`.
 - The live app registers its MCP server on launch; a Claude Code session started **before** launch won't see it — start a fresh session to pick up MCP changes.
 

@@ -2860,6 +2860,7 @@ struct SettingsView: View {
                     model.flashToast("MCP re-registered")
                 }
             }
+            CLISettingsSection()
             Section {
                 Button("Edit Guide for All Projects…") { showGuide = true }
             } header: {
