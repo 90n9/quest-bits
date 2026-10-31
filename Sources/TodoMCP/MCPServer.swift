@@ -854,6 +854,17 @@ final class MCPServer: @unchecked Sendable {
             }
             return try jsonString(["task": try store.getTask(id: removed.taskId).code, "removed": linkDict(removed)] as [String: Any])
 
+        case "list_gate_rules":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            return try jsonString(gateRulesDict(pid, rules: try store.gateRules(projectId: pid)))
+
+        case "add_gate_rule":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let (rules, added) = try store.addGateRule(projectId: pid, rule: try requireString(args, "rule"))
+            var d = gateRulesDict(pid, rules: rules)
+            d["added"] = added
+            return try jsonString(d)
+
         case "list_milestones":
             let includeClosed = try boolArg(args, "include_closed") ?? false
             let pid: Int64? = given(args, "project_id", "project_code")
@@ -1091,6 +1102,13 @@ final class MCPServer: @unchecked Sendable {
     }
 
     // MARK: - Serialization helpers
+
+    /// list_gate_rules / add_gate_rule: the defaults (always on) and the project's own rules.
+    private func gateRulesDict(_ pid: Int64, rules: [String]) -> [String: Any] {
+        ["project": store.projectCode(id: pid) ?? "\(pid)",
+         "defaults": GateRule.defaults.map(\.text),
+         "rules": rules]
+    }
 
     private func projectDict(_ p: Project) -> [String: Any] {
         var d: [String: Any] = ["id": p.id, "code": p.code, "name": p.name, "description": p.detail,

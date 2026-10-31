@@ -568,6 +568,21 @@ final class AppModel: ObservableObject {
         updateProject(id, name: name, detail: detail)
     }
 
+    /// A project's own gate rules (QUE-36); empty when there are none or they can't be read.
+    func gateRules(projectId: Int64) -> [String] {
+        (try? store.gateRules(projectId: projectId)) ?? []
+    }
+
+    /// Replace a project's own gate rules. Returns why they were not saved, or nil.
+    func setGateRules(projectId: Int64, rules: [String]) -> String? {
+        do {
+            try store.setGateRules(projectId: projectId, rules: rules)
+            return nil
+        } catch {
+            return "\(error)"
+        }
+    }
+
     /// Why `raw` can't be the repo folder of project `id` (nil: a new project), or nil when
     /// it can. Empty is fine (no folder). The store checks again when it saves.
     func repoPathProblem(_ raw: String, for id: Int64?) -> String? {

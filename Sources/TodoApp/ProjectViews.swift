@@ -134,6 +134,9 @@ struct ProjectOverview: View {
                         .foregroundStyle(project.repoPath == nil ? Theme.Colors.steel : Theme.Colors.slate)
                         .textSelection(.enabled)
                 }
+                section("Gate") {
+                    GateRulesSection(project: project)
+                }
                 section("Agent guide") {
                     Text(guideLabel).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
                     link("Open Guide", .guide)

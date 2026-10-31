@@ -520,6 +520,28 @@ public final class Store: @unchecked Sendable {
         if !columnExists("tasks", "claim_heartbeat_at") { exec("ALTER TABLE tasks ADD COLUMN claim_heartbeat_at REAL;") }
         if !columnExists("tasks", "claim_expires_at") { exec("ALTER TABLE tasks ADD COLUMN claim_expires_at REAL;") }
         exec("CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by) WHERE claimed_by IS NOT NULL;")
+
+        // --- Additive migration: the gate (1.5.0) ---
+        // gate_rules: a project's own gate rules (JSON array of GateRule lines; NULL = none),
+        // added to GateRule.defaults. gate_requests: one row per approve question the gate
+        // asked, matched on (agent_session_id, tool_name, input_hash) — a SHA-256 of the
+        // exact call, never the call itself — and used once (used_at, outcome).
+        if !columnExists("projects", "gate_rules") { exec("ALTER TABLE projects ADD COLUMN gate_rules TEXT;") }
+        exec("""
+        CREATE TABLE IF NOT EXISTS gate_requests (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id      INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE CASCADE,
+            agent_session_id TEXT NOT NULL,
+            project_id       INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            tool_name        TEXT NOT NULL,
+            input_hash       TEXT NOT NULL,
+            rule             TEXT NOT NULL DEFAULT '',
+            created_at       REAL NOT NULL,
+            used_at          REAL,
+            outcome          TEXT
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_gate_requests_call ON gate_requests(agent_session_id, input_hash);")
         pageSearchUsesFTS = migratePageSearchIndex()
 
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
@@ -3485,41 +3507,45 @@ public final class Store: @unchecked Sendable {
         default: break
         }
         let optionsJSON = String(data: try JSONEncoder().encode(options), encoding: .utf8) ?? "[]"
-        let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
         lock.lock(); defer { lock.unlock() }
-        do {
-            try beginImmediate()
-            guard let task = getTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
-            guard !task.status.isClosed else { throw StoreError.invalid("\(task.code) is \(task.status.rawValue); reopen it first") }
-            // The app lists questions of active projects only: one asked here could not be answered.
-            try requireActiveProjectUnlocked(task.projectId)
-            // A blocking question parks the task on the user — unless it already waits
-            // (on the user, or a third party): that wait, and its reason, stay as they are.
-            let parks = blocksTask && task.status != .waiting
-            try runWrite(
-                "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at, "
-                + "parked, agent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                [.int(taskId), session.map(SQLValue.text) ?? .null, .text(kind.rawValue), .text(prompt),
-                 .text(context.trimmingCharacters(in: .whitespacesAndNewlines)), .text(optionsJSON),
-                 .int(blocksTask ? 1 : 0), .text(QuestionStatus.open.rawValue),
-                 .double(Date().timeIntervalSince1970), .int(parks ? 1 : 0),
-                 Self.blankToNil(agentSessionId).map(SQLValue.text) ?? .null])
-            let qid = lastInsertId()
-            var eventId: Int64?
-            if parks {
-                eventId = try applyTaskUpdateUnlocked(id: taskId, status: .waiting, waitingOn: .user,
-                                                      waitingReason: .some(Self.questionReason(prompt)),
-                                                      spawnRecurrence: false)
-            }
-            _ = try insertNoteUnlocked(taskId: taskId, text: prompt, kind: .question, author: .agent,
-                                       sessionId: session, statusEventId: eventId, questionId: qid)
-            let q = try questionUnlocked(qid)
-            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
-            return q
-        } catch {
-            exec("ROLLBACK;")
-            throw error
+        return try inWriteTransaction {
+            try askQuestionUnlocked(taskId: taskId, kind: kind, prompt: prompt, context: context,
+                                    optionsJSON: optionsJSON, blocksTask: blocksTask,
+                                    sessionId: sessionId, agentSessionId: agentSessionId)
         }
+    }
+
+    /// askQuestion's write, inside the caller's lock and BEGIN IMMEDIATE (arguments already
+    /// checked): the task must exist and be open, its project active.
+    private func askQuestionUnlocked(taskId: Int64, kind: QuestionKind, prompt: String, context: String,
+                                     optionsJSON: String, blocksTask: Bool,
+                                     sessionId: String?, agentSessionId: String?) throws -> Question {
+        let session = sessionId.flatMap { $0.isEmpty ? nil : $0 }
+        guard let task = getTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
+        guard !task.status.isClosed else { throw StoreError.invalid("\(task.code) is \(task.status.rawValue); reopen it first") }
+        // The app lists questions of active projects only: one asked here could not be answered.
+        try requireActiveProjectUnlocked(task.projectId)
+        // A blocking question parks the task on the user — unless it already waits
+        // (on the user, or a third party): that wait, and its reason, stay as they are.
+        let parks = blocksTask && task.status != .waiting
+        try runWrite(
+            "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at, "
+            + "parked, agent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            [.int(taskId), session.map(SQLValue.text) ?? .null, .text(kind.rawValue), .text(prompt),
+             .text(context.trimmingCharacters(in: .whitespacesAndNewlines)), .text(optionsJSON),
+             .int(blocksTask ? 1 : 0), .text(QuestionStatus.open.rawValue),
+             .double(Date().timeIntervalSince1970), .int(parks ? 1 : 0),
+             Self.blankToNil(agentSessionId).map(SQLValue.text) ?? .null])
+        let qid = lastInsertId()
+        var eventId: Int64?
+        if parks {
+            eventId = try applyTaskUpdateUnlocked(id: taskId, status: .waiting, waitingOn: .user,
+                                                  waitingReason: .some(Self.questionReason(prompt)),
+                                                  spawnRecurrence: false)
+        }
+        _ = try insertNoteUnlocked(taskId: taskId, text: prompt, kind: .question, author: .agent,
+                                   sessionId: session, statusEventId: eventId, questionId: qid)
+        return try questionUnlocked(qid)
     }
 
     /// The user answers an open question (the app). `choice` is the 0-based option picked;
@@ -3734,6 +3760,215 @@ public final class Store: @unchecked Sendable {
         }
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
+    }
+
+    // MARK: - Gate (QUE-36)
+
+    /// How long the user's approval of a gated call can be used, from when it was given.
+    public static let gateApprovalTTL: TimeInterval = 24 * 3600
+    /// The answer the app's Approve button sends. Only this answer approves a gate request:
+    /// an edited answer is the user's reply, not an approval.
+    public static let approvedAnswer = "Approved"
+    /// Where the gate asks when the session holds no claim: one open task per project.
+    public static let gateTaskTitle = "Agent approvals"
+    public static let gateTaskTag = "gate"
+    /// At most this many rules of a project's own.
+    public static let maxGateRules = 100
+
+    /// A project's own gate rules, as stored (GateRule lines), added to GateRule.defaults.
+    /// Throws when the stored value is not a JSON list of strings: the gate must not run
+    /// on half a rule list.
+    public func gateRules(projectId: Int64) throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return try gateRulesUnlocked(projectId)
+    }
+
+    private func gateRulesUnlocked(_ projectId: Int64) throws -> [String] {
+        guard queryInt("SELECT COUNT(*) FROM projects WHERE id=?;", [.int(projectId)]) == 1 else {
+            throw StoreError.notFound("project \(projectId)")
+        }
+        guard let raw = queryString("SELECT gate_rules FROM projects WHERE id=?;", [.int(projectId)]),
+              !raw.isEmpty else { return [] }
+        guard let list = try? JSONDecoder().decode([String].self, from: Data(raw.utf8)) else {
+            throw StoreError.invalid("the project's gate rules are not readable")
+        }
+        return list
+    }
+
+    /// Checked and tidied rule lines: each must parse (GateRule.parse); written in its
+    /// normal form, once (any case), defaults left out (they always apply).
+    static func normalizedGateRules(_ rules: [String]) throws -> [String] {
+        var out: [String] = []
+        var seen = Set(GateRule.defaults.map { $0.text.lowercased() })
+        for raw in rules where !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let rule = try GateRule.parse(raw)
+            if seen.insert(rule.text.lowercased()).inserted { out.append(rule.text) }
+        }
+        guard out.count <= maxGateRules else { throw StoreError.invalid("a project has at most \(maxGateRules) gate rules") }
+        return out
+    }
+
+    /// Replace a project's own rules (the app's editor). Returns what was stored.
+    @discardableResult
+    public func setGateRules(projectId: Int64, rules: [String]) throws -> [String] {
+        let list = try Self.normalizedGateRules(rules)
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            _ = try gateRulesUnlocked(projectId)
+            try writeGateRulesUnlocked(projectId, list)
+            return list
+        }
+    }
+
+    /// Add one rule to a project (MCP add_gate_rule: agents can add rules, never remove
+    /// one). Repeat-safe: a rule already there (or a default) is not added again.
+    public func addGateRule(projectId: Int64, rule: String) throws -> (rules: [String], added: Bool) {
+        let parsed = try GateRule.parse(rule)
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            let current = try gateRulesUnlocked(projectId)
+            let list = try Self.normalizedGateRules(current + [parsed.text])
+            guard list.count > current.count else { return (current, false) }
+            try writeGateRulesUnlocked(projectId, list)
+            return (list, true)
+        }
+    }
+
+    private func writeGateRulesUnlocked(_ projectId: Int64, _ list: [String]) throws {
+        let json = list.isEmpty ? nil : String(data: try JSONEncoder().encode(list), encoding: .utf8)
+        try runWrite("UPDATE projects SET gate_rules=? WHERE id=?;", [json.map(SQLValue.text) ?? .null, .int(projectId)])
+    }
+
+    /// One gated tool call, as the gate hook saw it. `inputHash` is GateCall.inputHash;
+    /// `prompt` and `context` are already redacted (they are stored).
+    public struct GateCallRecord: Sendable {
+        public var sessionId: String
+        public var projectId: Int64
+        public var toolName: String
+        public var inputHash: String
+        public var rule: String
+        public var prompt: String
+        public var context: String
+
+        public init(sessionId: String, projectId: Int64, toolName: String, inputHash: String,
+                    rule: String, prompt: String, context: String) {
+            self.sessionId = sessionId; self.projectId = projectId; self.toolName = toolName
+            self.inputHash = inputHash; self.rule = rule; self.prompt = prompt; self.context = context
+        }
+    }
+
+    public enum GateOutcome: Sendable {
+        /// The user approved this exact call in this session: it may run, this once.
+        case allowed(Question)
+        /// Already asked; the user has not answered yet.
+        case pending(Question)
+        /// The user answered with something other than Approve (shown to the agent once).
+        case refused(Question)
+        /// Asked now (`expired`: an earlier approval of the same call was older than 24 h).
+        case asked(Question, expired: Bool)
+    }
+
+    /// The gate's decision for a call a rule matched, in one BEGIN IMMEDIATE so two hooks
+    /// for the same call never both use one approval. Looks at this session's requests for
+    /// the same tool and input hash that are not used yet, newest first:
+    /// - answered with exactly `approvedAnswer` within `gateApprovalTTL`: used, `.allowed`;
+    ///   approved longer ago: used as expired, and the call is asked again;
+    /// - answered otherwise: used, `.refused` (the next try asks again);
+    /// - withdrawn (cancelled): used, skipped; still open: `.pending`.
+    /// Otherwise it asks: an approve question (non-blocking) on the task the session has
+    /// claimed, else on the project's open "Agent approvals" task (created with tag `gate`
+    /// on first use), with a gate_requests row holding only the hash.
+    public func gateRequest(_ call: GateCallRecord, now: Date = Date()) throws -> GateOutcome {
+        let sid = call.sessionId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !sid.isEmpty, sid.count <= 200 else { throw StoreError.invalid("session id is empty or too long") }
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            let stmt = try prepare(
+                "SELECT g.id, g.question_id, q.status, q.answer, q.answer_choice, q.answered_at "
+                + "FROM gate_requests g JOIN questions q ON q.id = g.question_id "
+                + "WHERE g.agent_session_id=? AND g.tool_name=? AND g.input_hash=? AND g.used_at IS NULL "
+                + "ORDER BY g.id DESC;", [.text(sid), .text(call.toolName), .text(call.inputHash)])
+            var rows: [(id: Int64, qid: Int64, status: String, answer: String?, choice: Bool, answeredAt: Double?)] = []
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                rows.append((sqlite3_column_int64(stmt, 0), sqlite3_column_int64(stmt, 1), colText(stmt, 2),
+                             colTextOpt(stmt, 3), sqlite3_column_type(stmt, 4) != SQLITE_NULL,
+                             sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5)))
+                rc = sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
+            guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+
+            let at = now.timeIntervalSince1970
+            func use(_ id: Int64, _ outcome: String) throws {
+                try runWrite("UPDATE gate_requests SET used_at=?, outcome=? WHERE id=?;", [.double(at), .text(outcome), .int(id)])
+            }
+            var pending: Int64?
+            var expired = false
+            for r in rows {
+                switch QuestionStatus(rawValue: r.status) ?? .open {
+                case .answered, .resumed:
+                    if r.answer == Self.approvedAnswer && !r.choice {
+                        if let a = r.answeredAt, a >= at - Self.gateApprovalTTL, a <= at + 60 {
+                            try use(r.id, "allowed")
+                            let q = try questionUnlocked(r.qid)
+                            _ = try insertNoteUnlocked(taskId: q.taskId,
+                                                       text: "Gate: the approved call ran (question \(q.id)): \(q.prompt)",
+                                                       kind: .progress, author: .agent, sessionId: sid, questionId: q.id)
+                            return .allowed(q)
+                        }
+                        try use(r.id, "expired")
+                        expired = true
+                    } else {
+                        try use(r.id, "refused")
+                        return .refused(try questionUnlocked(r.qid))
+                    }
+                case .cancelled:
+                    try use(r.id, "cancelled")
+                case .open:
+                    if pending == nil { pending = r.qid }
+                }
+            }
+            if let pending { return .pending(try questionUnlocked(pending)) }
+
+            let taskId = try gateTaskUnlocked(sessionId: sid, projectId: call.projectId)
+            let prompt = call.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let q = try askQuestionUnlocked(taskId: taskId, kind: .approve, prompt: prompt.isEmpty ? "Allow this call?" : prompt,
+                                            context: call.context, optionsJSON: "[]", blocksTask: false,
+                                            sessionId: sid, agentSessionId: sid)
+            try runWrite(
+                "INSERT INTO gate_requests (question_id, agent_session_id, project_id, tool_name, input_hash, rule, created_at) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?);",
+                [.int(q.id), .text(sid), .int(call.projectId), .text(call.toolName), .text(call.inputHash),
+                 .text(call.rule), .double(at)])
+            return .asked(q, expired: expired)
+        }
+    }
+
+    /// The task a gate question goes on: the open task the session claimed last (its
+    /// project active), else the project's open top-level "Agent approvals" task, created
+    /// (tag `gate`) when there is none. Inside the caller's BEGIN IMMEDIATE.
+    private func gateTaskUnlocked(sessionId: String, projectId: Int64) throws -> Int64 {
+        let claimed = try readTasks(
+            "SELECT \(Self.taskCols) FROM tasks WHERE claimed_by=? "
+            + "AND status NOT IN ('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)') "
+            + "ORDER BY claim_heartbeat_at DESC, id;", [.text(sessionId)])
+        for t in claimed where queryInt("SELECT archived_at IS NULL FROM projects WHERE id=?;", [.int(t.projectId)]) == 1 {
+            return t.id
+        }
+        try requireActiveProjectUnlocked(projectId)
+        if let id = queryInt(
+            "SELECT id FROM tasks WHERE project_id=? AND title=? AND parent_id IS NULL "
+            + "AND status NOT IN ('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)') ORDER BY id LIMIT 1;",
+            [.int(projectId), .text(Self.gateTaskTitle)]) {
+            return id
+        }
+        let task = try createTaskUnlocked(
+            projectId: projectId, title: Self.gateTaskTitle,
+            detail: "Calls the QuestBits gate held for your approval, from agent sessions that had no task claimed. "
+                + "Approve or edit them under Questions. You can close this task; the gate opens a new one when needed.",
+            tags: [Self.gateTaskTag], author: .agent)
+        return task.id
     }
 
     // MARK: - Agent sessions (Claude Code sessions)

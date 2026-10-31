@@ -260,7 +260,7 @@ struct QuestionCard: View {
                 } else {
                     Button("Edit…") { draft = question.context; editingDraft = true; typing = true }
                         .buttonStyle(QBSecondaryButtonStyle(compact: true))
-                    Button("Approve") { send(answer: "Approved", choice: nil) }
+                    Button("Approve") { send(answer: Store.approvedAnswer, choice: nil) }
                         .buttonStyle(QBPrimaryButtonStyle(compact: true))
                         .keyboardShortcut(.return, modifiers: .command)
                 }

@@ -17,7 +17,7 @@ import Foundation
 enum HookCommand {
     static let command = CLICommand(
         name: "hook",
-        usage: "hook <session-start|user-prompt-submit|stop|session-end> [--brief | --after-compact]",
+        usage: "hook <session-start|user-prompt-submit|stop|session-end|pre-tool-use> [--brief | --after-compact]",
         summary: "Claude Code hook: record the session from the event JSON on stdin (always exits 0).",
         details: """
         Register each as a command hook on the Claude Code event of the same name, with the
@@ -32,6 +32,13 @@ enum HookCommand {
           user-prompt-submit  UserPromptSubmit: running (the prompt itself is not read or stored)
           stop                Stop: idle, waiting at the terminal
           session-end         SessionEnd: ended, with its reason
+          pre-tool-use        PreToolUse: the QuestBits gate. In a project's repo folder, a call a
+                              gate rule matches (git push, gh release, gh pr merge/create, a recursive
+                              rm outside the folder, MCP tools that send messages, the project's own
+                              rules) is denied and an approve question is left in QuestBits; once
+                              the user approves, the same call is allowed once (24 hours). Prints
+                              nothing when no rule matches or the folder is in no project; asks in
+                              the terminal when it cannot check (never allows on an error).
         Always exits 0 and prints nothing on stderr; QUESTBITS_HOOK_DEBUG=1 shows errors.
         """,
         flags: ["brief", "after-compact"],
@@ -41,6 +48,8 @@ enum HookCommand {
     static let events = ["session-start", "user-prompt-submit", "stop", "session-end"]
 
     static func run(_ args: CLIArgs, _ ctx: CLIContext) -> Int32 {
+        // The gate answers with a decision of its own (never allow on an error): GateCommand.
+        if args.positionals == ["pre-tool-use"] { return GateCommand.run(ctx) }
         do {
             try record(args, ctx)
         } catch CLIError.usage(let message), CLIError.failure(let message) {

@@ -29,23 +29,32 @@ enum HookInstaller {
     static var marker: String { "# questbits-hook:\(flavor)" }
 
     /// One hook: the Claude Code event, its matcher (nil = no matcher key: the event has
-    /// none, or every occurrence), the CLI arguments, and the timeout in seconds.
+    /// none, or every occurrence), the CLI arguments, the timeout in seconds, and
+    /// `onFailure` ("block": a crash, timeout or bad output stops the tool call instead of
+    /// letting it run; Claude Code 2.1.295+, older versions ignore the key).
     struct Row: Equatable {
         let event: String
         let matcher: String?
         let arguments: String
         let timeout: Int
+        var onFailure: String? = nil
     }
 
     /// What Install writes. SessionStart `compact` (after an auto or manual compaction) has
     /// a row of its own: it brings back the session's claimed tasks before the brief. Keep
-    /// timeouts short: a hook that times out is cancelled, never blocking.
+    /// timeouts short: a hook that times out is cancelled, never blocking — except the gate
+    /// (PreToolUse, QUE-36): it runs on every Bash and MCP call (the matcher is a regex,
+    /// anchored so BashOutput and the like stay out), and when it fails the call is blocked,
+    /// never let through. It decides on its own errors itself (ask), so a block means the
+    /// gate could not run at all.
     static let rows: [Row] = [
         Row(event: "SessionStart", matcher: "startup|resume|clear|fork", arguments: "hook session-start --brief", timeout: 10),
         Row(event: "SessionStart", matcher: "compact", arguments: "hook session-start --after-compact", timeout: 10),
         Row(event: "UserPromptSubmit", matcher: nil, arguments: "hook user-prompt-submit", timeout: 5),
         Row(event: "Stop", matcher: nil, arguments: "hook stop", timeout: 5),
-        Row(event: "SessionEnd", matcher: nil, arguments: "hook session-end", timeout: 5)
+        Row(event: "SessionEnd", matcher: nil, arguments: "hook session-end", timeout: 5),
+        Row(event: "PreToolUse", matcher: "^(Bash|mcp__.*)$", arguments: "hook pre-tool-use", timeout: 15,
+            onFailure: "block")
     ]
 
     enum Status: Equatable {
@@ -77,9 +86,11 @@ enum HookInstaller {
         let matcher: String?
         let command: String
         let timeout: Int?
+        var onFailure: String? = nil
 
         static func < (a: Handler, b: Handler) -> Bool {
-            (a.event, a.matcher ?? "", a.command, a.timeout ?? -1) < (b.event, b.matcher ?? "", b.command, b.timeout ?? -1)
+            (a.event, a.matcher ?? "", a.command, a.timeout ?? -1, a.onFailure ?? "")
+                < (b.event, b.matcher ?? "", b.command, b.timeout ?? -1, b.onFailure ?? "")
         }
     }
 
@@ -99,7 +110,8 @@ enum HookInstaller {
     }
 
     static func desired(cli: String, rows: [Row] = rows, marker: String = marker) -> [Handler] {
-        rows.map { Handler(event: $0.event, matcher: $0.matcher, command: command(cli: cli, $0, marker: marker), timeout: $0.timeout) }
+        rows.map { Handler(event: $0.event, matcher: $0.matcher, command: command(cli: cli, $0, marker: marker),
+                           timeout: $0.timeout, onFailure: $0.onFailure) }
     }
 
     static func isOurs(_ handler: Any, marker: String) -> Bool {
@@ -125,7 +137,8 @@ enum HookInstaller {
                 for h in list where isOurs(h, marker: marker) {
                     let d = h as! [String: Any]
                     out.append(Handler(event: event, matcher: matcher, command: d["command"] as! String,
-                                       timeout: (d["timeout"] as? NSNumber)?.intValue))
+                                       timeout: (d["timeout"] as? NSNumber)?.intValue,
+                                       onFailure: d["onFailure"] as? String))
                 }
             }
         }
@@ -181,9 +194,11 @@ enum HookInstaller {
             }
             var groups = hooks[event] as? [Any] ?? []
             let new: [Any] = rows.filter { $0.event == event }.map { row in
-                var group: [String: Any] = ["hooks": [["type": "command",
-                                                       "command": command(cli: cli, row, marker: marker),
-                                                       "timeout": row.timeout] as [String: Any]]]
+                var handler: [String: Any] = ["type": "command",
+                                              "command": command(cli: cli, row, marker: marker),
+                                              "timeout": row.timeout]
+                if let f = row.onFailure { handler["onFailure"] = f }
+                var group: [String: Any] = ["hooks": [handler]]
                 if let m = row.matcher { group["matcher"] = m }
                 return group
             }

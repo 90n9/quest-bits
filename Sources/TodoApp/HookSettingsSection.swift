@@ -65,7 +65,8 @@ struct HookSettingsSection: View {
         "Adds hooks that call this app's CLI when a Claude Code session starts, takes a prompt, "
             + "stops and ends: the session shows in QuestBits, and a new session in a project's folder "
             + "starts with that project's brief; after a compaction, a session gets its claimed tasks back. "
-            + "Your other hooks and settings stay as they are, and "
+            + "In a project's folder, risky calls (git push, releases, PRs, recursive rm outside the folder, "
+            + "sending messages) wait for your approval under Questions. Your other hooks and settings stay as they are, and "
             + "settings.json is backed up first. Takes effect in new Claude Code sessions."
     }
 

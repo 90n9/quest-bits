@@ -282,6 +282,16 @@ extension MCPServer {
              "description": "Remove a link from a task: give the task (`id` or `code`) and the link's `url`, or the link's `link_id` alone. Returns {task, removed: {id, kind, url, ...}}; a link the task does not have is an error.",
              "inputSchema": obj(["id": int, "code": str, "url": str, "link_id": int])],
 
+            ["name": "list_gate_rules",
+             "description": "The QuestBits gate's rules for a project (`project_id`/`project_code`). When QuestBits' Claude Code hooks are installed, a Bash or MCP tool call in the project's repo folder that a rule matches is not run: an approve question goes to the user, and once they approve, the exact same call is allowed once, in the same session, within 24 hours. Returns {project, defaults, rules}: `defaults` always apply (git push, gh release, gh pr merge, gh pr create, recursive rm outside the repo folder, commands that name the QuestBits database, MCP tools that send Slack or Gmail messages); `rules` are the project's own. Rule syntax: a shell command as plain words, program first (`terraform apply`, `git push --force`; words starting with - must be present too), or `tool:` and an MCP tool name where * matches anything (`tool:mcp__*__create_issue`).",
+             "inputSchema": obj(["project_id": int, "project_code": str])],
+
+            ["name": "add_gate_rule",
+             "description": "Add a rule to a project's QuestBits gate (`project_id`/`project_code`), in list_gate_rules' syntax, e.g. `npm publish` or `tool:mcp__*__create_issue`. Repeat-safe (`added` false when it was already there or is a default). Agents can only add rules; the user removes them in the app (the project's Overview). Returns {project, defaults, rules, added}.",
+             "inputSchema": obj(["project_id": int, "project_code": str,
+                                 "rule": ["type": "string", "description": "one rule, e.g. \"npm publish\" or \"tool:mcp__*__create_issue\""] as [String: Any]],
+                                required: ["rule"])],
+
             ["name": "list_milestones",
              "description": "A project's milestones (`project_id`/`project_code`), or with no project those of every active project, in order. A milestone is a named stage of one project (e.g. \"Phase 2 Hide\", \"v1.5.0\") that tasks count toward, beside parent/subtask. Closed ones are left out unless `include_closed` is true. Each: {id, project (code), name, done, total, open, description?, acceptance?, target_date?, closed_at?}; done/total count its tasks (subtasks included, dropped ones in neither), open counts those not done or dropped. `acceptance` is its exit criteria: a milestone whose tasks are all done is not finished until its acceptance is met and someone closes it.",
              "inputSchema": obj(["project_id": int, "project_code": str,
