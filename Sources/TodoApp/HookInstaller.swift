@@ -37,10 +37,12 @@ enum HookInstaller {
         let timeout: Int
     }
 
-    /// What Install writes. SessionStart leaves out `compact`: QUE-38 gives it a row of
-    /// its own. Keep timeouts short: a hook that times out is cancelled, never blocking.
+    /// What Install writes. SessionStart `compact` (after an auto or manual compaction) has
+    /// a row of its own: it brings back the session's claimed tasks before the brief. Keep
+    /// timeouts short: a hook that times out is cancelled, never blocking.
     static let rows: [Row] = [
         Row(event: "SessionStart", matcher: "startup|resume|clear|fork", arguments: "hook session-start --brief", timeout: 10),
+        Row(event: "SessionStart", matcher: "compact", arguments: "hook session-start --after-compact", timeout: 10),
         Row(event: "UserPromptSubmit", matcher: nil, arguments: "hook user-prompt-submit", timeout: 5),
         Row(event: "Stop", matcher: nil, arguments: "hook stop", timeout: 5),
         Row(event: "SessionEnd", matcher: nil, arguments: "hook session-end", timeout: 5)

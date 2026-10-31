@@ -5,7 +5,8 @@ import Foundation
 /// Only session_id, cwd, transcript_path, source (SessionStart) and reason (SessionEnd)
 /// are read; a prompt or reply in the event is never stored.
 ///
-///   session-start       SessionStart       running; prints the session line (and --brief)
+///   session-start       SessionStart       running; prints the session line (and --brief),
+///                                          or after a compaction the session's work (--after-compact)
 ///   user-prompt-submit  UserPromptSubmit   running
 ///   stop                Stop               idle (its turn ended)
 ///   session-end         SessionEnd         ended, with the reason
@@ -16,7 +17,7 @@ import Foundation
 enum HookCommand {
     static let command = CLICommand(
         name: "hook",
-        usage: "hook <session-start|user-prompt-submit|stop|session-end> [--brief]",
+        usage: "hook <session-start|user-prompt-submit|stop|session-end> [--brief | --after-compact]",
         summary: "Claude Code hook: record the session from the event JSON on stdin (always exits 0).",
         details: """
         Register each as a command hook on the Claude Code event of the same name, with the
@@ -25,12 +26,15 @@ enum HookCommand {
           session-start       SessionStart: records the session as running and, when cwd belongs to
                               a project, prints "QuestBits session: <id>" for the agent's context
             --brief           also print `brief` for that folder first
+            --after-compact   for the `compact` matcher: print the session line, then what
+                              `brief --session <id>` prints (this session's claimed tasks, their
+                              latest decisions, notes and questions, the ask loop, a short brief)
           user-prompt-submit  UserPromptSubmit: running (the prompt itself is not read or stored)
           stop                Stop: idle, waiting at the terminal
           session-end         SessionEnd: ended, with its reason
         Always exits 0 and prints nothing on stderr; QUESTBITS_HOOK_DEBUG=1 shows errors.
         """,
-        flags: ["brief"],
+        flags: ["brief", "after-compact"],
         neverFails: true,
         run: { run($0, $1) })
 
@@ -76,12 +80,14 @@ enum HookCommand {
             guard kind == .start, let session else { return "" }
             // Tidy up: sessions whose Claude Code process closed without a SessionEnd.
             _ = try? store.endSessionsWithoutProcess()
+            if args.has("after-compact") { return try afterCompact(session, store: store) }
             guard let pid = session.projectId,
                   let project = try store.listProjects(includeArchived: false).first(where: { $0.id == pid })
             else { return "" }
             var lines = ""
             if args.has("brief") {
-                lines = capped(try BriefCommand.render(project, store: store, next: BriefCommand.defaultNext),
+                lines = capped(try BriefCommand.render(project, store: store, next: BriefCommand.defaultNext,
+                                                       holderId: session.id),
                                code: project.code) + "\n"
             }
             return lines + sessionLine(session.id)
@@ -89,16 +95,30 @@ enum HookCommand {
         if !out.isEmpty { ctx.write(out) }
     }
 
+    /// After a compaction (SessionStart, source `compact`; same session id): the session line
+    /// first, then the session's own work and a short brief of its project, within the cap.
+    /// Silent when the session holds no claim, asked nothing open and has no project.
+    private static func afterCompact(_ session: AgentSession, store: Store) throws -> String {
+        let project = try session.projectId.flatMap { pid in
+            try store.listProjects(includeArchived: false).first(where: { $0.id == pid })
+        }
+        let text = try BriefCommand.sessionBrief(session.id, project: project, store: store,
+                                                 next: BriefCommand.shortNext)
+        guard !text.isEmpty else { return "" }
+        return sessionLine(session.id) + "\n" + capped(text, code: project?.code)
+    }
+
     /// Claude Code keeps at most 10,000 characters of a hook's stdout in context (more is
     /// saved to a file and only a preview is shown), so a brief with a long project guide is
     /// cut at a line boundary well below that, leaving room for the session line.
     static let briefLimit = 8_000
 
-    static func capped(_ brief: String, code: String) -> String {
+    static func capped(_ brief: String, code: String?) -> String {
         guard brief.count > briefLimit else { return brief }
         var kept = String(brief.prefix(briefLimit))
         if let lastBreak = kept.lastIndex(of: "\n") { kept = String(kept[..<lastBreak]) }
-        return kept + "\n\n…brief cut here; get_guide \(code) and list_tasks have the rest.\n"
+        let rest = code.map { "get_guide \($0) and list_tasks have the rest" } ?? "get_task has the rest"
+        return kept + "\n\n…brief cut here; \(rest).\n"
     }
 
     /// What the agent reads at session start (plain stdout of a SessionStart hook joins

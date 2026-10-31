@@ -2,20 +2,29 @@ import Foundation
 
 /// `questbits brief [--path <dir>]`: what an agent starting a session in a folder should know,
 /// as short markdown lines (not JSON): the project the folder maps to (find_project's rule),
-/// its guide, the work in progress, what waits on the user, the next tasks in board order,
-/// open milestones and the wiki. Prints nothing and exits 0 when the folder maps to no
-/// project (or there is no database), so a session-start hook stays silent outside projects.
+/// its guide, the work in progress, what waits on the user, the next tasks as next_task
+/// offers them, open milestones and the wiki. Prints nothing and exits 0 when the folder maps
+/// to no project (or there is no database), so a session-start hook stays silent outside projects.
+///
+/// `--session <id>` puts that Claude Code session's own work first (`sessionWork`): the
+/// tasks it claimed, their latest decisions and notes, its open questions, and the ask loop
+/// in short. The SessionStart hook prints the same after a compaction (`hook session-start
+/// --after-compact`), when what the session was doing has just been summarised away.
 enum BriefCommand {
     static let command = CLICommand(
         name: "brief",
-        usage: "brief [--path <dir>] [--next <n>]",
+        usage: "brief [--path <dir>] [--next <n>] [--session <id>]",
         summary: "Short markdown brief of the project a folder belongs to (silent when none).",
         details: """
         --path <dir>  folder to look up (default: the current directory); the project whose
                       repo folder holds it most specifically, as find_project picks it
-        --next <n>    how many next tasks to list (default 5, 0 = none)
+        --next <n>    how many next tasks to list (default 5, 0 = none), in the order
+                      next_task offers them
+        --session <id>  a Claude Code session id: first its claimed tasks (latest decisions and
+                      notes, open questions) and the ask loop, then a shorter project brief;
+                      what the SessionStart hook prints after a compaction
         """,
-        options: ["path", "next"],
+        options: ["path", "next", "session"],
         run: { try run($0, $1) })
 
     static let defaultNext = 5
@@ -23,6 +32,13 @@ enum BriefCommand {
     static let milestoneCap = 5
     static let decisionCap = 3
     static let guideCap = 3_000      // characters of the project guide; the work comes after it
+    static let shortGuideCap = 1_500 // the guide after a session's own work (--session, after compact)
+    static let shortNext = 3
+    static let claimedCap = 3        // claimed tasks shown in full at most (within workBudget)
+    static let decisionNotes = 5     // per claimed task: latest decisions, and latest other notes
+    static let otherNotes = 3
+    static let noteWidth = 240
+    static let workBudget = 4_500    // characters of a session's work in full; the brief follows it
 
     static func run(_ args: CLIArgs, _ ctx: CLIContext) throws -> Int32 {
         guard args.positionals.isEmpty else { throw CLIError.usage("unexpected argument '\(args.positionals[0])'") }
@@ -32,17 +48,33 @@ enum BriefCommand {
             next = n
         }
         let path = ctx.absolutePath(args.value("path") ?? ctx.cwd)
+        let session = args.value("session").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        if let session, session.isEmpty { throw CLIError.usage("--session needs a session id") }
         guard ctx.databaseExists else { return 0 }
         let text = try ctx.withStore { store -> String in
-            guard let project = Store.bestProject(for: path, among: try store.listProjects(includeArchived: false))
-            else { return "" }
+            let project = Store.bestProject(for: path, among: try store.listProjects(includeArchived: false))
+            if let session {
+                return try sessionBrief(session, project: project, store: store,
+                                        next: args.value("next") == nil ? shortNext : next)
+            }
+            guard let project else { return "" }
             return try render(project, store: store, next: next)
         }
         if !text.isEmpty { ctx.write(text) }
         return 0
     }
 
-    static func render(_ p: Project, store: Store, next: Int) throws -> String {
+    /// `--session`: the session's own work, then the project brief with a shorter guide;
+    /// empty when the session holds no claim, asked nothing open, and the folder has no project.
+    static func sessionBrief(_ sessionId: String, project: Project?, store: Store, next: Int) throws -> String {
+        let work = try sessionWork(sessionId, store: store, idleHint: project != nil)
+        guard let project else { return work }
+        let brief = try render(project, store: store, next: next, holderId: sessionId, guideCap: shortGuideCap)
+        return work.isEmpty ? brief : work + "\n" + brief
+    }
+
+    static func render(_ p: Project, store: Store, next: Int, holderId: String? = nil,
+                       guideCap: Int = guideCap) throws -> String {
         let open = try store.listTasks(matching: TaskFilter(
             projectId: p.id, statuses: [.inProgress, .waiting, .todo], sort: .board))
         let rel = try store.taskRelations(for: open)
@@ -50,7 +82,6 @@ enum BriefCommand {
         let waitingOnUser = open.filter { $0.status == .waiting && $0.waitingOn == .user }
         let waitingOther = open.filter { $0.status == .waiting && $0.waitingOn != .user }
         let todo = open.filter { $0.status == .todo }
-        let ready = todo.filter { !rel.blockedIds.contains($0.id) }
 
         var out: [String] = ["# QuestBits project \(p.code) · \(p.name)"]
         if let folder = p.repoPath { out.append("Folder: \(folder)") }
@@ -61,19 +92,12 @@ enum BriefCommand {
 
         if let guide = try store.guide(projectId: p.id),
            !guide.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            out += ["", "## Project guide", guideExcerpt(guide.markdown, code: p.code)]
+            out += ["", "## Project guide", guideExcerpt(guide.markdown, code: p.code, cap: guideCap)]
         }
         section(&out, "In progress", inProgress, rel)
         section(&out, "Waiting on you", waitingOnUser, rel)
-        if next > 0 && !ready.isEmpty {
-            out += ["", "## Next (board order)"]
-            out += ready.prefix(next).map { "- " + Fmt.taskLine($0, rel) }
-            let blocked = todo.count - ready.count
-            let more = ready.count - min(next, ready.count)
-            if more > 0 || blocked > 0 {
-                out.append("- …" + [more > 0 ? "\(more) more ready" : nil, blocked > 0 ? "\(blocked) blocked" : nil]
-                    .compactMap { $0 }.joined(separator: ", "))
-            }
+        if next > 0 {
+            out += try nextSection(p, store: store, next: next, holderId: holderId, rel: rel)
         }
         out += try milestones(p, store: store)
         out += try wiki(p, store: store)
@@ -83,12 +107,35 @@ enum BriefCommand {
 
     /// The project guide, cut at a line boundary after `guideCap` characters so a long guide
     /// never pushes the work out of a session-start hook's context (capped by Claude Code).
-    static func guideExcerpt(_ markdown: String, code: String) -> String {
+    static func guideExcerpt(_ markdown: String, code: String, cap: Int = guideCap) -> String {
         let text = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.count > guideCap else { return text }
-        var kept = String(text.prefix(guideCap))
+        guard text.count > cap else { return text }
+        var kept = String(text.prefix(cap))
         if let lastBreak = kept.lastIndex(of: "\n") { kept = String(kept[..<lastBreak]) }
         return kept + "\n…the guide goes on: get_guide \(code) has all of it."
+    }
+
+    /// The tasks next_task would offer, in its order and by its rule (`Store.nextTasks`,
+    /// read-only: nothing is claimed), so the brief and next_task agree. `holderId`: the
+    /// session the brief is for, whose own claimed todo tasks stay eligible.
+    private static func nextSection(_ p: Project, store: Store, next: Int, holderId: String?,
+                                    rel: TaskRelations) throws -> [String] {
+        let ready = try store.nextTasks(projectId: p.id, holderId: holderId)
+        let skips = try store.nextTaskSkips(projectId: p.id, holderId: holderId)
+        var out = ["", "## Next (board order, as next_task offers them)"]
+        out += ready.prefix(next).map { "- " + Fmt.taskLine($0, rel) }
+        let more = ready.count - min(next, ready.count)
+        let rest = [more > 0 ? "\(more) more ready" : nil,
+                    skips.blocked > 0 ? "\(skips.blocked) blocked" : nil,
+                    skips.claimed > 0 ? Fmt.count(skips.claimed, "claimed by another session",
+                                                  "claimed by other sessions") : nil].compactMap { $0 }
+        if ready.isEmpty && rest.isEmpty { return [] }
+        if ready.isEmpty {
+            out.append("- none ready" + (rest.isEmpty ? "" : ": " + rest.joined(separator: ", ")))
+        } else if !rest.isEmpty {
+            out.append("- …" + rest.joined(separator: ", "))
+        }
+        return out
     }
 
     private static func section(_ out: inout [String], _ title: String, _ tasks: [TodoTask], _ rel: TaskRelations) {

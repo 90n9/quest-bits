@@ -3981,7 +3981,7 @@ public final class Store: @unchecked Sendable {
         if claim && holder == nil { throw StoreError.invalid("claiming needs to know your session") }
         lock.lock(); defer { lock.unlock() }
         let pick = { [self] () throws -> (ClaimResult?, NextTaskSkips) in
-            guard let t = try nextCandidateUnlocked(projectId: projectId, holderId: holder?.id, now: now) else {
+            guard let t = try nextCandidatesUnlocked(projectId: projectId, holderId: holder?.id, now: now, limit: 1).first else {
                 return (nil, try nextSkipsUnlocked(projectId: projectId, holderId: holder?.id, now: now))
             }
             if claim, let holder { return (try claimUnlocked(t, holder: holder, now: now), NextTaskSkips()) }
@@ -4082,8 +4082,24 @@ public final class Store: @unchecked Sendable {
         return ("p.archived_at IS NULL AND tasks.project_id=?", [.int(projectId)])
     }
 
-    /// `nextTask`'s pick (see there for the rule); caller holds the lock.
-    private func nextCandidateUnlocked(projectId: Int64?, holderId: String?, now: Date) throws -> TodoTask? {
+    /// The tasks next_task would offer, in the order it offers them, without claiming any:
+    /// the same eligibility rule as `nextTask` (its first result is next_task's pick for
+    /// `holderId`), so a brief's "Next" list and next_task agree. `limit` nil = all.
+    public func nextTasks(projectId: Int64?, holderId: String?, limit: Int? = nil,
+                          now: Date = Date()) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        return try nextCandidatesUnlocked(projectId: projectId, holderId: holderId, now: now, limit: limit)
+    }
+
+    /// What next_task passes over in its scope, by reason (read-only).
+    public func nextTaskSkips(projectId: Int64?, holderId: String?, now: Date = Date()) throws -> NextTaskSkips {
+        lock.lock(); defer { lock.unlock() }
+        return try nextSkipsUnlocked(projectId: projectId, holderId: holderId, now: now)
+    }
+
+    /// `nextTask`'s pick (see there for the rule), best first; caller holds the lock.
+    private func nextCandidatesUnlocked(projectId: Int64?, holderId: String?, now: Date,
+                                        limit: Int?) throws -> [TodoTask] {
         let scope = Self.nextScopeSQL(projectId)
         let open = "('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)')"
         let sql = """
@@ -4097,10 +4113,11 @@ public final class Store: @unchecked Sendable {
               AND NOT EXISTS (SELECT 1 FROM tasks s WHERE s.parent_id = tasks.id AND s.status NOT IN \(open))
               AND NOT EXISTS (SELECT 1 FROM tasks pt WHERE pt.id = tasks.parent_id
                               AND (pt.status = '\(TaskStatus.waiting.rawValue)' OR \(Self.hasOpenDependencySQL("pt"))))
-            ORDER BY \(Self.treeOrderSQL) LIMIT 1;
+            ORDER BY \(Self.treeOrderSQL) LIMIT ?;
             """
         let at = now.timeIntervalSince1970
-        return try readTasks(sql, scope.binds + [.double(at), .text(holderId ?? ""), .double(at)]).first
+        return try readTasks(sql, scope.binds + [.double(at), .text(holderId ?? ""), .double(at),
+                                                 .int(Int64(limit.map { max(0, $0) } ?? -1))])   // LIMIT -1 = no limit
     }
 
     /// What next_task passed over in its scope, by reason (`NextTaskSkips`).

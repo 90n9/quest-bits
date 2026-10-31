@@ -64,7 +64,8 @@ struct HookSettingsSection: View {
     private var footer: String {
         "Adds hooks that call this app's CLI when a Claude Code session starts, takes a prompt, "
             + "stops and ends: the session shows in QuestBits, and a new session in a project's folder "
-            + "starts with that project's brief. Your other hooks and settings stay as they are, and "
+            + "starts with that project's brief; after a compaction, a session gets its claimed tasks back. "
+            + "Your other hooks and settings stay as they are, and "
             + "settings.json is backed up first. Takes effect in new Claude Code sessions."
     }
 
