@@ -79,6 +79,9 @@ final class AppModel: ObservableObject {
     /// Open questions in projects not archived, longest waiting first; refreshed with the
     /// tasks (so with every poll), republished only when they changed.
     @Published private(set) var openQuestions: [Question] = []
+    /// Claude Code sessions seen in the last week, plus older ones an open or answered
+    /// question came from; last seen first. Refreshed with the questions.
+    @Published private(set) var agentSessions: [AgentSession] = []
     /// The tab shown for the selected project; back to Tasks when another project is picked.
     @Published var projectTab: ProjectTab = .tasks
     /// The selected project's wiki (its Wiki tab): pages in full, the decision notes of its
@@ -257,11 +260,23 @@ final class AppModel: ObservableObject {
     func reloadQuestions() {
         let open = (try? store.questions(statuses: [.open], activeOnly: true)) ?? openQuestions
         if open != openQuestions { openQuestions = open }
+        let sessions = (try? store.agentSessions(seenSince: Date().addingTimeInterval(-Self.sessionsShownSeconds)))
+            ?? agentSessions
+        if sessions != agentSessions { agentSessions = sessions }
         let shown = questionsShown(in: open)
         if showQuestions || shownProjectTab == .questions,
            selectedQuestionId.map({ id in !shown.contains { $0.id == id } }) ?? true {
             selectedQuestionId = shown.first?.id
         }
+    }
+
+    static let sessionsShownSeconds: TimeInterval = 7 * 24 * 3600
+
+    /// The Claude Code session a question was asked from: the one the MCP server linked,
+    /// else the session id inside its label.
+    func agentSession(for q: Question) -> AgentSession? {
+        guard let sid = q.agentSessionId ?? AgentSession.sessionId(in: q.sessionId) else { return nil }
+        return agentSessions.first { $0.id == sid }
     }
 
     /// Keep local due-date notifications in sync with the current task set.

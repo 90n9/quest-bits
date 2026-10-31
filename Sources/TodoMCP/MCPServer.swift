@@ -17,6 +17,13 @@ final class MCPServer: @unchecked Sendable {
     private let waitLock = NSLock()
     private var activeWaits: [String: UUID] = [:]
     private var cancelledWaits = Set<UUID>()
+    // The Claude Code process that spawned this server (its parent), found once at start:
+    // how a call learns its Claude Code session (`agentSessionId`). And when each session
+    // was last refreshed from here, so a burst of calls writes the heartbeat once.
+    private let host = ClaudeProcess.host()
+    private let touchLock = NSLock()
+    private var lastTouch: [String: (at: Date, kind: SessionEvent.Kind)] = [:]
+    static let touchEverySeconds: TimeInterval = 30
 
     init() {
         do {
@@ -108,6 +115,7 @@ final class MCPServer: @unchecked Sendable {
     private func handleToolCall(id: Any?, params: [String: Any]) {
         let name = params["name"] as? String ?? ""
         let args = params["arguments"] as? [String: Any] ?? [:]
+        touchSession(args, .mcp)
         do {
             let text = try invoke(tool: name, args: args)
             respondText(id: id, text)
@@ -174,11 +182,12 @@ final class MCPServer: @unchecked Sendable {
             return
         }
         let token = (params["_meta"] as? [String: Any])?["progressToken"]
+        let agentSession = touchSession(args, .wait)
         let key = Self.requestKey(id), waitId = UUID()
         waitLock.lock(); activeWaits[key] = waitId; waitLock.unlock()
         Thread.detachNewThread { [self] in
             waitForAnswers(id: id, key: key, waitId: waitId, token: token, projectId: filter.projectId,
-                           sessionId: filter.sessionId, minutes: minutes)
+                           sessionId: filter.sessionId, agentSession: agentSession, minutes: minutes)
         }
     }
 
@@ -188,14 +197,17 @@ final class MCPServer: @unchecked Sendable {
     /// call after 30 silent minutes). A power assertion keeps the Mac from idle sleep
     /// meanwhile: asleep, nothing is answered, and on wake the client counts the sleep
     /// as silence. A closed lid still sleeps. A cancelled wait sends no response.
+    /// Meanwhile the Claude Code session (`agentSession`, when known) is marked waiting and
+    /// its heartbeat refreshed each minute, so the app can say it still waits.
     private func waitForAnswers(id: Any?, key: String, waitId: UUID, token: Any?, projectId: Int64?,
-                                sessionId: String?, minutes: Int) {
+                                sessionId: String?, agentSession: String?, minutes: Int) {
         var assertion: IOPMAssertionID = 0
         let asserted = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
             "QuestBits is waiting for your answers" as CFString, &assertion) == kIOReturnSuccess
         defer {
             if asserted { IOPMAssertionRelease(assertion) }
+            if let agentSession { recordSessionEvent(agentSession, .waitDone, force: true) }
             waitLock.lock()
             if activeWaits[key] == waitId { activeWaits[key] = nil }
             cancelledWaits.remove(waitId)
@@ -204,6 +216,7 @@ final class MCPServer: @unchecked Sendable {
         let start = Date()
         let deadline = start.addingTimeInterval(TimeInterval(minutes * 60))
         var lastProgress = start
+        var lastBeat = start
         var progress = 0
         while true {
             waitLock.lock(); let cancelled = cancelledWaits.contains(waitId); waitLock.unlock()
@@ -215,6 +228,10 @@ final class MCPServer: @unchecked Sendable {
                     respondText(id: id, try answersJSON(projectId: projectId, sessionId: sessionId,
                                                         waitedSeconds: Int(Date().timeIntervalSince(start))))
                     return
+                }
+                if let agentSession, Date().timeIntervalSince(lastBeat) >= Self.waitProgressSeconds {
+                    lastBeat = Date()
+                    recordSessionEvent(agentSession, .wait, force: true)
                 }
                 if let token, Date().timeIntervalSince(lastProgress) >= Self.waitProgressSeconds {
                     progress += 1
@@ -242,6 +259,43 @@ final class MCPServer: @unchecked Sendable {
         var d: [String: Any] = ["answered": answered.map(questionDict), "open": open]
         if let waitedSeconds { d["waited_minutes"] = waitedSeconds / 60 }
         return try jsonString(d)
+    }
+
+    // MARK: - Claude Code session
+
+    /// The Claude Code session this call comes from (AgentSession.id), or nil: the session
+    /// id inside the `session` label when a hook recorded that session, else the session
+    /// the hooks last saw open in the Claude Code process that spawned this server. Claude
+    /// Code gives MCP servers no session id, so without the hooks this is nil.
+    private func agentSessionId(_ args: [String: Any]) -> String? {
+        if let label = try? sessionArg(args), let sid = AgentSession.sessionId(in: label),
+           (try? store.agentSession(id: sid)) != nil {
+            return sid
+        }
+        guard let host else { return nil }
+        return (try? store.currentAgentSession(process: host))?.id
+    }
+
+    /// Refresh the heartbeat of the call's session (`kind` mcp or wait); returns its id.
+    /// Never fails the call: a session that cannot be written is simply not refreshed.
+    @discardableResult
+    private func touchSession(_ args: [String: Any], _ kind: SessionEvent.Kind) -> String? {
+        guard let sid = agentSessionId(args) else { return nil }
+        recordSessionEvent(sid, kind, force: kind != .mcp)
+        return sid
+    }
+
+    /// Write `kind` on session `sid`, at most every `touchEverySeconds` for the same kind
+    /// unless `force`.
+    private func recordSessionEvent(_ sid: String, _ kind: SessionEvent.Kind, force: Bool) {
+        let now = Date()
+        touchLock.lock()
+        let last = lastTouch[sid]
+        let due = force || last == nil || last!.kind != kind || now.timeIntervalSince(last!.at) >= Self.touchEverySeconds
+        if due { lastTouch[sid] = (now, kind) }
+        touchLock.unlock()
+        guard due else { return }
+        _ = try? store.recordSession(SessionEvent(kind, sessionId: sid, at: now))
     }
 
     /// `project_id`/`project_code` and `session` for the question tools; all optional.
@@ -858,7 +912,8 @@ final class MCPServer: @unchecked Sendable {
             let q = try store.askQuestion(
                 taskId: try resolveTaskId(args), kind: kind, prompt: prompt,
                 context: args["context"] as? String ?? "", options: options,
-                blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args))
+                blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args),
+                agentSessionId: agentSessionId(args))
             var d = questionDict(q)
             if q.blocksTask { d["task_status"] = TaskStatus.waiting.rawValue }
             return try jsonString(d)
@@ -1114,6 +1169,7 @@ final class MCPServer: @unchecked Sendable {
         }
         if !q.blocksTask { d["blocks_task"] = false }
         if let s = q.sessionId { d["session"] = s }
+        if let s = q.agentSessionId { d["claude_session"] = s }
         if let a = q.answer { d["answer"] = a }
         if let c = q.answerChoice { d["choice"] = c + 1 }
         if let r = q.cancelReason { d["cancel_reason"] = r }

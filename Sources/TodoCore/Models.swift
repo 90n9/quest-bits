@@ -753,12 +753,15 @@ public struct Question: Identifiable, Codable, Hashable, Sendable {
     public var askedAt: Date
     public var answeredAt: Date?
     public var resumedAt: Date?
+    /// The Claude Code session it was asked from (AgentSession.id), when the MCP server
+    /// knew it; `sessionId` is the agent's own label.
+    public var agentSessionId: String?
 
     public init(id: Int64, taskId: Int64, taskCode: String, taskTitle: String, projectCode: String,
                 sessionId: String?, kind: QuestionKind, prompt: String, context: String,
                 options: [QuestionOption], blocksTask: Bool, status: QuestionStatus,
                 answer: String?, answerChoice: Int?, cancelReason: String?,
-                askedAt: Date, answeredAt: Date?, resumedAt: Date?) {
+                askedAt: Date, answeredAt: Date?, resumedAt: Date?, agentSessionId: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.taskCode = taskCode
@@ -777,6 +780,7 @@ public struct Question: Identifiable, Codable, Hashable, Sendable {
         self.askedAt = askedAt
         self.answeredAt = answeredAt
         self.resumedAt = resumedAt
+        self.agentSessionId = agentSessionId
     }
 }
 

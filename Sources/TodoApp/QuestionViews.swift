@@ -100,6 +100,9 @@ struct QuestionCard: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                 header
+                if let session = model.agentSession(for: question) {
+                    SessionStatusLine(session: session)
+                }
                 Text(question.prompt)
                     .font(Theme.Fonts.heading5)
                     .foregroundStyle(Theme.Colors.ink)

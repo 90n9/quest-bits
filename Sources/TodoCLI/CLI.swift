@@ -6,7 +6,8 @@ import Foundation
 ///
 /// It reads the same database as the app and the MCP server: the flavor's real one
 /// (`Store.defaultDatabaseURL()`), or `TODO_DB_PATH` when set (tests use a scratch copy).
-/// The commands here only read, so the store is opened read-only (`CLIContext.withStore`).
+/// Commands that only read open the store read-only (`CLIContext.withStore`); the `hook`
+/// commands record Claude Code sessions, and never create a missing database.
 ///
 /// Adding a command: write a `CLICommand` and list it in `CLI.commands`. A command with
 /// subcommands (e.g. `hook session-start`, `hook pre-tool-use`) is one entry whose `run`
@@ -17,7 +18,8 @@ enum CLI {
         BriefCommand.command,
         ListCommand.command,
         ShowCommand.command,
-        ExportCommand.command
+        ExportCommand.command,
+        HookCommand.command
     ]
 
     /// The name the user typed (questbits, questbits-dev, or the bundle path), for messages.
@@ -65,6 +67,12 @@ enum CLI {
         do {
             let args = try CLIArgs.parse(rest, options: cmd.options, flags: cmd.flags)
             return try cmd.run(args, CLIContext())
+        } catch where cmd.neverFails {
+            // A hook command: a bad command line must not fail (or block) Claude Code either.
+            if ProcessInfo.processInfo.environment["QUESTBITS_HOOK_DEBUG"] == "1" {
+                printErr("\(programName) \(cmd.name): \(error)")
+            }
+            return 0
         } catch let error as CLIError {
             switch error {
             case .usage(let message):
@@ -117,6 +125,8 @@ struct CLICommand: Sendable {
     let details: String
     var options: Set<String> = []
     var flags: Set<String> = []
+    /// Exit 0 on any error, silently (hook commands: see HookCommand).
+    var neverFails = false
     let run: @Sendable (CLIArgs, CLIContext) throws -> Int32
 
     var help: String {
@@ -218,7 +228,8 @@ struct CLIContext: Sendable {
         }
     }
 
-    /// For commands that write (none yet): the normal open, migrations included.
+    /// For commands that write (the hooks): the normal open, migrations included. Call it
+    /// only when `databaseExists`: it creates a missing database.
     func withWritableStore<T>(_ body: (Store) throws -> T) throws -> T {
         try body(try Store(url: dbURL))
     }

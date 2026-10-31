@@ -477,6 +477,36 @@ public final class Store: @unchecked Sendable {
         );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_page_history_page ON page_history(page_id, id);")
+
+        // --- Additive migration: Claude Code sessions (1.5.0) ---
+        // One row per Claude Code session_id, written by the questbits CLI's hook commands
+        // and refreshed by the MCP server (AgentSession). state running|waiting|idle|ended,
+        // no CHECK (the store validates it). last_seen is the session's heartbeat; pid and
+        // pid_started_at identify its Claude Code process. No prompt or transcript content.
+        exec("""
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            id              TEXT PRIMARY KEY,
+            cwd             TEXT NOT NULL DEFAULT '',
+            project_id      INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            transcript_path TEXT,
+            source          TEXT,
+            state           TEXT NOT NULL DEFAULT 'running',
+            started_at      REAL NOT NULL,
+            last_seen       REAL NOT NULL,
+            last_event      TEXT,
+            ended_at        REAL,
+            end_reason      TEXT,
+            pid             INTEGER,
+            pid_started_at  REAL
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_agent_sessions_pid ON agent_sessions(pid, state);")
+        exec("CREATE INDEX IF NOT EXISTS idx_agent_sessions_seen ON agent_sessions(last_seen);")
+        // The Claude Code session a question was asked from (NULL = unknown), beside the
+        // free-form `session_id` label the agent passes.
+        if !columnExists("questions", "agent_session_id") {
+            exec("ALTER TABLE questions ADD COLUMN agent_session_id TEXT;")
+        }
         pageSearchUsesFTS = migratePageSearchIndex()
 
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
@@ -851,6 +881,10 @@ public final class Store: @unchecked Sendable {
     /// archived ones.
     public func listProjects(includeArchived: Bool = true) throws -> [Project] {
         lock.lock(); defer { lock.unlock() }
+        return try listProjectsUnlocked(includeArchived: includeArchived)
+    }
+
+    private func listProjectsUnlocked(includeArchived: Bool) throws -> [Project] {
         let whereSQL = includeArchived ? "" : "WHERE archived_at IS NULL "
         let stmt = try prepare(
             "SELECT \(Self.projectCols) FROM projects \(whereSQL)ORDER BY archived_at IS NOT NULL, sort_order, id;", [])
@@ -3384,7 +3418,7 @@ public final class Store: @unchecked Sendable {
 
     private static let questionCols = "q.id, q.task_id, t.code, t.title, p.code, q.session_id, q.kind, q.prompt, "
         + "q.context, q.options, q.blocks_task, q.status, q.answer, q.answer_choice, q.cancel_reason, "
-        + "q.asked_at, q.answered_at, q.resumed_at"
+        + "q.asked_at, q.answered_at, q.resumed_at, q.agent_session_id"
     private static let questionFrom = "FROM questions q JOIN tasks t ON t.id = q.task_id JOIN projects p ON p.id = t.project_id"
 
     /// Leave a question for the user on a task (ask_user). Checked before the write: a
@@ -3396,7 +3430,7 @@ public final class Store: @unchecked Sendable {
     /// (on anyone), which keeps that wait and its reason. The task's project must be active.
     public func askQuestion(taskId: Int64, kind: QuestionKind, prompt: String, context: String = "",
                             options: [QuestionOption] = [], blocksTask: Bool = true,
-                            sessionId: String? = nil) throws -> Question {
+                            sessionId: String? = nil, agentSessionId: String? = nil) throws -> Question {
         let prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { throw StoreError.invalid("question is empty") }
         let options = options.map {
@@ -3430,12 +3464,13 @@ public final class Store: @unchecked Sendable {
             // (on the user, or a third party): that wait, and its reason, stay as they are.
             let parks = blocksTask && task.status != .waiting
             try runWrite(
-                "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at, parked) "
-                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, asked_at, "
+                + "parked, agent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 [.int(taskId), session.map(SQLValue.text) ?? .null, .text(kind.rawValue), .text(prompt),
                  .text(context.trimmingCharacters(in: .whitespacesAndNewlines)), .text(optionsJSON),
                  .int(blocksTask ? 1 : 0), .text(QuestionStatus.open.rawValue),
-                 .double(Date().timeIntervalSince1970), .int(parks ? 1 : 0)])
+                 .double(Date().timeIntervalSince1970), .int(parks ? 1 : 0),
+                 Self.blankToNil(agentSessionId).map(SQLValue.text) ?? .null])
             let qid = lastInsertId()
             var eventId: Int64?
             if parks {
@@ -3661,7 +3696,177 @@ public final class Store: @unchecked Sendable {
                 answerChoice: sqlite3_column_type(stmt, 13) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 13)),
                 cancelReason: colTextOpt(stmt, 14),
                 askedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 15)),
-                answeredAt: dateOpt(16), resumedAt: dateOpt(17)))
+                answeredAt: dateOpt(16), resumedAt: dateOpt(17), agentSessionId: colTextOpt(stmt, 18)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    // MARK: - Agent sessions (Claude Code sessions)
+
+    private static let sessionCols = "id, cwd, project_id, transcript_path, source, state, started_at, last_seen, "
+        + "last_event, ended_at, end_reason, pid, pid_started_at"
+
+    /// Record a hook event or QuestBits call on a Claude Code session (`SessionEvent`), in
+    /// one BEGIN IMMEDIATE with the row re-read inside it. A hook event creates the row when
+    /// it is missing; an MCP call only refreshes an existing one (returns nil otherwise).
+    /// - start: running; revives an ended session (resume); refreshes cwd, transcript path,
+    ///   source and process; maps the project from cwd (find_project's rule) when the row is
+    ///   new or has none. Other sessions still open in the same Claude Code process end as
+    ///   `superseded`: a process runs one session at a time (/clear, /resume switch it).
+    /// - prompt: running. stop: idle. end: ended, with the reason.
+    /// - mcp: running, except a waiting session stays waiting (a wait runs in the
+    ///   background while the agent works). wait: waiting. wait_done: running (idle
+    ///   stays idle: the turn ended while the wait ran in the background).
+    ///   These never create a session or touch one that ended.
+    /// Every event moves last_seen (the heartbeat) forward, never back.
+    @discardableResult
+    public func recordSession(_ e: SessionEvent) throws -> AgentSession? {
+        let id = e.sessionId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !id.isEmpty, id.count <= 200 else { throw StoreError.invalid("session id is empty or too long") }
+        let now = e.at.timeIntervalSince1970
+        let cwd = Self.blankToNil(e.cwd)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let existing = try agentSessionUnlocked(id)
+            // An MCP call refreshes a live session only: it neither creates one nor revives one that ended.
+            if !e.createsSession && (existing == nil || existing?.state == .ended) {
+                exec("ROLLBACK;")
+                return existing
+            }
+            if existing == nil {
+                let project = cwd.flatMap { Self.bestProject(for: $0, among: (try? listProjectsUnlocked(includeArchived: false)) ?? []) }
+                try runWrite("INSERT INTO agent_sessions (id, cwd, project_id, started_at, last_seen) VALUES (?, ?, ?, ?, ?);",
+                             [.text(id), .text(cwd ?? ""), project.map { .int($0.id) } ?? .null, .double(now), .double(now)])
+            }
+            let state: SessionState
+            switch e.kind {
+            case .start, .prompt: state = .running
+            case .stop: state = .idle
+            case .end: state = .ended
+            case .mcp: state = existing?.state == .waiting ? .waiting : .running
+            case .wait: state = .waiting
+            case .waitDone: state = existing?.state == .idle ? .idle : .running
+            }
+            var sets = ["state=?", "last_seen=MAX(last_seen, ?)", "last_event=?"]
+            var binds: [SQLValue] = [.text(state.rawValue), .double(now), .text(e.kind.rawValue)]
+            if state == .ended {
+                sets += ["ended_at=?", "end_reason=?"]
+                binds += [.double(now), Self.blankToNil(e.endReason).map(SQLValue.text) ?? .null]
+            } else {
+                sets += ["ended_at=NULL", "end_reason=NULL"]
+            }
+            if let cwd, e.kind == .start || existing?.cwd.isEmpty == true {
+                sets.append("cwd=?"); binds.append(.text(cwd))
+                if existing != nil, existing?.projectId == nil,
+                   let p = Self.bestProject(for: cwd, among: try listProjectsUnlocked(includeArchived: false)) {
+                    sets.append("project_id=?"); binds.append(.int(p.id))
+                }
+            }
+            if let t = Self.blankToNil(e.transcriptPath) { sets.append("transcript_path=?"); binds.append(.text(t)) }
+            if let s = Self.blankToNil(e.source) { sets.append("source=?"); binds.append(.text(s)) }
+            if let p = e.process, e.createsSession {
+                sets += ["pid=?", "pid_started_at=?"]
+                binds += [.int(Int64(p.pid)), .double(p.startedAt.timeIntervalSince1970)]
+            }
+            binds.append(.text(id))
+            try runWrite("UPDATE agent_sessions SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
+            if e.kind == .start, let p = e.process {
+                try runWrite(
+                    "UPDATE agent_sessions SET state=?, ended_at=?, end_reason='superseded' "
+                    + "WHERE id<>? AND pid=? AND ABS(pid_started_at - ?) < 1 AND state<>?;",
+                    [.text(SessionState.ended.rawValue), .double(now), .text(id), .int(Int64(p.pid)),
+                     .double(p.startedAt.timeIntervalSince1970), .text(SessionState.ended.rawValue)])
+            }
+            let row = try agentSessionUnlocked(id)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return row
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// End the open sessions whose Claude Code process is gone (`isRunning` says false for
+    /// its pid and start), as `process_exited`: closing a terminal can skip SessionEnd.
+    /// Sessions with no pid are left alone. Returns how many ended. One BEGIN IMMEDIATE,
+    /// each row re-checked inside it.
+    @discardableResult
+    public func endSessionsWithoutProcess(isRunning: (Int32?, Date?) -> Bool? = ClaudeProcess.isRunning,
+                                          now: Date = Date()) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let open = try readSessionsUnlocked("WHERE state<>? AND pid IS NOT NULL", [.text(SessionState.ended.rawValue)])
+        let gone = open.filter { isRunning($0.pid, $0.pidStartedAt) == false }
+        guard !gone.isEmpty else { return 0 }
+        do {
+            try beginImmediate()
+            var n = 0
+            for s in gone {
+                try runWrite("UPDATE agent_sessions SET state=?, ended_at=?, end_reason='process_exited' "
+                             + "WHERE id=? AND state<>? AND pid=? AND last_seen<=?;",
+                             [.text(SessionState.ended.rawValue), .double(now.timeIntervalSince1970), .text(s.id),
+                              .text(SessionState.ended.rawValue), .int(Int64(s.pid ?? 0)),
+                              .double(s.lastSeen.timeIntervalSince1970)])
+                n += Int(sqlite3_changes(db))
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return n
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    public func agentSession(id: String) throws -> AgentSession? {
+        lock.lock(); defer { lock.unlock() }
+        return try agentSessionUnlocked(id.lowercased())
+    }
+
+    /// The session a Claude Code process runs now: its open session seen last (the MCP
+    /// server's way to know its session, since Claude Code tells MCP servers no session id).
+    public func currentAgentSession(process p: ClaudeProcess) throws -> AgentSession? {
+        lock.lock(); defer { lock.unlock() }
+        return try readSessionsUnlocked(
+            "WHERE pid=? AND ABS(pid_started_at - ?) < 1 AND state<>? ORDER BY last_seen DESC LIMIT 1",
+            [.int(Int64(p.pid)), .double(p.startedAt.timeIntervalSince1970), .text(SessionState.ended.rawValue)]).first
+    }
+
+    /// Sessions seen since `since`, plus any older one an open or answered question was
+    /// asked from (its card shows it); last seen first. `projectId` narrows to one project.
+    public func agentSessions(seenSince since: Date, projectId: Int64? = nil) throws -> [AgentSession] {
+        lock.lock(); defer { lock.unlock() }
+        var sql = "WHERE (last_seen >= ? OR id IN (SELECT agent_session_id FROM questions "
+            + "WHERE status IN ('open', 'answered') AND agent_session_id IS NOT NULL))"
+        var binds: [SQLValue] = [.double(since.timeIntervalSince1970)]
+        if let projectId { sql += " AND project_id=?"; binds.append(.int(projectId)) }
+        return try readSessionsUnlocked(sql + " ORDER BY last_seen DESC", binds)
+    }
+
+    private func agentSessionUnlocked(_ id: String) throws -> AgentSession? {
+        try readSessionsUnlocked("WHERE id=?", [.text(id)]).first
+    }
+
+    private func readSessionsUnlocked(_ whereSQL: String, _ binds: [SQLValue]) throws -> [AgentSession] {
+        let stmt = try prepare("SELECT \(Self.sessionCols) FROM agent_sessions \(whereSQL);", binds)
+        defer { sqlite3_finalize(stmt) }
+        func dateOpt(_ i: Int32) -> Date? {
+            sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
+        }
+        var out: [AgentSession] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(AgentSession(
+                id: colText(stmt, 0), cwd: colText(stmt, 1),
+                projectId: sqlite3_column_type(stmt, 2) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 2),
+                transcriptPath: colTextOpt(stmt, 3), source: colTextOpt(stmt, 4),
+                state: SessionState(rawValue: colText(stmt, 5)) ?? .running,
+                startedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6)),
+                lastSeen: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 7)),
+                lastEvent: colTextOpt(stmt, 8), endedAt: dateOpt(9), endReason: colTextOpt(stmt, 10),
+                pid: sqlite3_column_type(stmt, 11) == SQLITE_NULL ? nil : Int32(truncatingIfNeeded: sqlite3_column_int64(stmt, 11)),
+                pidStartedAt: dateOpt(12)))
             rc = sqlite3_step(stmt)
         }
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }

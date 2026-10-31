@@ -126,6 +126,9 @@ struct ProjectOverview: View {
                     stat("Waiting for your answer", n)
                     if n > 0 { link("Answer…", .questions) }
                 }
+                section("Agent sessions") {
+                    ProjectSessionsList(project: project)
+                }
                 section("Repo folder") {
                     Text(project.repoPath ?? "None").font(Theme.Fonts.caption)
                         .foregroundStyle(project.repoPath == nil ? Theme.Colors.steel : Theme.Colors.slate)
