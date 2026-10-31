@@ -119,7 +119,7 @@ struct QuestionCard: View {
                 }
                 switch question.kind {
                 case .approve: approveBody
-                case .choice, .text: answerBody
+                case .choice, .text, .disagree: answerBody
                 }
                 footer
             }

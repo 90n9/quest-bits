@@ -741,8 +741,14 @@ public struct NoteSearchHit: Hashable, Sendable {
 // MARK: - Questions (ask loop)
 
 /// How a question is answered: pick an option, type text, or approve / edit a draft.
+/// `disagree` is the other way round: the user disagrees with a decision an agent recorded
+/// (Store.disagree), so it is born answered, with the user's reason as the answer, for the
+/// agent to pick up like any answer (get_answers, resume_question). Agents cannot ask one.
 public enum QuestionKind: String, Codable, CaseIterable, Sendable {
-    case choice, text, approve
+    case choice, text, approve, disagree
+
+    /// The kinds ask_user takes.
+    public static var askable: [QuestionKind] { allCases.filter { $0 != .disagree } }
 }
 
 /// open → answered (in the app) → resumed (the agent picked the answer up);
@@ -788,12 +794,15 @@ public struct Question: Identifiable, Codable, Hashable, Sendable {
     /// The Claude Code session it was asked from (AgentSession.id), when the MCP server
     /// knew it; `sessionId` is the agent's own label.
     public var agentSessionId: String?
+    /// A disagreement's decision note (task_notes.id); nil on every other kind.
+    public var aboutNoteId: Int64?
 
     public init(id: Int64, taskId: Int64, taskCode: String, taskTitle: String, projectCode: String,
                 sessionId: String?, kind: QuestionKind, prompt: String, context: String,
                 options: [QuestionOption], blocksTask: Bool, status: QuestionStatus,
                 answer: String?, answerChoice: Int?, cancelReason: String?,
-                askedAt: Date, answeredAt: Date?, resumedAt: Date?, agentSessionId: String? = nil) {
+                askedAt: Date, answeredAt: Date?, resumedAt: Date?, agentSessionId: String? = nil,
+                aboutNoteId: Int64? = nil) {
         self.id = id
         self.taskId = taskId
         self.taskCode = taskCode
@@ -813,6 +822,7 @@ public struct Question: Identifiable, Codable, Hashable, Sendable {
         self.answeredAt = answeredAt
         self.resumedAt = resumedAt
         self.agentSessionId = agentSessionId
+        self.aboutNoteId = aboutNoteId
     }
 }
 

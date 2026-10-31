@@ -603,8 +603,40 @@ public final class Store: @unchecked Sendable {
         exec("CREATE INDEX IF NOT EXISTS idx_notes_history ON task_notes(history_id) WHERE history_id IS NOT NULL;")
         pageSearchUsesFTS = migratePageSearchIndex()
 
+        // --- Additive migration: agent decisions seen, and disagreements (1.5.0, QUE-39) ---
+        // task_notes.reviewed_at: when the user marked a decision seen (or disagreed with it),
+        // NULL = new. questions.about_note_id: the decision note a disagreement is about.
+        if !columnExists("questions", "about_note_id") {
+            exec("ALTER TABLE questions ADD COLUMN about_note_id INTEGER;")
+        }
+        try migrateDecisionReviews()
+        exec("CREATE INDEX IF NOT EXISTS idx_notes_decisions ON task_notes(ts) WHERE kind='decision';")
+        exec("CREATE INDEX IF NOT EXISTS idx_questions_about_note ON questions(about_note_id) "
+             + "WHERE about_note_id IS NOT NULL;")
+
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
         repairStatusFields()
+    }
+
+    /// 1.5.0: add task_notes.reviewed_at, and mark the decisions recorded before the last
+    /// `decisionsNewWindow` seen, so the Decisions page starts with the recent ones as new
+    /// rather than every decision ever written. In one BEGIN IMMEDIATE, re-checked inside
+    /// it, so the app and MCP server opening together backfill it once.
+    private func migrateDecisionReviews() throws {
+        guard !columnExists("task_notes", "reviewed_at") else { return }
+        do {
+            try beginImmediate()
+            if !columnExists("task_notes", "reviewed_at") {
+                try runWrite("ALTER TABLE task_notes ADD COLUMN reviewed_at REAL;", [])
+                let now = Date().timeIntervalSince1970
+                try runWrite("UPDATE task_notes SET reviewed_at=? WHERE kind='decision' AND ts < ?;",
+                             [.double(now), .double(now - Self.decisionsNewWindow)])
+            }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            throw StoreError.open("decision review migration failed: \(error)")
+        }
     }
 
     /// The task_notes table as of 1.4.0. `author` is NULL on older notes (and on notes an
@@ -3587,7 +3619,7 @@ public final class Store: @unchecked Sendable {
 
     private static let questionCols = "q.id, q.task_id, t.code, t.title, p.code, q.session_id, q.kind, q.prompt, "
         + "q.context, q.options, q.blocks_task, q.status, q.answer, q.answer_choice, q.cancel_reason, "
-        + "q.asked_at, q.answered_at, q.resumed_at, q.agent_session_id"
+        + "q.asked_at, q.answered_at, q.resumed_at, q.agent_session_id, q.about_note_id"
     private static let questionFrom = "FROM questions q JOIN tasks t ON t.id = q.task_id JOIN projects p ON p.id = t.project_id"
 
     /// Leave a question for the user on a task (ask_user). Checked before the write: a
@@ -3733,6 +3765,10 @@ public final class Store: @unchecked Sendable {
             guard q.status == .open || q.status == .answered else {
                 throw StoreError.invalid("question \(id) is already \(q.status.rawValue)")
             }
+            guard q.kind != .disagree else {
+                throw StoreError.invalid("question \(id) is the user's disagreement with your decision: "
+                                         + "resume_question \(id), then say what you did (add_note)")
+            }
             try runWrite("UPDATE questions SET status=?, cancel_reason=? WHERE id=?;",
                          [.text(QuestionStatus.cancelled.rawValue), reason.isEmpty ? .null : .text(reason), .int(id)])
             let text = "Withdrew question: \(q.prompt)" + (reason.isEmpty ? "" : "\nReason: \(reason)")
@@ -3869,11 +3905,166 @@ public final class Store: @unchecked Sendable {
                 answerChoice: sqlite3_column_type(stmt, 13) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 13)),
                 cancelReason: colTextOpt(stmt, 14),
                 askedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 15)),
-                answeredAt: dateOpt(16), resumedAt: dateOpt(17), agentSessionId: colTextOpt(stmt, 18)))
+                answeredAt: dateOpt(16), resumedAt: dateOpt(17), agentSessionId: colTextOpt(stmt, 18),
+                aboutNoteId: sqlite3_column_type(stmt, 19) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 19)))
             rc = sqlite3_step(stmt)
         }
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
+    }
+
+    // MARK: - Agent decisions (QUE-39)
+
+    /// Decision notes, newest first, with their task, project, seen state and the user's
+    /// disagreements (`DecisionFilter`; by default an agent's own decisions in active
+    /// projects). An agent's own: author agent and no question behind it (`AgentDecision`).
+    public func decisions(_ filter: DecisionFilter = DecisionFilter()) throws -> [AgentDecision] {
+        lock.lock(); defer { lock.unlock() }
+        let (whereSQL, binds) = Self.decisionWhere(filter)
+        let stmt = try prepare(
+            "SELECT \(Self.qualifiedNoteCols), n.reviewed_at, n.agent_session_id, t.code, t.title, t.status, p.id, p.code "
+            + "FROM task_notes n JOIN tasks t ON t.id = n.task_id JOIN projects p ON p.id = t.project_id "
+            + "\(whereSQL) ORDER BY n.ts DESC, n.id DESC LIMIT ?;",
+            binds + [.int(Int64(max(0, filter.limit)))])
+        defer { sqlite3_finalize(stmt) }
+        var out: [AgentDecision] = []
+        let c = Self.noteColCount
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(AgentDecision(
+                note: noteFromRow(stmt), taskCode: colText(stmt, c + 2), taskTitle: colText(stmt, c + 3),
+                taskStatus: TaskStatus(rawValue: colText(stmt, c + 4)) ?? .todo,
+                projectId: sqlite3_column_int64(stmt, c + 5), projectCode: colText(stmt, c + 6),
+                reviewedAt: sqlite3_column_type(stmt, c) == SQLITE_NULL ? nil
+                    : Date(timeIntervalSince1970: sqlite3_column_double(stmt, c)),
+                agentSessionId: colTextOpt(stmt, c + 1)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        var byNote: [Int64: [Question]] = [:]
+        for chunk in Self.chunked(out.map(\.id)) where !chunk.isEmpty {
+            for q in try readQuestionsUnlocked("WHERE q.about_note_id IN (\(Self.placeholders(chunk.count))) "
+                                               + "ORDER BY q.asked_at DESC, q.id DESC", chunk.map(SQLValue.int)) {
+                byNote[q.aboutNoteId ?? 0, default: []].append(q)
+            }
+        }
+        for i in out.indices { out[i].disagreements = byNote[out[i].id] ?? [] }
+        return out
+    }
+
+    /// How many of an agent's own decisions in active projects the user has not seen yet
+    /// (the sidebar's Decisions badge; not part of Waiting on you).
+    public func newDecisionCount() throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let (whereSQL, binds) = Self.decisionWhere(DecisionFilter(newOnly: true))
+        return Int(queryInt("SELECT COUNT(*) FROM task_notes n JOIN tasks t ON t.id = n.task_id "
+                            + "JOIN projects p ON p.id = t.project_id \(whereSQL);", binds) ?? 0)
+    }
+
+    private static func decisionWhere(_ f: DecisionFilter) -> (String, [SQLValue]) {
+        var conds = ["n.kind='decision'"]
+        var binds: [SQLValue] = []
+        switch f.author {
+        case .agent: conds.append("n.author='agent' AND n.question_id IS NULL")
+        case .user: conds.append("n.author='user'")
+        case .any: conds.append("(n.author IS NOT 'agent' OR n.question_id IS NULL)")
+        }
+        if let pid = f.projectId { conds.append("t.project_id=?"); binds.append(.int(pid)) }
+        if !f.includeArchived { conds.append("p.archived_at IS NULL") }
+        if let from = f.from { conds.append("n.ts >= ?"); binds.append(.double(from.timeIntervalSince1970)) }
+        if let to = f.to { conds.append("n.ts < ?"); binds.append(.double(to.timeIntervalSince1970)) }
+        if f.newOnly { conds.append("n.reviewed_at IS NULL") }
+        if f.disagreedOnly { conds.append("EXISTS(SELECT 1 FROM questions dq WHERE dq.about_note_id = n.id)") }
+        return ("WHERE " + conds.joined(separator: " AND "), binds)
+    }
+
+    /// Mark decisions seen (the app's Mark as Seen). Only decision notes not seen yet
+    /// change; returns how many did. Not task activity: updated_at stays.
+    @discardableResult
+    public func markDecisionsSeen(noteIds: [Int64]) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var changed = 0
+        try inWriteTransaction {
+            for chunk in Self.chunked(noteIds) where !chunk.isEmpty {
+                try runWrite("UPDATE task_notes SET reviewed_at=? WHERE kind='decision' AND reviewed_at IS NULL "
+                             + "AND id IN (\(Self.placeholders(chunk.count)));",
+                             [.double(Date().timeIntervalSince1970)] + chunk.map(SQLValue.int))
+                changed += Int(sqlite3_changes(db))
+            }
+        }
+        return changed
+    }
+
+    /// The user disagrees with a decision note (the app's Disagree), saying `why`. It
+    /// reaches the agent as an answered question of kind disagree — the decision is the
+    /// prompt, `why` the answer, the note's session label and Claude Code session its own —
+    /// so get_answers, get_task and the session brief show it until the agent resumes it.
+    /// It goes on the decision's task; when that task is closed, on a new todo task in the
+    /// same project that relates to it. A review note by the user records it on that task,
+    /// and the decision is marked seen. No task changes status. In one BEGIN IMMEDIATE.
+    /// Repeat-safe: while a disagreement with the note waits for the agent, the same reason
+    /// again returns it (`existing`), another reason is refused.
+    public func disagree(noteId: Int64, why: String) throws -> DisagreeResult {
+        let why = why.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !why.isEmpty else { throw StoreError.invalid("say why you disagree") }
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            guard let note = try readNotes("SELECT \(Self.noteCols) FROM task_notes WHERE id=?;", [.int(noteId)]).first else {
+                throw StoreError.notFound("note \(noteId)")
+            }
+            guard note.kind == .decision else { throw StoreError.invalid("note \(noteId) is not a decision") }
+            if let pending = try readQuestionsUnlocked(
+                "WHERE q.about_note_id=? AND q.status IN ('open', 'answered') ORDER BY q.id DESC LIMIT 1",
+                [.int(noteId)]).first {
+                guard pending.answer == why else {
+                    throw StoreError.invalid("you already disagreed with this decision; the agent has not picked it up yet")
+                }
+                return DisagreeResult(question: pending, createdTask: nil, existing: true)
+            }
+            guard let task = getTaskUnlocked(note.taskId) else { throw StoreError.notFound("task \(note.taskId)") }
+            try requireActiveProjectUnlocked(task.projectId)
+            let excerpt = Self.decisionExcerpt(note.text, max: 300)
+            var target = task
+            var created: TodoTask?
+            if task.status.isClosed {
+                let detail = "The user disagrees with a decision an agent recorded on \(task.code) "
+                    + "(\(task.status.rawValue)): reconsider it.\n\n## Decision (note \(note.id), "
+                    + "\(ISO8601DateFormatter().string(from: note.timestamp)))\n\(note.text)\n\n"
+                    + "## Why the user disagrees\n\(why)"
+                let t = try createTaskUnlocked(
+                    projectId: task.projectId,
+                    title: "Revisit decision in \(task.code): \(Self.decisionExcerpt(note.text, max: 80))",
+                    detail: detail, author: .user)
+                let row = Self.relationRow(t.id, task.id, .relates)
+                try runWrite("INSERT OR IGNORE INTO task_relations (task_id, other_id, kind, created_at) VALUES (?, ?, ?, ?);",
+                             [.int(row.task), .int(row.other), .text(row.kind), .double(Date().timeIntervalSince1970)])
+                if sqlite3_changes(db) == 1 { logRelationUnlocked(row, added: true) }
+                created = t
+                target = t
+            }
+            let now = Date().timeIntervalSince1970
+            let context = "Your decision (note \(note.id) on \(task.code), "
+                + "\(ISO8601DateFormatter().string(from: note.timestamp))):\n\n\(note.text)\n\n"
+                + "The answer is why the user disagrees. Reconsider: resume_question, then change course or "
+                + "explain, and record what you do (add_note kind decision)."
+            let agentSession = queryString("SELECT agent_session_id FROM task_notes WHERE id=?;", [.int(noteId)])
+            try runWrite(
+                "INSERT INTO questions (task_id, session_id, kind, prompt, context, options, blocks_task, status, answer, "
+                + "asked_at, answered_at, parked, agent_session_id, about_note_id) "
+                + "VALUES (?, ?, ?, ?, ?, '[]', 0, ?, ?, ?, ?, 0, ?, ?);",
+                [.int(target.id), note.sessionId.map(SQLValue.text) ?? .null, .text(QuestionKind.disagree.rawValue),
+                 .text("The user disagrees with your decision: “\(excerpt)”"), .text(context),
+                 .text(QuestionStatus.answered.rawValue), .text(why), .double(now), .double(now),
+                 agentSession.map(SQLValue.text) ?? .null, .int(noteId)])
+            let qid = lastInsertId()
+            let where_ = target.id == task.id ? "" : " in \(task.code)"
+            _ = try insertNoteUnlocked(taskId: target.id,
+                                       text: "Disagree with the decision\(where_): “\(excerpt)”\n\n\(why)",
+                                       kind: .review, author: .user, sessionId: nil, questionId: qid)
+            try runWrite("UPDATE task_notes SET reviewed_at=COALESCE(reviewed_at, ?) WHERE id=?;",
+                         [.double(now), .int(noteId)])
+            return DisagreeResult(question: try questionUnlocked(qid), createdTask: created, existing: false)
+        }
     }
 
     // MARK: - Gate (QUE-36)

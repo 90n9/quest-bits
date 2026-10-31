@@ -26,7 +26,7 @@ public enum AgentGuide {
 
         ## Starting a task
         - Pick a short session label (e.g. the repo and the ticket) and pass it as `session` to ask_user, get_answers, wait_for_answers and the notes you write, so you only pick up answers to your own questions. If your session's start context has a line `QuestBits session: <id>`, use that id as the label (a subagent adds a suffix, e.g. `<id>/QUE-3`): the app then shows whether your session still waits and how to resume it.
-        - Read the task with get_task, then call get_answers and finish answered questions first (resume_question, then act on the answer).
+        - Read the task with get_task, then call get_answers and finish answered questions first (resume_question, then act on the answer). A question of kind disagree is the user disagreeing with a decision you recorded: reconsider it, then change course or explain why not, and record what you do.
         - Move the task to in_progress when you start on it.
 
         ## Asking the user

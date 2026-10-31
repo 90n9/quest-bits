@@ -96,6 +96,7 @@ enum BriefCommand {
         }
         section(&out, "In progress", inProgress, rel)
         section(&out, "Waiting on you", waitingOnUser, rel)
+        out += try disagreements(p, store: store)
         if next > 0 {
             out += try nextSection(p, store: store, next: next, holderId: holderId, rel: rel)
         }
@@ -143,6 +144,17 @@ enum BriefCommand {
         out += ["", "## \(title)"]
         out += tasks.prefix(listCap).map { "- " + Fmt.taskLine($0, rel) }
         if tasks.count > listCap { out.append("- …\(tasks.count - listCap) more") }
+    }
+
+    /// The user's disagreements with agents' decisions that no agent has picked up yet
+    /// (QUE-39), so whichever session starts here sees them.
+    private static func disagreements(_ p: Project, store: Store) throws -> [String] {
+        let pending = try store.questions(statuses: [.answered], projectId: p.id).filter { $0.kind == .disagree }
+        guard !pending.isEmpty else { return [] }
+        var out = ["", "## The user disagrees (reconsider before new work)"]
+        out += pending.prefix(listCap).map { "- \($0.taskCode): " + questionLine($0) }
+        if pending.count > listCap { out.append("- …\(pending.count - listCap) more: get_answers") }
+        return out
     }
 
     private static func milestones(_ p: Project, store: Store) throws -> [String] {

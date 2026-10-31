@@ -1047,6 +1047,28 @@ final class MCPServer: @unchecked Sendable {
                 return d
             })
 
+        case "decisions":
+            let pid = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            var since: Date?
+            if given(args, "since") {
+                guard let d = parseDate(args["since"]) else {
+                    throw MCPError.invalidArg("since must be an ISO-8601 time or yyyy-MM-dd")
+                }
+                since = d
+            }
+            var author = DecisionAuthor.agent
+            if given(args, "author") {
+                guard let s = args["author"] as? String, let a = DecisionAuthor(rawValue: s) else {
+                    throw MCPError.invalidArg("author must be one of: agent, user, any")
+                }
+                author = a
+            }
+            let filter = DecisionFilter(projectId: pid, from: since, author: author,
+                                        disagreedOnly: try boolArg(args, "disagreed") ?? false,
+                                        includeArchived: true, limit: try limitArg(args, "limit", default: 50, max: 200))
+            return try jsonString(store.decisions(filter).map(decisionDict))
+
         case "get_note_history":
             let noteId = try requireInt(args, "note_id")
             let note = try store.note(id: noteId)
@@ -1315,6 +1337,28 @@ final class MCPServer: @unchecked Sendable {
         return d
     }
 
+    /// A decision in `decisions`: the note (as in get_task) plus task, title, task_status,
+    /// project, seen_at (when the user marked it seen) and the user's disagreements.
+    private func decisionDict(_ d: AgentDecision) -> [String: Any] {
+        var out = noteDict(d.note)
+        out["task"] = taskHandle(code: d.taskCode, id: d.note.taskId)
+        out["title"] = d.taskTitle
+        out["task_status"] = d.taskStatus.rawValue
+        out["project"] = d.projectCode
+        if let s = d.agentSessionId { out["claude_session"] = s }
+        if let t = d.reviewedAt { out["seen_at"] = iso(t) }
+        if !d.disagreements.isEmpty {
+            out["disagreements"] = d.disagreements.map { q -> [String: Any] in
+                var dq: [String: Any] = ["question_id": q.id, "task": taskHandle(code: q.taskCode, id: q.taskId),
+                                         "why": q.answer ?? "", "at": iso(q.answeredAt ?? q.askedAt),
+                                         "status": q.status.rawValue]
+                if let t = q.resumedAt { dq["resumed_at"] = iso(t) }
+                return dq
+            }
+        }
+        return out
+    }
+
     /// A question as the question tools return it. Options are numbered from 1, as the
     /// user picks them; empty and default fields are omitted.
     private func questionDict(_ q: Question) -> [String: Any] {
@@ -1333,6 +1377,7 @@ final class MCPServer: @unchecked Sendable {
         if !q.blocksTask { d["blocks_task"] = false }
         if let s = q.sessionId { d["session"] = s }
         if let s = q.agentSessionId { d["claude_session"] = s }
+        if let n = q.aboutNoteId { d["about_note"] = n }
         if let a = q.answer { d["answer"] = a }
         if let c = q.answerChoice { d["choice"] = c + 1 }
         if let r = q.cancelReason { d["cancel_reason"] = r }
@@ -1781,8 +1826,8 @@ final class MCPServer: @unchecked Sendable {
     /// ask_user `kind`: choice (default), text or approve.
     private func questionKindArg(_ args: [String: Any]) throws -> QuestionKind {
         guard given(args, "kind") else { return .choice }
-        guard let s = args["kind"] as? String, let k = QuestionKind(rawValue: s) else {
-            throw MCPError.invalidArg("kind must be one of: \(QuestionKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        guard let s = args["kind"] as? String, let k = QuestionKind(rawValue: s), QuestionKind.askable.contains(k) else {
+            throw MCPError.invalidArg("kind must be one of: \(QuestionKind.askable.map(\.rawValue).joined(separator: ", "))")
         }
         return k
     }

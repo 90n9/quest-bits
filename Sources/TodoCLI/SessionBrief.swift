@@ -100,11 +100,16 @@ extension BriefCommand {
         return out
     }
 
-    /// "#12 open: prompt (asked 5 min ago)", or "#13 answered “…”: resume_question 13, then act on it".
-    private static func questionLine(_ q: Question) -> String {
+    /// "#12 open: prompt (asked 5 min ago)", or "#13 answered “…”: resume_question 13, then act on it";
+    /// a disagreement: "#14 The user disagrees with your decision: “…” Why: “…”: resume_question 14, …".
+    static func questionLine(_ q: Question) -> String {
         let prompt = Fmt.oneLine(q.prompt, max: 160)
         guard q.status == .answered else {
             return "#\(q.id) open: \(prompt) (asked \(TaskClaim.ago(q.askedAt)))"
+        }
+        if q.kind == .disagree {
+            return "#\(q.id) \(prompt) Why: “\(Fmt.oneLine(q.answer ?? "", max: 200))”: "
+                + "resume_question \(q.id), then reconsider and record what you do"
         }
         let picked = q.answerChoice.flatMap { q.options.indices.contains($0) ? q.options[$0].label : nil }
         let answer = [picked, q.answer.flatMap { $0.isEmpty ? nil : $0 }].compactMap { $0 }.joined(separator: " · ")

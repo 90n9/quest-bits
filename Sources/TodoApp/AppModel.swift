@@ -101,6 +101,18 @@ final class AppModel: ObservableObject {
     @Published private(set) var activityHasMore = false
     @Published var activitySelection: ActivityGroup.ID?
     private var activityEvents: [ActivityEvent] = []
+    /// Decisions page (QUE-39): the decisions agents recorded on their own, newest first,
+    /// with Mark as Seen and Disagree. Filters: project, day, all / new / disagreed.
+    /// `newDecisionCount` (the sidebar badge) is refreshed with the questions; it is not
+    /// part of Waiting on you.
+    @Published var showDecisions = false
+    @Published var decisionsProjectId: Int64? { didSet { if decisionsProjectId != oldValue { reloadDecisions() } } }
+    @Published var decisionsDay: ActivityDay = .any { didSet { if decisionsDay != oldValue { reloadDecisions() } } }
+    @Published var decisionsShow: DecisionShow = .all { didSet { if decisionsShow != oldValue { reloadDecisions() } } }
+    @Published private(set) var decisions: [AgentDecision] = []
+    @Published var decisionSelection: AgentDecision.ID?
+    @Published private(set) var newDecisionCount = 0
+    static let decisionsShown = 500
     private var activityLimit = AppModel.activityPage
     static let activityPage = 300
     /// What waits on the user now, refreshed with the questions (so with every poll) and
@@ -137,7 +149,7 @@ final class AppModel: ObservableObject {
     /// so its tabs are.
     var selectedProject: Project? {
         guard smartView == nil, !showDashboard, !showQuestions, !showArchived, !showInbox, !showActivity,
-              let id = selectedProjectId else { return nil }
+              !showDecisions, let id = selectedProjectId else { return nil }
         return projects.first { $0.id == id }
     }
 
@@ -218,6 +230,7 @@ final class AppModel: ObservableObject {
         reloadTasks()
         if showDashboard { reloadDashboard() }
         if showActivity { reloadActivity() }
+        if showDecisions { reloadDecisions() }
         reloadWiki()
     }
 
@@ -295,6 +308,7 @@ final class AppModel: ObservableObject {
         if let sessions = try? store.sessionsNeedingUser() { attentionSessions = sessions }
         rebuildWaitingOnYou()
         notifyNewWaiting(readAt: readAt)
+        if let n = try? store.newDecisionCount(), n != newDecisionCount { newDecisionCount = n }
     }
 
     /// Notify about what newly waits on the user (QUE-26): one notification per read, for
@@ -378,6 +392,7 @@ final class AppModel: ObservableObject {
         showArchived = false
         showInbox = false
         showActivity = false
+        showDecisions = false
         smartView = nil
         selectedProjectId = id
         selectedTaskIds = []
@@ -391,6 +406,7 @@ final class AppModel: ObservableObject {
         showArchived = false
         showInbox = false
         showActivity = false
+        showDecisions = false
         smartView = v
         selectedProjectId = nil
         selectedTaskIds = []
@@ -404,6 +420,7 @@ final class AppModel: ObservableObject {
         showArchived = false
         showInbox = false
         showActivity = false
+        showDecisions = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -417,6 +434,7 @@ final class AppModel: ObservableObject {
         showArchived = false
         showInbox = false
         showActivity = false
+        showDecisions = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []
@@ -428,6 +446,7 @@ final class AppModel: ObservableObject {
     func selectInbox() {
         showInbox = true
         showActivity = false
+        showDecisions = false
         showQuestions = false
         showDashboard = false
         showArchived = false
@@ -443,6 +462,7 @@ final class AppModel: ObservableObject {
     /// Show the Activity page, for one project or (nil) every project not archived.
     func selectActivity(projectId: Int64? = nil) {
         showActivity = true
+        showDecisions = false
         showInbox = false
         showQuestions = false
         showDashboard = false
@@ -494,6 +514,77 @@ final class AppModel: ObservableObject {
             selectProjectTab(.wiki)
             wikiSelection = .page(id)
         }
+    }
+
+    // MARK: - Decisions page (QUE-39)
+
+    /// Show the Decisions page, for one project or (nil) every project not archived.
+    func selectDecisions(projectId: Int64? = nil) {
+        showDecisions = true
+        showActivity = false
+        showInbox = false
+        showQuestions = false
+        showDashboard = false
+        showArchived = false
+        smartView = nil
+        selectedProjectId = nil
+        selectedTaskIds = []
+        searchQuery = ""
+        decisionSelection = nil
+        if decisionsProjectId != projectId { decisionsProjectId = projectId } else { reloadDecisions() }
+    }
+
+    /// Reread the list with the filters (on every DB change while the page shows). The
+    /// selection stays while its decision is listed, else moves to the newest.
+    func reloadDecisions() {
+        guard showDecisions else { return }
+        let range = decisionsDay.range()
+        let filter = DecisionFilter(projectId: decisionsProjectId, from: range?.from, to: range?.to,
+                                    newOnly: decisionsShow == .new, disagreedOnly: decisionsShow == .disagreed,
+                                    limit: Self.decisionsShown)
+        guard let list = try? store.decisions(filter) else { return }
+        if list != decisions { decisions = list }
+        if decisionSelection.map({ id in !list.contains { $0.id == id } }) ?? true {
+            decisionSelection = list.first?.id
+        }
+    }
+
+    /// Mark decisions seen (one, or every new one listed).
+    func markDecisionsSeen(_ ids: [Int64]) {
+        do {
+            try store.markDecisionsSeen(noteIds: ids)
+        } catch {
+            flashToast("Couldn't mark as seen: \(error)")
+        }
+        reloadDecisions()
+        if let n = try? store.newDecisionCount() { newDecisionCount = n }
+    }
+
+    /// Send the user's disagreement with a decision to the agent (Store.disagree). Returns
+    /// whether it was sent, so the form can close.
+    @discardableResult
+    func disagree(with d: AgentDecision, why: String) -> Bool {
+        do {
+            let r = try store.disagree(noteId: d.id, why: why)
+            if let t = r.createdTask {
+                flashToast("\(d.taskCode) is closed: sent to the agent as \(t.code)")
+            } else {
+                flashToast("Sent to the agent on \(r.question.taskCode)")
+            }
+            reloadTasks()
+            reloadDecisions()
+            if let n = try? store.newDecisionCount() { newDecisionCount = n }
+            return true
+        } catch {
+            flashToast("Couldn't send: \(error)")
+            return false
+        }
+    }
+
+    /// Open a decision's task (or the task its disagreement went to).
+    func openDecisionTask(_ taskId: Int64, projectId: Int64) {
+        selectProject(projectId)
+        openTask(taskId)
     }
 
     /// The "Waiting on you" page with `item` selected (the menu bar's entries), or its
@@ -572,6 +663,7 @@ final class AppModel: ObservableObject {
         showDashboard = false
         showInbox = false
         showActivity = false
+        showDecisions = false
         smartView = nil
         selectedProjectId = nil
         selectedTaskIds = []

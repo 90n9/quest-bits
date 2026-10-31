@@ -206,6 +206,15 @@ extension MCPServer {
                 "limit": ["type": "integer", "minimum": 1, "maximum": 100] as [String: Any]
              ], required: ["query"])],
 
+            ["name": "decisions",
+             "description": "Decisions recorded as notes (add_note kind decision), newest first, across projects — e.g. to look back at what agents decided on their own. `author`: agent (default: decisions agents made themselves, not answers they resumed), user (the user's: answers an agent resumed, notes they wrote), or any. Optional `project_id`/`project_code`, `since` (ISO-8601 or yyyy-MM-dd), `disagreed` true (only those the user disagreed with), `limit` (default 50, max 200). Archived projects are included. Each is a note (as in get_task) plus task, title, task_status, project, seen_at (when the user marked it seen in the app) and `disagreements` [{question_id, task, why, at, status, resumed_at?}]: a disagreement reaches you as a question of kind disagree, already answered with the user's reason (get_answers, get_task); resume it, then change course or explain, and record what you do.",
+             "inputSchema": obj([
+                "project_id": int, "project_code": str, "since": str,
+                "author": ["type": "string", "enum": DecisionAuthor.allCases.map(\.rawValue)] as [String: Any],
+                "disagreed": ["type": "boolean"] as [String: Any],
+                "limit": ["type": "integer", "minimum": 1, "maximum": 200] as [String: Any]
+             ])],
+
             ["name": "get_note_history",
              "description": "A note (`note_id`, the `id` in get_task notes) with `edits`: its earlier texts, newest first, each with when it was replaced. Only the user edits notes, in the app.",
              "inputSchema": obj(["note_id": int], required: ["note_id"])],
@@ -214,7 +223,7 @@ extension MCPServer {
              "description": "Leave a question for the user on a task (`id` or `code`) and keep working on something else — do not end your turn to wait. The user answers in the QuestBits app when convenient. `kind`: choice (default; 2–4 `options`), text (free answer; up to 4 suggested options) or approve (approve or edit a draft given in `context`; no options). Options are strings or {label, note}; `recommended` is the option number (from 1) or label you recommend — give one, with the reason in its note or the context. `context`: short markdown the user needs to decide. By default the question blocks the task: it moves to waiting on the user until every blocking question is answered, then back to todo. `blocks_task` false asks without blocking. Also logs a question note. Returns the question with its `id` (and `claude_session`, the Claude Code session it was linked to, when QuestBits' hooks recorded it). Later: get_answers / wait_for_answers, then resume_question.",
              "inputSchema": obj([
                 "id": int, "code": str, "question": str,
-                "kind": ["type": "string", "enum": QuestionKind.allCases.map(\.rawValue)] as [String: Any],
+                "kind": ["type": "string", "enum": QuestionKind.askable.map(\.rawValue)] as [String: Any],
                 "options": ["type": "array", "maxItems": 4, "items": ["anyOf": [
                     str, obj(["label": str, "note": str], required: ["label"])
                 ]] as [String: Any]] as [String: Any],
@@ -225,7 +234,7 @@ extension MCPServer {
              ], required: ["question"])],
 
             ["name": "get_answers",
-             "description": "Questions the user has answered that are not resumed yet, oldest first, plus how many are still `open`: {answered: [question...], open: N}. Each answered question has `answer` (and `choice`, the option number, when an option was picked). Call it before starting new work and act on answers first: resume_question, then continue the task. Optional project and session filters.",
+             "description": "Questions the user has answered that are not resumed yet, oldest first, plus how many are still `open`: {answered: [question...], open: N}. Each answered question has `answer` (and `choice`, the option number, when an option was picked). A question of kind disagree is the user disagreeing with a decision you recorded (`about_note` is that note; `answer` says why): reconsider it. Call it before starting new work and act on answers first: resume_question, then continue the task. Optional project and session filters.",
              "inputSchema": obj(questionFilter)],
 
             ["name": "wait_for_answers",
@@ -239,7 +248,7 @@ extension MCPServer {
              "inputSchema": obj(["id": int, "session": sessionStr], required: ["id"])],
 
             ["name": "cancel_question",
-             "description": "Withdraw a question (`id`) that is open or answered but no longer needed, e.g. you found the answer yourself. `reason` says why (recorded as a decision note by the agent). A blocking question releases its task as resume_question does.",
+             "description": "Withdraw a question (`id`) that is open or answered but no longer needed, e.g. you found the answer yourself (not a disagreement: resume that one). `reason` says why (recorded as a decision note by the agent). A blocking question releases its task as resume_question does.",
              "inputSchema": obj(["id": int, "reason": str, "session": sessionStr], required: ["id"])],
 
             ["name": "get_task_history",

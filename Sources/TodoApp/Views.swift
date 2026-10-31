@@ -24,6 +24,9 @@ struct ContentView: View {
                 } else if model.showActivity {
                     ActivityListView()
                         .navigationSplitViewColumnWidth(min: 320, ideal: 400)
+                } else if model.showDecisions {
+                    DecisionListView()
+                        .navigationSplitViewColumnWidth(min: 320, ideal: 400)
                 } else if model.showQuestions {
                     QuestionListView()
                         .navigationSplitViewColumnWidth(min: 260, ideal: 320)
@@ -50,6 +53,8 @@ struct ContentView: View {
                     InboxDetailView()
                 } else if model.showActivity {
                     ActivityDetailView()
+                } else if model.showDecisions {
+                    DecisionDetailView()
                 } else if model.showQuestions {
                     QuestionDetailView()
                 } else if model.showDashboard {
@@ -231,6 +236,24 @@ struct ProjectSidebar: View {
             .help("What you and your agents did: changes, notes and wiki edits")
     }
 
+    /// "Decisions": what agents decided on their own (DecisionListView); the badge counts
+    /// the ones not seen yet.
+    private var decisionsRow: some View {
+        Label {
+            HStack {
+                Text("Decisions")
+                Spacer()
+                if model.newDecisionCount > 0 { inboxBadge(model.newDecisionCount) }
+            }
+        } icon: { QBIcon(name: "lucide-crown") }
+            .font(Theme.Fonts.bodySmMedium)
+            .foregroundStyle(model.showDecisions ? Theme.Colors.brandBlue : Theme.Colors.ink)
+            .contentShape(Rectangle())
+            .onTapGesture { model.selectDecisions() }
+            .listRowBackground(sidebarRowCard(model.showDecisions))
+            .help("Decisions your agents made on their own: mark them seen, or disagree")
+    }
+
     private func inboxBadge(_ n: Int) -> some View {
         Text("\(n)")
             .font(Theme.Fonts.micro)
@@ -256,6 +279,7 @@ struct ProjectSidebar: View {
                         .listRowBackground(sidebarRowCard(model.smartView == v))
                 }
                 activityRow
+                decisionsRow
                 Label { Text("Dashboard") } icon: { QBIcon(name: "lucide-castle") }
                     .font(Theme.Fonts.bodySmMedium)
                     .foregroundStyle(model.showDashboard ? Theme.Colors.brandBlue : Theme.Colors.ink)
@@ -370,7 +394,7 @@ struct ProjectSidebar: View {
     /// True while the selected sidebar item is an archived project.
     private var selectedIsArchived: Bool {
         guard model.smartView == nil, !model.showDashboard, !model.showQuestions, !model.showArchived, !model.showInbox,
-              !model.showActivity,
+              !model.showActivity, !model.showDecisions,
               let sel = model.selectedProjectId else { return false }
         return model.archivedProjects.contains { $0.id == sel }
     }
@@ -410,7 +434,7 @@ struct ProjectSidebar: View {
         .tag(p.id)
         .listRowBackground(sidebarRowCard(
             model.smartView == nil && !model.showDashboard && !model.showQuestions && !model.showArchived
-                && !model.showInbox && !model.showActivity
+                && !model.showInbox && !model.showActivity && !model.showDecisions
                 && model.selectedProjectId == p.id))
         .help(p.detail.isEmpty ? p.name : p.detail)
         .contextMenu {
@@ -418,6 +442,7 @@ struct ProjectSidebar: View {
             Button("Edit…") { editing = p }
             Button("Edit Guide…") { guideProject = p }
             Button("Show Activity") { model.selectActivity(projectId: p.id) }
+            Button("Show Decisions") { model.selectDecisions(projectId: p.id) }
             // No new tasks in an archived project (the store refuses them too).
             if !p.isArchived {
                 if model.templates.isEmpty {
@@ -2588,7 +2613,7 @@ struct NoteRow: View {
                 Text("with status \(e.oldValue) → \(e.newValue)")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
             }
-            if note.kind == .question, let q = question { questionFooter(q) }
+            if let q = question, note.kind == .question || q.kind == .disagree { questionFooter(q) }
         }
         .padding(.vertical, 2)
     }
@@ -2607,6 +2632,9 @@ struct NoteRow: View {
                 .buttonStyle(QBLinkButtonStyle())
                 .font(Theme.Fonts.micro)
             }
+        case .answered where q.kind == .disagree, .resumed where q.kind == .disagree:
+            Text(q.status == .answered ? "Sent to the agent · not picked up yet" : "Picked up by the agent")
+                .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.mossDark)
         case .answered, .resumed:
             Text("Answered: \(q.answer ?? "")" + (q.status == .answered ? " · agent has not picked it up yet" : ""))
                 .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.mossDark)
