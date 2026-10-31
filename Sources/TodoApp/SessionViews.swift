@@ -193,6 +193,9 @@ struct SessionRow: View {
 /// over or it closes. Re-read every minute, so a claim that lapses without any write shows.
 struct ClaimChip: View {
     let claim: TaskClaim
+    /// Add the last heartbeat ("agent · 3 min ago"): subtask rows, where many tasks of a
+    /// set are in progress and the claim is what tells the one being worked on now.
+    var showAge = false
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
@@ -200,8 +203,13 @@ struct ClaimChip: View {
         }
     }
 
+    private func text(live: Bool, now: Date) -> String {
+        let base = live ? "agent" : "agent (expired)"
+        return showAge ? "\(base) · \(TaskClaim.ago(claim.heartbeatAt, now: now))" : base
+    }
+
     private func chip(live: Bool, now: Date) -> some View {
-        Label(live ? "agent" : "agent (expired)", systemImage: live ? "bolt.fill" : "bolt.slash")
+        Label(text(live: live, now: now), systemImage: live ? "bolt.fill" : "bolt.slash")
             .font(Theme.Fonts.micro)
             .padding(.horizontal, 6).padding(.vertical, 1)
             .background(live ? Theme.Colors.tealLight : Theme.Colors.surface, in: Capsule())

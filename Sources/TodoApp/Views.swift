@@ -1283,14 +1283,7 @@ struct TaskRow: View {
                                 .foregroundStyle(doneCount == countedSubtasks ? Theme.Colors.successAccent : Theme.Colors.steel)
                                 .help("\(doneCount) of \(countedSubtasks) subtasks done")
                         }
-                        if isBlocked {
-                            Text("🔒 blocked")
-                                .font(Theme.Fonts.micro)
-                                .padding(.horizontal, 6).padding(.vertical, 1)
-                                .background(Theme.Colors.brandRed, in: Capsule())
-                                .foregroundStyle(Theme.Colors.coralDark)
-                                .help("Blocked by an unfinished dependency")
-                        }
+                        if isBlocked { BlockedChip() }
                         if let n = model.blockingCounts[task.id] { BlocksOthersMark(count: n) }
                         WaitingChip(task: task)
                         if let claim = task.claim, !task.status.isClosed { ClaimChip(claim: claim) }
@@ -1343,7 +1336,7 @@ struct TaskRow: View {
                 if model.canAddTask(to: task.projectId) {
                     if addingSubtask {
                         HStack(spacing: 8) {
-                            Image(systemName: "square").foregroundStyle(Theme.Colors.steel)
+                            Image(systemName: qbStatusIcon(.todo)).foregroundStyle(Theme.Colors.steel)
                             TextField("Subtask title", text: $newSubtaskTitle)
                                 .textFieldStyle(.roundedBorder)
                                 .font(Theme.Fonts.bodySm)
@@ -1439,27 +1432,23 @@ struct FlowLayout: Layout {
     }
 }
 
-/// A single subtask line: checkbox + title, indented under its parent.
+/// A single subtask line, indented under its parent: the status glyph the task rows use
+/// (a click still toggles done), the title, and the marks that tell subtasks apart when
+/// a whole set is in progress: waiting, blocked, blocks others, and the agent working on it.
 struct SubtaskRow: View {
     @EnvironmentObject var model: AppModel
     let sub: TodoTask
 
     var body: some View {
         HStack(spacing: 8) {
-            Button(action: { model.toggleSubtaskDone(sub) }) {
-                Image(systemName: subtaskBox)
-                    .foregroundStyle(sub.status.isClosed ? qbStatusColor(sub.status) : Theme.Colors.steel)
-                    .font(.system(size: 14))
-            }
-            .buttonStyle(.plain)
-            .help("Toggle done")
-
+            statusButton
             Text(sub.title)
                 .font(Theme.Fonts.bodySm)
                 .strikethrough(sub.status.isClosed)
                 .foregroundStyle(qbTitleColor(sub.status))
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer()
+            Spacer(minLength: 4)
+            marks
         }
         .padding(.vertical, 2)
         .padding(.horizontal, 6)
@@ -1474,12 +1463,38 @@ struct SubtaskRow: View {
 
     private var selected: Bool { model.selectedTaskId == sub.id }
 
-    private var subtaskBox: String {
-        switch sub.status {
-        case .done: return "checkmark.square.fill"
-        case .dropped: return "xmark.square"
-        case .todo, .inProgress, .waiting: return "square"
+    private var statusButton: some View {
+        Button(action: { model.toggleSubtaskDone(sub) }) {
+            Image(systemName: qbStatusIcon(sub.status))
+                .foregroundStyle(qbStatusColor(sub.status))
+                .font(.system(size: 14))
         }
+        .buttonStyle(.plain)
+        .help("\(sub.status.display) · click to \(sub.status.isClosed ? "reopen" : "mark done")")
+    }
+
+    /// Right-aligned marks at their natural size. A closed subtask shows no claim, as
+    /// elsewhere in the app; the chip says how long ago the agent last checked in.
+    private var marks: some View {
+        HStack(spacing: 6) {
+            WaitingChip(task: sub)
+            if model.blockedTaskIds.contains(sub.id) { BlockedChip() }
+            if let n = model.blockingCounts[sub.id] { BlocksOthersMark(count: n) }
+            if let claim = sub.claim, !sub.status.isClosed { ClaimChip(claim: claim, showAge: true) }
+        }
+        .fixedSize()
+    }
+}
+
+/// The list's chip on a task an unfinished dependency still holds up.
+struct BlockedChip: View {
+    var body: some View {
+        Text("🔒 blocked")
+            .font(Theme.Fonts.micro)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(Theme.Colors.brandRed, in: Capsule())
+            .foregroundStyle(Theme.Colors.coralDark)
+            .help("Blocked by an unfinished dependency")
     }
 }
 
