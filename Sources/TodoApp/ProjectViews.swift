@@ -5,7 +5,7 @@ import SwiftUI
 /// The tabs of a project's page. Tasks is the list (or board) and task detail as before;
 /// the others show the rest of the project in place of popups and the sidebar menu.
 enum ProjectTab: String, CaseIterable, Identifiable {
-    case tasks, detail, guide, questions
+    case tasks, detail, wiki, guide, questions
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum ProjectTab: String, CaseIterable, Identifiable {
         switch self {
         case .tasks: return "Tasks"
         case .detail: return "Detail"
+        case .wiki: return "Wiki"
         case .guide: return "Guide"
         case .questions: return "Questions"
         }
@@ -61,6 +62,7 @@ struct ProjectTabColumn: View {
         switch tab {
         case .tasks: EmptyView()
         case .detail: ProjectOverview(project: project)
+        case .wiki: WikiListView(project: project)
         case .guide: GuideContextView(project: project)
         case .questions: QuestionListView()
         }
@@ -81,6 +83,7 @@ struct ProjectTabDetail: View {
             GuideEditor(project: project, showsBuiltIn: false).id(project.id)
                 .padding(Theme.Spacing.lg)
                 .qbParchment()
+        case .wiki: WikiDetailView()
         case .questions: QuestionDetailView()
         }
     }
@@ -111,6 +114,12 @@ struct ProjectOverview: View {
                 }
                 section("Milestones") {
                     MilestonesSection(project: project)
+                }
+                section("Wiki") {
+                    let pages = model.wikiCounts(projectId: project.id)
+                    stat("Decisions", pages[.decision] ?? 0)
+                    stat("Notes", pages[.note] ?? 0)
+                    link("Open Wiki", .wiki)
                 }
                 section("Questions") {
                     let n = model.openQuestions.filter { $0.projectCode == project.code }.count

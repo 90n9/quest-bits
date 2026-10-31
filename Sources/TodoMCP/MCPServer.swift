@@ -317,6 +317,14 @@ final class MCPServer: @unchecked Sendable {
             d["open"] = c.open
             d["in_progress"] = c.inProgress
             d["waiting_on_user"] = c.waitingOnUser
+            // What an agent starting here should read: the project's guide (not a wiki
+            // page), and how many wiki pages it can search.
+            if let g = try store.guide(projectId: p.id), !g.markdown.isEmpty {
+                d["guide"] = g.markdown
+                d["guide_version"] = g.id
+            }
+            let pages = try store.pageCounts(projectId: p.id)
+            d["wiki"] = PageKind.allCases.reduce(into: [String: Any]()) { $0[$1.plural.lowercased()] = pages[$1] ?? 0 }
             return try jsonString(["path": resolved, "project": d] as [String: Any])
 
         case "archive_project", "unarchive_project":
@@ -703,6 +711,105 @@ final class MCPServer: @unchecked Sendable {
             return try jsonString(["deleted": m.name, "project": store.projectCode(id: m.projectId) ?? "",
                                    "unassigned": unassigned] as [String: Any])
 
+        case "list_pages":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let kind = try pageKindArg(args)
+            var d: [String: Any] = ["project": try scopeName(pid),
+                                    "pages": try store.pages(projectId: pid, kind: kind).map { pageDict($0, full: false) }]
+            if kind != .note, try boolArg(args, "include_notes") ?? true {
+                d["decision_notes"] = try store.decisionNotes(projectId: pid, limit: 50).map { hit in
+                    ["note_id": hit.note.id, "task": taskHandle(code: hit.taskCode, id: hit.note.taskId),
+                     "ts": iso(hit.note.timestamp), "text": Self.firstLine(hit.note.text)] as [String: Any]
+                }
+            }
+            return try jsonString(d)
+
+        case "get_page":
+            return try jsonString(pageDict(store.page(id: try resolvePageId(args)), full: true))
+
+        case "create_page":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let prov = PageProvenance(
+                source: try optionalStringArg(args, "source") ?? nil, key: try optionalStringArg(args, "source_key") ?? nil,
+                author: try optionalStringArg(args, "source_author") ?? nil,
+                session: try optionalStringArg(args, "source_session") ?? nil,
+                timestamp: try sourceTimestampArg(args))
+            let made = try store.createPage(
+                projectId: pid, kind: try pageKindArg(args) ?? .note, title: try requireString(args, "title"),
+                body: (try optionalStringArg(args, "body") ?? nil) ?? "",
+                outcome: try optionalStringArg(args, "outcome") ?? nil,
+                decidedOn: try optionalStringArg(args, "decided_on") ?? nil,
+                taskIds: try pageTaskIdsArg(args, codesKey: "tasks", idsKey: "task_ids") ?? [],
+                author: .agent, sessionId: try sessionArg(args), provenance: prov)
+            var d = pageDict(made.page, full: true)
+            d["created"] = made.created
+            return try jsonString(d)
+
+        case "update_page":
+            let id = try resolvePageId(args)
+            var newTitle: String?
+            if given(args, "new_title") {
+                guard let s = args["new_title"] as? String else { throw MCPError.invalidArg("new_title must be a string") }
+                newTitle = s
+            }
+            var expected: Int?
+            if given(args, "expected_version") {
+                guard let n = try? requireInt(args, "expected_version") else {
+                    throw MCPError.invalidArg("expected_version must be an integer")
+                }
+                expected = Int(n)
+            }
+            let page = try store.updatePage(
+                id: id, title: newTitle,
+                body: try optionalStringArg(args, "body").map { $0 ?? "" },
+                append: try optionalStringArg(args, "append") ?? nil,
+                kind: try pageKindArg(args),
+                outcome: try optionalStringArg(args, "outcome"),
+                decidedOn: try optionalStringArg(args, "decided_on"),
+                taskIds: try pageTaskIdsArg(args, codesKey: "tasks", idsKey: "task_ids"),
+                addTaskIds: try pageTaskIdsArg(args, codesKey: "add_tasks", idsKey: "add_task_ids") ?? [],
+                author: .agent, sessionId: try sessionArg(args), expectedVersion: expected)
+            return try jsonString(pageDict(page, full: true))
+
+        case "delete_page":
+            let page = try store.deletePage(id: try resolvePageId(args))
+            return try jsonString(["deleted": page.title, "id": page.id,
+                                   "project": store.projectCode(id: page.projectId) ?? ""] as [String: Any])
+
+        case "search_pages":
+            guard let query = args["query"] as? String else { throw MCPError.missingArg("query") }
+            let pid = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            let result = try store.searchPages(query: query, projectId: pid, kind: try pageKindArg(args),
+                                               limit: try limitArg(args, "limit", default: 20, max: 100))
+            let pages: [[String: Any]] = result.pages.map { hit in
+                var d = pageDict(hit.page, full: false)
+                d["project"] = hit.projectCode
+                if let o = hit.page.outcome { d["outcome"] = o }
+                d["snippet"] = hit.snippet
+                return d
+            }
+            let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+            let notes: [[String: Any]] = result.decisionNotes.map { hit in
+                ["note_id": hit.note.id, "task": taskHandle(code: hit.taskCode, id: hit.note.taskId),
+                 "project": hit.projectCode, "ts": iso(hit.note.timestamp),
+                 "snippet": Store.snippet(hit.note.text, terms: terms)] as [String: Any]
+            }
+            return try jsonString(["engine": result.usedFTS ? "fts5" : "like", "pages": pages,
+                                   "decision_notes": notes] as [String: Any])
+
+        case "get_page_history":
+            let page = try store.page(id: try resolvePageId(args))
+            let limit = try limitArg(args, "limit", default: 10, max: 50)
+            let events: [[String: Any]] = try store.pageHistory(pageId: page.id, limit: limit).map { e in
+                var d: [String: Any] = ["ts": iso(e.timestamp), "field": e.field, "old": e.oldValue, "new": e.newValue]
+                if let a = e.author { d["author"] = a.rawValue }
+                if let s = e.sessionId { d["session"] = s }
+                return d
+            }
+            return try jsonString(["page": page.id, "title": page.title, "version": page.version,
+                                   "events": events] as [String: Any])
+
         case "list_templates":
             return try jsonString(store.listTemplates().map(templateDict))
 
@@ -1057,6 +1164,105 @@ final class MCPServer: @unchecked Sendable {
     private func parsePriority(_ v: Any?) -> Priority? {
         guard let s = v as? String else { return nil }
         return Priority(rawValue: s)
+    }
+
+    // MARK: - Wiki pages
+
+    /// A wiki page as the page tools return it. `full` false is list_pages' shape: no body,
+    /// tasks or provenance.
+    private func pageDict(_ p: ProjectPage, full: Bool) -> [String: Any] {
+        var d: [String: Any] = ["id": p.id, "kind": p.kind.rawValue, "title": p.title, "updated_at": iso(p.updatedAt)]
+        if let date = p.decidedOn { d["decided_on"] = date }
+        guard full else { return d }
+        d["project"] = store.projectCode(id: p.projectId) ?? ""
+        d["body"] = p.body
+        d["version"] = p.version
+        d["author"] = p.author.rawValue
+        d["created_at"] = iso(p.createdAt)
+        if let o = p.outcome { d["outcome"] = o }
+        if let s = p.sessionId { d["session"] = s }
+        if !p.tasks.isEmpty {
+            d["tasks"] = p.tasks.map { ["code": $0.code, "title": $0.title, "status": $0.status.rawValue] }
+        }
+        let prov = p.provenance
+        if let v = prov.source { d["source"] = v }
+        if let v = prov.key { d["source_key"] = v }
+        if let v = prov.author { d["source_author"] = v }
+        if let v = prov.session { d["source_session"] = v }
+        if let v = prov.timestamp { d["source_timestamp"] = iso(v) }
+        return d
+    }
+
+    /// The page a call names: `id`, or in a project (`project_id`/`project_code`) its
+    /// `source_key` or its `title` (whole title, case-insensitive; several pages with that
+    /// title is an error listing their ids).
+    private func resolvePageId(_ args: [String: Any]) throws -> Int64 {
+        if given(args, "id") { return try requireInt(args, "id") }
+        guard given(args, "source_key") || given(args, "title") else {
+            throw MCPError.missingArg("id, or title (or source_key) with project_code")
+        }
+        let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+        let code = try scopeName(pid)
+        if let key = args["source_key"] as? String, given(args, "source_key") {
+            guard let id = store.pageId(projectId: pid, sourceKey: key) else {
+                throw StoreError.notFound("page with source_key \(key) in project \(code)")
+            }
+            return id
+        }
+        guard let title = args["title"] as? String else { throw MCPError.invalidArg("title must be a string") }
+        let ids = store.pageIds(projectId: pid, title: title)
+        guard let first = ids.first else { throw StoreError.notFound("page titled \"\(title)\" in project \(code)") }
+        guard ids.count == 1 else {
+            throw MCPError.invalidArg("project \(code) has \(ids.count) pages titled \"\(title)\" "
+                                      + "(ids \(ids.map(String.init).joined(separator: ", "))); give the id")
+        }
+        return first
+    }
+
+    /// `kind` of a page: absent or null = not given; otherwise decision or note.
+    private func pageKindArg(_ args: [String: Any]) throws -> PageKind? {
+        guard given(args, "kind") else { return nil }
+        guard let s = args["kind"] as? String, let k = PageKind(rawValue: s) else {
+            throw MCPError.invalidArg("kind must be one of: \(PageKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return k
+    }
+
+    /// A page's tasks: task codes in `codesKey` and/or ids in `idsKey`; nil when neither is
+    /// given. An unknown code is an error naming it.
+    private func pageTaskIdsArg(_ args: [String: Any], codesKey: String, idsKey: String) throws -> [Int64]? {
+        guard given(args, codesKey) || given(args, idsKey) else { return nil }
+        var ids: [Int64] = []
+        if given(args, codesKey) {
+            guard let codes = args[codesKey] as? [String] else { throw MCPError.invalidArg("\(codesKey) must be an array of task codes") }
+            for c in codes {
+                guard let id = store.taskId(forCode: c) else { throw StoreError.notFound("task \(c)") }
+                ids.append(id)
+            }
+        }
+        if given(args, idsKey) {
+            guard let arr = args[idsKey] as? [Any] else { throw MCPError.invalidArg("\(idsKey) must be an array of task ids") }
+            for v in arr {
+                if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { ids.append(n.int64Value) }
+                else { throw MCPError.invalidArg("\(idsKey): \(v) is not a task id") }
+            }
+        }
+        return ids
+    }
+
+    /// create_page `source_timestamp`: absent or null = unknown; else ISO-8601 or yyyy-MM-dd.
+    private func sourceTimestampArg(_ args: [String: Any]) throws -> Date? {
+        guard given(args, "source_timestamp") else { return nil }
+        guard let d = parseDate(args["source_timestamp"]) else {
+            throw MCPError.invalidArg("source_timestamp must be ISO-8601 or yyyy-MM-dd, or null")
+        }
+        return d
+    }
+
+    /// The first line of a note, at most 160 characters, for lists.
+    private static func firstLine(_ text: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        return line.count > 160 ? String(line.prefix(160)) + "…" : line
     }
 
     // MARK: - Guides

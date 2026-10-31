@@ -30,6 +30,10 @@ public final class Store: @unchecked Sendable {
 
     public let dbURL: URL
 
+    /// Whether wiki search (`searchPages`) can use the FTS5 index; false when this SQLite
+    /// has no FTS5 (or trigram tokenizer), and it falls back to LIKE. Set at open.
+    public private(set) var pageSearchUsesFTS = false
+
     /// Images attached to task details: files in `attachments/` next to the database,
     /// referenced from the markdown as `attachments/<name>` (`Store.attachmentPrefix`).
     public var attachmentsURL: URL {
@@ -398,6 +402,61 @@ public final class Store: @unchecked Sendable {
         }
         exec("CREATE INDEX IF NOT EXISTS idx_tasks_milestone ON tasks(milestone_id);")
 
+        // --- Additive migration: project wiki pages (1.5.0) ---
+        // kind decision | note (no CHECK: the store validates it). outcome and decided_on
+        // (yyyy-MM-dd) are a decision's. version goes up on every change (PageConflict).
+        // author/session_id: the actor that wrote the row; the source_* columns are an
+        // import's provenance, NULL when unknown. source_key is unique per project, so an
+        // importer's rerun finds its page instead of adding another.
+        exec("""
+        CREATE TABLE IF NOT EXISTS project_pages (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            kind             TEXT NOT NULL DEFAULT 'note',
+            title            TEXT NOT NULL,
+            body             TEXT NOT NULL DEFAULT '',
+            outcome          TEXT,
+            decided_on       TEXT,
+            version          INTEGER NOT NULL DEFAULT 1,
+            author           TEXT NOT NULL,
+            session_id       TEXT,
+            source           TEXT,
+            source_key       TEXT,
+            source_author    TEXT,
+            source_session   TEXT,
+            source_timestamp REAL,
+            created_at       REAL NOT NULL,
+            updated_at       REAL NOT NULL
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_pages_project ON project_pages(project_id, kind);")
+        exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_source_key ON project_pages(project_id, source_key) "
+             + "WHERE source_key IS NOT NULL;")
+        // The tasks a page refers to (any project); gone with the page or the task.
+        exec("""
+        CREATE TABLE IF NOT EXISTS page_tasks (
+            page_id INTEGER NOT NULL REFERENCES project_pages(id) ON DELETE CASCADE,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY(page_id, task_id)
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_page_tasks_task ON page_tasks(task_id);")
+        // Every change to a page, as task_history: body rows keep the whole old and new text.
+        exec("""
+        CREATE TABLE IF NOT EXISTS page_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_id    INTEGER NOT NULL REFERENCES project_pages(id) ON DELETE CASCADE,
+            ts         REAL NOT NULL,
+            field      TEXT NOT NULL,
+            old_value  TEXT NOT NULL DEFAULT '',
+            new_value  TEXT NOT NULL DEFAULT '',
+            author     TEXT,
+            session_id TEXT
+        );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_page_history_page ON page_history(page_id, id);")
+        pageSearchUsesFTS = migratePageSearchIndex()
+
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
         repairStatusFields()
     }
@@ -452,6 +511,58 @@ public final class Store: @unchecked Sendable {
             }
         }
         throw StoreError.open("notes migration failed: \(lastError.map { "\($0)" } ?? "unknown error")")
+    }
+
+    /// The wiki's full-text index: an FTS5 table over project_pages (title, outcome, body)
+    /// with the trigram tokenizer, so a search matches any part of a word, Thai included
+    /// (Thai has no spaces between words). Triggers keep it in step inside the same
+    /// transaction as every write, cascades included. Built once: the first open that
+    /// creates it indexes the pages already there ('rebuild'), in one BEGIN IMMEDIATE,
+    /// re-checked inside it, so the app and MCP server opening together build it once.
+    /// Returns whether it is usable; when this SQLite has no FTS5 (or no trigram), nothing
+    /// is created and searchPages uses LIKE instead.
+    private static let pageFTSTriggers = ["project_pages_fts_ai", "project_pages_fts_ad", "project_pages_fts_au"]
+
+    private func migratePageSearchIndex() -> Bool {
+        func ready() -> Bool {
+            let n = queryInt("SELECT COUNT(*) FROM sqlite_master WHERE (type='table' AND name='project_pages_fts') "
+                             + "OR (type='trigger' AND name IN \(Self.sqlList(Self.pageFTSTriggers)));", []) ?? 0
+            return n == 1 + Int64(Self.pageFTSTriggers.count)
+        }
+        func probe() -> Bool {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            return sqlite3_prepare_v2(db, "SELECT rowid FROM project_pages_fts WHERE project_pages_fts MATCH 'abc' LIMIT 0;",
+                                      -1, &stmt, nil) == SQLITE_OK
+        }
+        if ready() { return probe() }
+        do {
+            try beginImmediate()
+            let existed = queryInt("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_pages_fts';", []) != nil
+            if !existed {
+                try runWrite("CREATE VIRTUAL TABLE project_pages_fts USING fts5(title, outcome, body, "
+                             + "content='project_pages', content_rowid='id', tokenize='trigram');", [])
+            }
+            // An external-content index is told what to drop with the row's old values.
+            let row = "(rowid, title, outcome, body) VALUES (new.id, new.title, new.outcome, new.body)"
+            let drop = "(project_pages_fts, rowid, title, outcome, body) VALUES ('delete', old.id, old.title, old.outcome, old.body)"
+            try runWrite("CREATE TRIGGER IF NOT EXISTS project_pages_fts_ai AFTER INSERT ON project_pages BEGIN "
+                         + "INSERT INTO project_pages_fts\(row); END;", [])
+            try runWrite("CREATE TRIGGER IF NOT EXISTS project_pages_fts_ad AFTER DELETE ON project_pages BEGIN "
+                         + "INSERT INTO project_pages_fts\(drop); END;", [])
+            try runWrite("CREATE TRIGGER IF NOT EXISTS project_pages_fts_au AFTER UPDATE OF title, outcome, body "
+                         + "ON project_pages BEGIN INSERT INTO project_pages_fts\(drop); "
+                         + "INSERT INTO project_pages_fts\(row); END;", [])
+            // A new index over rows written before it (none on a fresh table, or pages from
+            // a build whose SQLite had no FTS5).
+            if !existed { try runWrite("INSERT INTO project_pages_fts(project_pages_fts) VALUES ('rebuild');", []) }
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+        } catch {
+            exec("ROLLBACK;")
+            NSLog("QuestBits: wiki search index unavailable, using LIKE: \(error)")
+            return false
+        }
+        return probe()
     }
 
     /// Repair the fields that follow a task's status, on every open: rows written before
@@ -2779,6 +2890,471 @@ public final class Store: @unchecked Sendable {
             rc = sqlite3_step(stmt)
         }
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    // MARK: - Project wiki (1.5.0)
+
+    private static let pageCols = "p.id, p.project_id, p.kind, p.title, p.body, p.outcome, p.decided_on, p.version, "
+        + "p.author, p.session_id, p.source, p.source_key, p.source_author, p.source_session, p.source_timestamp, "
+        + "p.created_at, p.updated_at"
+    private static let pageColCount = Int32(pageCols.components(separatedBy: ", ").count)
+    /// Decisions first, newest decision date first (then newest page); then notes by title.
+    private static let pageOrderSQL = "ORDER BY p.kind = 'note', p.decided_on DESC, "
+        + "CASE p.kind WHEN 'decision' THEN -p.id ELSE 0 END, p.title COLLATE NOCASE, p.id"
+
+    /// A page title as stored: trimmed, one line, 1–200 characters.
+    public static func normalizedPageTitle(_ raw: String) throws -> String {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { throw StoreError.invalid("a page needs a title") }
+        guard !t.contains(where: \.isNewline) else { throw StoreError.invalid("a page title is one line") }
+        guard t.count <= 200 else { throw StoreError.invalid("a page title is at most 200 characters") }
+        return t
+    }
+
+    /// A decision date as stored: a real calendar date written yyyy-MM-dd.
+    public static func normalizedDecisionDate(_ raw: String) throws -> String {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard s.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil,
+              let d = dayFormatter.date(from: s), dayFormatter.string(from: d) == s else {
+            throw StoreError.invalid("decided_on must be a date written yyyy-MM-dd: \(raw)")
+        }
+        return s
+    }
+
+    /// Today in the local calendar, yyyy-MM-dd: a new decision's date when none is given.
+    public static func todayString() -> String { dayFormatter.string(from: Date()) }
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd"
+        f.isLenient = false
+        return f
+    }()
+
+    private static func pageBody(_ raw: String) -> String {
+        raw.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+    }
+
+    /// A text field that is nil when blank (outcome, provenance), trimmed.
+    private static func blankToNil(_ raw: String?) -> String? {
+        raw.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// A project's pages, every one in full (body, tasks, provenance), decisions first
+    /// (newest date first), then notes by title; `kind` keeps one kind. For list views and
+    /// exports (questbits brief/export).
+    public func pages(projectId: Int64, kind: PageKind? = nil) throws -> [ProjectPage] {
+        lock.lock(); defer { lock.unlock() }
+        var sql = "SELECT \(Self.pageCols) FROM project_pages p WHERE p.project_id=?"
+        var binds: [SQLValue] = [.int(projectId)]
+        if let kind { sql += " AND p.kind=?"; binds.append(.text(kind.rawValue)) }
+        return try readPages("\(sql) \(Self.pageOrderSQL);", binds)
+    }
+
+    public func page(id: Int64) throws -> ProjectPage {
+        lock.lock(); defer { lock.unlock() }
+        return try pageUnlocked(id)
+    }
+
+    /// The page an import wrote for source item `sourceKey` in a project, or nil.
+    public func pageId(projectId: Int64, sourceKey: String) -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        return queryInt("SELECT id FROM project_pages WHERE project_id=? AND source_key=?;",
+                        [.int(projectId), .text(sourceKey.trimmingCharacters(in: .whitespacesAndNewlines))])
+    }
+
+    /// A project's pages titled `title` (case-insensitive for ASCII, whole title), oldest
+    /// first. Titles need not be unique, so this may return several.
+    public func pageIds(projectId: Int64, title: String) -> [Int64] {
+        lock.lock(); defer { lock.unlock() }
+        guard let stmt = try? prepare("SELECT id FROM project_pages WHERE project_id=? AND title=? COLLATE NOCASE ORDER BY id;",
+                                      [.int(projectId), .text(title.trimmingCharacters(in: .whitespacesAndNewlines))])
+        else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [Int64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { out.append(sqlite3_column_int64(stmt, 0)) }
+        return out
+    }
+
+    /// How many pages of each kind a project has (a kind with none has no entry).
+    public func pageCounts(projectId: Int64) throws -> [PageKind: Int] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare("SELECT kind, COUNT(*) FROM project_pages WHERE project_id=? GROUP BY kind;", [.int(projectId)])
+        defer { sqlite3_finalize(stmt) }
+        var out: [PageKind: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let k = PageKind(rawValue: colText(stmt, 0)) { out[k] = Int(sqlite3_column_int64(stmt, 1)) }
+        }
+        return out
+    }
+
+    /// Add a page to a project (not archived). A decision gets `decidedOn` (today when not
+    /// given) and an optional `outcome`; a note takes neither. `taskIds` are the tasks it
+    /// refers to (any project; each must exist). `provenance` records an import's source;
+    /// with a `key`, the call is repeat-safe: a page with that key already in the project
+    /// is returned as it is (created false; nothing else is applied, so a rerun never
+    /// overwrites an edit made since). Checked and written in one BEGIN IMMEDIATE, with a
+    /// "created" history row.
+    @discardableResult
+    public func createPage(projectId: Int64, kind: PageKind, title: String, body: String = "",
+                           outcome: String? = nil, decidedOn: String? = nil, taskIds: [Int64] = [],
+                           author: NoteAuthor, sessionId: String? = nil,
+                           provenance: PageProvenance = PageProvenance()) throws -> (page: ProjectPage, created: Bool) {
+        let title = try Self.normalizedPageTitle(title)
+        let body = Self.pageBody(body)
+        let outcome = Self.blankToNil(outcome)
+        var decided = try Self.blankToNil(decidedOn).map(Self.normalizedDecisionDate)
+        if kind == .note {
+            guard outcome == nil, decided == nil else {
+                throw StoreError.invalid("only a decision has an outcome or decided_on")
+            }
+        } else {
+            decided = decided ?? Self.todayString()
+        }
+        let prov = PageProvenance(source: Self.blankToNil(provenance.source), key: Self.blankToNil(provenance.key),
+                                  author: Self.blankToNil(provenance.author), session: Self.blankToNil(provenance.session),
+                                  timestamp: provenance.timestamp)
+        if let key = prov.key, key.count > 500 { throw StoreError.invalid("source_key is at most 500 characters") }
+        let session = Self.blankToNil(sessionId)
+        var seen = Set<Int64>()
+        let tasks = taskIds.filter { seen.insert($0).inserted }
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            if let key = prov.key, let existing = queryInt(
+                "SELECT id FROM project_pages WHERE project_id=? AND source_key=?;", [.int(projectId), .text(key)]) {
+                let p = try pageUnlocked(existing)
+                if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+                return (p, false)
+            }
+            try requireActiveProjectUnlocked(projectId)
+            try requireTasksUnlocked(tasks)
+            let now = Date().timeIntervalSince1970
+            func opt(_ s: String?) -> SQLValue { s.map(SQLValue.text) ?? .null }
+            try runWrite(
+                """
+                INSERT INTO project_pages (project_id, kind, title, body, outcome, decided_on, author, session_id,
+                    source, source_key, source_author, source_session, source_timestamp, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                [.int(projectId), .text(kind.rawValue), .text(title), .text(body), opt(outcome), opt(decided),
+                 .text(author.rawValue), opt(session), opt(prov.source), opt(prov.key), opt(prov.author),
+                 opt(prov.session), prov.timestamp.map { .double($0.timeIntervalSince1970) } ?? .null,
+                 .double(now), .double(now)])
+            let id = lastInsertId()
+            for t in tasks { try runWrite("INSERT INTO page_tasks (page_id, task_id) VALUES (?, ?);", [.int(id), .int(t)]) }
+            try logPageEventUnlocked(id, "created", "", title, author: author, sessionId: session, ts: now)
+            let p = try pageUnlocked(id)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return (p, true)
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Change a page (only given fields). `body` replaces the text; `append` adds a
+    /// paragraph at its end instead (a running log: two writers appending never lose each
+    /// other's text); not both. `kind` note clears a decision's outcome and date; kind
+    /// decision gives a note today's date unless `decidedOn` is given. `outcome` /
+    /// `decidedOn` .some(nil) clear them (decided_on only by turning it into a note).
+    /// `taskIds` replaces the page's tasks, `addTaskIds` adds to them. `expectedVersion`:
+    /// the version the edit was made from; if the page has changed since, nothing is
+    /// written and `PageConflict` carries the current page. Each changed field is logged to
+    /// page_history and bumps `version`; an edit that changes nothing writes nothing.
+    /// Checked and written in one BEGIN IMMEDIATE.
+    @discardableResult
+    public func updatePage(id: Int64, title: String? = nil, body: String? = nil, append: String? = nil,
+                           kind: PageKind? = nil, outcome: String?? = nil, decidedOn: String?? = nil,
+                           taskIds: [Int64]? = nil, addTaskIds: [Int64] = [],
+                           author: NoteAuthor, sessionId: String? = nil, expectedVersion: Int? = nil) throws -> ProjectPage {
+        guard body == nil || append == nil else { throw StoreError.invalid("give body or append, not both") }
+        let newTitle = try title.map(Self.normalizedPageTitle)
+        let appended = append.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if appended?.isEmpty == true { throw StoreError.invalid("append text is empty") }
+        let newDate: String?? = try decidedOn.map { try Self.blankToNil($0).map(Self.normalizedDecisionDate) }
+        let newOutcome: String?? = outcome.map { Self.blankToNil($0) }
+        let session = Self.blankToNil(sessionId)
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let old = try pageUnlocked(id)
+            if let expectedVersion, expectedVersion != old.version { throw PageConflict(current: old) }
+            let k = kind ?? old.kind
+            var o = old.outcome, d = old.decidedOn
+            if k == .note {
+                if newOutcome??.isEmpty == false || newDate??.isEmpty == false {
+                    throw StoreError.invalid("only a decision has an outcome or decided_on")
+                }
+                o = nil; d = nil
+            } else {
+                if let newOutcome { o = newOutcome }
+                if let newDate {
+                    guard let date = newDate else { throw StoreError.invalid("a decision keeps its decided_on; give a date") }
+                    d = date
+                }
+                d = d ?? Self.todayString()
+            }
+            var b = old.body
+            if let body { b = Self.pageBody(body) }
+            if let appended { b = old.body.isEmpty ? appended : Self.pageBody(old.body) + "\n\n" + appended }
+            let oldTaskIds = old.tasks.map(\.id)
+            var tasks = taskIds ?? oldTaskIds
+            for t in addTaskIds where !tasks.contains(t) { tasks.append(t) }
+            var seen = Set<Int64>()
+            tasks = tasks.filter { seen.insert($0).inserted }
+            try requireTasksUnlocked(tasks.filter { !oldTaskIds.contains($0) })
+
+            let now = Date().timeIntervalSince1970
+            var sets: [String] = []
+            var binds: [SQLValue] = []
+            func change(_ col: String, _ before: String?, _ after: String?) throws {
+                guard before != after else { return }
+                sets.append("\(col)=?"); binds.append(after.map(SQLValue.text) ?? .null)
+                try logPageEventUnlocked(id, col, before ?? "", after ?? "", author: author, sessionId: session, ts: now)
+            }
+            try change("title", old.title, newTitle ?? old.title)
+            try change("kind", old.kind.rawValue, k.rawValue)
+            try change("outcome", old.outcome, o)
+            try change("decided_on", old.decidedOn, d)
+            try change("body", old.body, b)
+            let tasksChanged = Set(tasks) != Set(oldTaskIds)
+            if tasksChanged {
+                try runWrite("DELETE FROM page_tasks WHERE page_id=?;", [.int(id)])
+                for t in tasks { try runWrite("INSERT INTO page_tasks (page_id, task_id) VALUES (?, ?);", [.int(id), .int(t)]) }
+                try logPageEventUnlocked(id, "tasks", old.tasks.map(\.code).joined(separator: ", "),
+                                         taskCodesUnlocked(tasks).joined(separator: ", "),
+                                         author: author, sessionId: session, ts: now)
+            }
+            if !sets.isEmpty || tasksChanged {
+                sets.append("version=version+1"); sets.append("updated_at=?"); binds.append(.double(now))
+                try runWrite("UPDATE project_pages SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(id)])
+            }
+            let p = try pageUnlocked(id)
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return p
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Delete a page, its task references and its history. Returns the page as it was.
+    @discardableResult
+    public func deletePage(id: Int64) throws -> ProjectPage {
+        lock.lock(); defer { lock.unlock() }
+        do {
+            try beginImmediate()
+            let p = try pageUnlocked(id)
+            try runWrite("DELETE FROM project_pages WHERE id=?;", [.int(id)])
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return p
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// A page's changes, newest first (at most `limit`).
+    public func pageHistory(pageId: Int64, limit: Int = 50) throws -> [PageEvent] {
+        lock.lock(); defer { lock.unlock() }
+        let stmt = try prepare("SELECT id, page_id, ts, field, old_value, new_value, author, session_id FROM page_history "
+                               + "WHERE page_id=? ORDER BY id DESC LIMIT ?;", [.int(pageId), .int(Int64(max(0, limit)))])
+        defer { sqlite3_finalize(stmt) }
+        var out: [PageEvent] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            out.append(PageEvent(id: sqlite3_column_int64(stmt, 0), pageId: sqlite3_column_int64(stmt, 1),
+                                 timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
+                                 field: colText(stmt, 3), oldValue: colText(stmt, 4), newValue: colText(stmt, 5),
+                                 author: colTextOpt(stmt, 6).flatMap(NoteAuthor.init(rawValue:)),
+                                 sessionId: colTextOpt(stmt, 7)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    /// The decision notes (add_note kind decision) of a project's tasks, newest first: the
+    /// wiki's Decisions shows them beside the decision pages, read from task_notes (never
+    /// copied).
+    public func decisionNotes(projectId: Int64, limit: Int = 200) throws -> [NoteSearchHit] {
+        lock.lock(); defer { lock.unlock() }
+        return try readDecisionNotes(terms: [], projectId: projectId, limit: limit)
+    }
+
+    /// Search the wiki: pages whose title, outcome or body hold every word of `query`
+    /// (split on spaces; any part of a word matches, ASCII case-insensitive), across every
+    /// project (archived ones too) or one, optionally one kind. With the FTS5 index the
+    /// best matches come first; when it is missing, or a word is under three characters
+    /// (the trigram index's minimum), LIKE answers instead, newest first. Unless `kind` is
+    /// note, decision notes of tasks that hold every word come too (newest first).
+    public func searchPages(query: String, projectId: Int64? = nil, kind: PageKind? = nil,
+                            limit: Int = 20) throws -> PageSearchResult {
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !terms.isEmpty else { throw StoreError.invalid("search query is empty") }
+        let limit = max(0, limit)
+        lock.lock(); defer { lock.unlock() }
+        var conds: [String] = []
+        var filterBinds: [SQLValue] = []
+        if let projectId { conds.append("p.project_id=?"); filterBinds.append(.int(projectId)) }
+        if let kind { conds.append("p.kind=?"); filterBinds.append(.text(kind.rawValue)) }
+        let filter = conds.map { " AND " + $0 }.joined()
+        let select = "SELECT \(Self.pageCols), pr.code FROM "
+        var hits: [(ProjectPage, String)]?
+        var usedFTS = false
+        if pageSearchUsesFTS, terms.allSatisfy({ $0.unicodeScalars.count >= 3 }) {
+            let match = terms.map { "\"" + $0.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }.joined(separator: " ")
+            // Title, then outcome, then body weigh most in the ranking.
+            hits = try? readPageHits(
+                select + "project_pages_fts JOIN project_pages p ON p.id = project_pages_fts.rowid "
+                + "JOIN projects pr ON pr.id = p.project_id WHERE project_pages_fts MATCH ?\(filter) "
+                + "ORDER BY bm25(project_pages_fts, 5.0, 3.0, 1.0), p.id DESC LIMIT ?;",
+                [.text(match)] + filterBinds + [.int(Int64(limit))])
+            usedFTS = hits != nil
+        }
+        if hits == nil {
+            let like = terms.map { _ in
+                " AND (p.title LIKE ? ESCAPE '\\' OR COALESCE(p.outcome, '') LIKE ? ESCAPE '\\' OR p.body LIKE ? ESCAPE '\\')"
+            }.joined()
+            let likeBinds = terms.flatMap { t -> [SQLValue] in let v = SQLValue.text(Self.likePattern(t)); return [v, v, v] }
+            hits = try readPageHits(
+                select + "project_pages p JOIN projects pr ON pr.id = p.project_id WHERE 1\(like)\(filter) "
+                + "ORDER BY p.updated_at DESC, p.id DESC LIMIT ?;",
+                likeBinds + filterBinds + [.int(Int64(limit))])
+        }
+        let pages = (hits ?? []).map { page, code in
+            PageSearchHit(page: page, projectCode: code,
+                          snippet: Self.snippet(page.body.isEmpty ? (page.outcome ?? page.title) : page.body, terms: terms))
+        }
+        let notes = kind == .note ? [] : try readDecisionNotes(terms: terms, projectId: projectId, limit: limit)
+        return PageSearchResult(pages: pages, decisionNotes: notes, usedFTS: usedFTS)
+    }
+
+    /// `%term%` for LIKE ... ESCAPE '\', with LIKE's wildcards in the term escaped.
+    private static func likePattern(_ term: String) -> String {
+        "%" + term.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_") + "%"
+    }
+
+    /// An excerpt of `text` (whitespace folded) around the first of `terms` it holds, about
+    /// `width` characters; its start when it holds none.
+    public static func snippet(_ text: String, terms: [String], width: Int = 160) -> String {
+        let flat = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard flat.count > width else { return flat }
+        let hit = terms.compactMap { flat.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) }
+            .min { $0.lowerBound < $1.lowerBound }
+        guard let hit else { return String(flat.prefix(width)) + "…" }
+        let start = flat.index(hit.lowerBound, offsetBy: -(width / 3), limitedBy: flat.startIndex) ?? flat.startIndex
+        let end = flat.index(start, offsetBy: width, limitedBy: flat.endIndex) ?? flat.endIndex
+        return (start > flat.startIndex ? "…" : "") + flat[start..<end] + (end < flat.endIndex ? "…" : "")
+    }
+
+    /// Decision notes holding every one of `terms` (none = all), of one project's tasks or
+    /// every project's, newest first.
+    private func readDecisionNotes(terms: [String], projectId: Int64?, limit: Int) throws -> [NoteSearchHit] {
+        var sql = "SELECT \(Self.qualifiedNoteCols), t.code, t.title, p.code FROM task_notes n "
+            + "JOIN tasks t ON t.id = n.task_id JOIN projects p ON p.id = t.project_id WHERE n.kind=?"
+        var binds: [SQLValue] = [.text(NoteKind.decision.rawValue)]
+        for t in terms { sql += " AND n.text LIKE ? ESCAPE '\\'"; binds.append(.text(Self.likePattern(t))) }
+        if let projectId { sql += " AND t.project_id=?"; binds.append(.int(projectId)) }
+        sql += " ORDER BY n.ts DESC, n.id DESC LIMIT ?;"
+        binds.append(.int(Int64(max(0, limit))))
+        let stmt = try prepare(sql, binds)
+        defer { sqlite3_finalize(stmt) }
+        var out: [NoteSearchHit] = []
+        var rc = sqlite3_step(stmt)
+        let c = Self.noteColCount
+        while rc == SQLITE_ROW {
+            out.append(NoteSearchHit(note: noteFromRow(stmt), taskCode: colText(stmt, c),
+                                     taskTitle: colText(stmt, c + 1), projectCode: colText(stmt, c + 2)))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        return out
+    }
+
+    private func pageUnlocked(_ id: Int64) throws -> ProjectPage {
+        guard let p = try readPages("SELECT \(Self.pageCols) FROM project_pages p WHERE p.id=?;", [.int(id)]).first else {
+            throw StoreError.notFound("page \(id)")
+        }
+        return p
+    }
+
+    /// Every task id must exist (a page may refer to tasks of any project).
+    private func requireTasksUnlocked(_ ids: [Int64]) throws {
+        for id in ids where queryInt("SELECT id FROM tasks WHERE id=?;", [.int(id)]) == nil {
+            throw StoreError.notFound("task \(id)")
+        }
+    }
+
+    private func taskCodesUnlocked(_ ids: [Int64]) -> [String] {
+        ids.map { queryString("SELECT code FROM tasks WHERE id=?;", [.int($0)]) ?? "#\($0)" }
+    }
+
+    private func logPageEventUnlocked(_ pageId: Int64, _ field: String, _ old: String, _ new: String,
+                                      author: NoteAuthor, sessionId: String?, ts: TimeInterval) throws {
+        try runWrite("INSERT INTO page_history (page_id, ts, field, old_value, new_value, author, session_id) "
+                     + "VALUES (?, ?, ?, ?, ?, ?, ?);",
+                     [.int(pageId), .double(ts), .text(field), .text(old), .text(new), .text(author.rawValue),
+                      sessionId.map(SQLValue.text) ?? .null])
+    }
+
+    private func readPages(_ sql: String, _ binds: [SQLValue]) throws -> [ProjectPage] {
+        try readPageHits(sql, binds, withCode: false).map(\.0)
+    }
+
+    /// Pages from rows of `pageCols` (then the project's code when `withCode`), with their
+    /// tasks attached in one more query.
+    private func readPageHits(_ sql: String, _ binds: [SQLValue], withCode: Bool = true) throws -> [(ProjectPage, String)] {
+        let stmt = try prepare(sql, binds)
+        defer { sqlite3_finalize(stmt) }
+        func dateOpt(_ i: Int32) -> Date? {
+            sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
+        }
+        var out: [(ProjectPage, String)] = []
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
+            let prov = PageProvenance(source: colTextOpt(stmt, 10), key: colTextOpt(stmt, 11), author: colTextOpt(stmt, 12),
+                                      session: colTextOpt(stmt, 13), timestamp: dateOpt(14))
+            let page = ProjectPage(
+                id: sqlite3_column_int64(stmt, 0), projectId: sqlite3_column_int64(stmt, 1),
+                kind: PageKind(rawValue: colText(stmt, 2)) ?? .note, title: colText(stmt, 3), body: colText(stmt, 4),
+                outcome: colTextOpt(stmt, 5), decidedOn: colTextOpt(stmt, 6), version: Int(sqlite3_column_int64(stmt, 7)),
+                author: NoteAuthor(rawValue: colText(stmt, 8)) ?? .agent, sessionId: colTextOpt(stmt, 9),
+                provenance: prov, createdAt: dateOpt(15) ?? Date(timeIntervalSince1970: 0),
+                updatedAt: dateOpt(16) ?? Date(timeIntervalSince1970: 0))
+            out.append((page, withCode ? colText(stmt, Self.pageColCount) : ""))
+            rc = sqlite3_step(stmt)
+        }
+        guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
+        let tasks = try pageTasksUnlocked(out.map(\.0.id))
+        return out.map { page, code in
+            var p = page
+            p.tasks = tasks[p.id] ?? []
+            return (p, code)
+        }
+    }
+
+    /// The tasks each page refers to, oldest task first.
+    private func pageTasksUnlocked(_ pageIds: [Int64]) throws -> [Int64: [RelatedTask]] {
+        var out: [Int64: [RelatedTask]] = [:]
+        for chunk in Self.chunked(pageIds) where !chunk.isEmpty {
+            let stmt = try prepare(
+                "SELECT pt.page_id, t.id, t.code, t.title, t.status, t.project_id FROM page_tasks pt "
+                + "JOIN tasks t ON t.id = pt.task_id WHERE pt.page_id IN (\(Self.placeholders(chunk.count))) ORDER BY t.id;",
+                chunk.map(SQLValue.int))
+            defer { sqlite3_finalize(stmt) }
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                out[sqlite3_column_int64(stmt, 0), default: []].append(RelatedTask(
+                    id: sqlite3_column_int64(stmt, 1), code: colText(stmt, 2), title: colText(stmt, 3),
+                    status: TaskStatus(rawValue: colText(stmt, 4)) ?? .todo, projectId: sqlite3_column_int64(stmt, 5)))
+            }
+        }
         return out
     }
 

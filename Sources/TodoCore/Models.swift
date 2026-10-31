@@ -527,6 +527,114 @@ public struct GuideConflict: Error, CustomStringConvertible {
     public var description: String { "the guide changed (version \(current.id)) since it was opened" }
 }
 
+// MARK: - Project wiki (1.5.0)
+
+/// What a wiki page of a project holds. Persisted as the raw value; `project_pages.kind`
+/// has no CHECK, so a new kind needs no table rebuild (the store validates it). The
+/// project's guide is not a page: it stays in `guide_versions` (get_guide / update_guide).
+public enum PageKind: String, Codable, CaseIterable, Sendable {
+    case decision   // a choice made for the project: when (decidedOn), what (outcome), why (body)
+    case note       // anything else worth keeping: findings, how-tos, a running log
+
+    public var display: String { self == .decision ? "Decision" : "Note" }
+    public var plural: String { self == .decision ? "Decisions" : "Notes" }
+}
+
+/// Where an imported page came from, kept apart from who wrote it (`ProjectPage.author` is
+/// the actor that wrote the row: an importer is the agent). Every field is nil when not
+/// known; none of them changes who may edit the page. `key` is the source item's stable
+/// identity: a page with the same key in the project is not created twice.
+public struct PageProvenance: Hashable, Sendable {
+    public var source: String?           // free-form locator, e.g. "PLAN.md#Decisions"
+    public var key: String?              // stable source identity (an importer's source_key)
+    public var author: String?           // who wrote the original, as the source says
+    public var session: String?          // the session that wrote the original
+    public var timestamp: Date?          // when the original was written
+
+    public init(source: String? = nil, key: String? = nil, author: String? = nil,
+                session: String? = nil, timestamp: Date? = nil) {
+        self.source = source; self.key = key; self.author = author
+        self.session = session; self.timestamp = timestamp
+    }
+
+    public var isEmpty: Bool { self == PageProvenance() }
+}
+
+/// A wiki page of one project (`project_pages`): a decision or a note, markdown `body`.
+/// A decision also has `decidedOn` (yyyy-MM-dd) and `outcome` (what was decided; the body
+/// says why); notes have neither. `tasks` are the tasks it refers to, in any project.
+/// `version` goes up on every change: an edit made from an older version is refused
+/// (`PageConflict`), so two writers never overwrite each other unseen.
+public struct ProjectPage: Identifiable, Hashable, Sendable {
+    public let id: Int64
+    public let projectId: Int64
+    public var kind: PageKind
+    public var title: String
+    public var body: String
+    public var outcome: String?
+    public var decidedOn: String?
+    public var tasks: [RelatedTask]
+    public var version: Int
+    public let author: NoteAuthor
+    public let sessionId: String?
+    public let provenance: PageProvenance
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(id: Int64, projectId: Int64, kind: PageKind, title: String, body: String = "",
+                outcome: String? = nil, decidedOn: String? = nil, tasks: [RelatedTask] = [], version: Int = 1,
+                author: NoteAuthor, sessionId: String? = nil, provenance: PageProvenance = PageProvenance(),
+                createdAt: Date, updatedAt: Date) {
+        self.id = id; self.projectId = projectId; self.kind = kind; self.title = title; self.body = body
+        self.outcome = outcome; self.decidedOn = decidedOn; self.tasks = tasks; self.version = version
+        self.author = author; self.sessionId = sessionId; self.provenance = provenance
+        self.createdAt = createdAt; self.updatedAt = updatedAt
+    }
+}
+
+/// One change to a page (`page_history`), like a task's history row: `field` is created,
+/// title, kind, outcome, decided_on, body or tasks; body rows keep the whole old and new text.
+public struct PageEvent: Identifiable, Hashable, Sendable {
+    public let id: Int64
+    public let pageId: Int64
+    public let timestamp: Date
+    public let field: String
+    public let oldValue: String
+    public let newValue: String
+    public let author: NoteAuthor?
+    public let sessionId: String?
+
+    public init(id: Int64, pageId: Int64, timestamp: Date, field: String, oldValue: String, newValue: String,
+                author: NoteAuthor?, sessionId: String?) {
+        self.id = id; self.pageId = pageId; self.timestamp = timestamp; self.field = field
+        self.oldValue = oldValue; self.newValue = newValue; self.author = author; self.sessionId = sessionId
+    }
+}
+
+/// A page search hit: the page (body included), its project's code, and an excerpt around
+/// the first match.
+public struct PageSearchHit: Hashable, Sendable {
+    public let page: ProjectPage
+    public let projectCode: String
+    public let snippet: String
+}
+
+/// `Store.searchPages`: matching pages (best first with FTS5, else newest first), matching
+/// decision notes of tasks (newest first), and whether the FTS5 index answered.
+public struct PageSearchResult: Sendable {
+    public let pages: [PageSearchHit]
+    public let decisionNotes: [NoteSearchHit]
+    public let usedFTS: Bool
+}
+
+/// Store.updatePage refused an edit made from an older version: `current` came first.
+public struct PageConflict: Error, CustomStringConvertible {
+    public let current: ProjectPage
+    public var description: String {
+        "page \(current.id) changed (now version \(current.version)) since it was read; read it again and redo the edit"
+    }
+}
+
 /// A timestamped entry in a task's log. Notes are inserted, never rewritten by
 /// another writer, so concurrent writers never overwrite each other (unlike appending
 /// to `detail`). The one exception: the user may edit their own note in the app, and

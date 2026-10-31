@@ -30,6 +30,12 @@ extension MCPServer {
         let milestoneInt: [String: Any] = ["type": ["integer", "null"], "description": "id form of milestone"]
         let milestoneRef: [String: Any] = ["id": int, "project_id": int, "project_code": str,
                                            "name": ["type": "string", "description": "the milestone's name, with project_code or project_id (or give its id)"] as [String: Any]]
+        let pageKindEnum: [String: Any] = ["type": "string", "enum": PageKind.allCases.map(\.rawValue)]
+        let codesArr: [String: Any] = ["type": "array", "items": str]
+        let idsArr: [String: Any] = ["type": "array", "items": int]
+        let pageRef: [String: Any] = ["id": int, "project_id": int, "project_code": str,
+                                      "title": ["type": "string", "description": "the page's whole title (case-insensitive), with project_code or project_id (or give its id)"] as [String: Any],
+                                      "source_key": ["type": "string", "description": "the source_key it was created with, with project_code or project_id"] as [String: Any]]
         let questionFilter: [String: Any] = ["project_id": int, "project_code": str,
                                              "session": ["type": "string", "description": "only questions asked with this session label"] as [String: Any]]
 
@@ -55,7 +61,7 @@ extension MCPServer {
                                  "repo_path": repoPathStr])],
 
             ["name": "find_project",
-             "description": "Which project a folder belongs to, e.g. your working directory: the active project whose `repo_path` is that folder or contains it (a subfolder of a repo matches). When folders nest, such as a workspace and a repo inside it, the deepest one wins. Folders compare as the file system sees them: ~ expanded, symlinks resolved, trailing slashes ignored, whole folder names only (/x/app does not contain /x/app-2). Archived projects and projects without a repo_path never match. Returns {path (resolved), project} where project is null or the project (as in list_projects) plus counts of its tasks: open, in_progress, waiting_on_user.",
+             "description": "Which project a folder belongs to, e.g. your working directory: the active project whose `repo_path` is that folder or contains it (a subfolder of a repo matches). When folders nest, such as a workspace and a repo inside it, the deepest one wins. Folders compare as the file system sees them: ~ expanded, symlinks resolved, trailing slashes ignored, whole folder names only (/x/app does not contain /x/app-2). Archived projects and projects without a repo_path never match. Returns {path (resolved), project} where project is null or the project (as in list_projects) plus counts of its tasks: open, in_progress, waiting_on_user; `guide` (the project's own guide markdown, with `guide_version`; only when it has one; get_guide gives the full guide) and `wiki` {decisions, notes}: how many wiki pages it has (see search_pages).",
              "inputSchema": obj(["path": ["type": "string", "description": "an absolute folder path (or starting with ~)"] as [String: Any]],
                                 required: ["path"])],
 
@@ -276,6 +282,59 @@ extension MCPServer {
             ["name": "delete_milestone",
              "description": "Delete a milestone, by `id` or by `name` with `project_code`/`project_id`. Its tasks are kept, in no milestone. Returns {deleted (name), project, unassigned (how many tasks it had)}.",
              "inputSchema": obj(milestoneRef)],
+
+            ["name": "list_pages",
+             "description": "A project's wiki (`project_id`/`project_code`): pages that keep its decisions and notes, for agents to look up instead of asking again. Without bodies: each page is {id, kind (decision|note), title, updated_at, decided_on (decisions)}; read one with get_page. Decisions come first, newest date first, then notes by title. `kind` keeps one kind. Unless kind is note or `include_notes` is false, `decision_notes` also lists the decision notes of the project's tasks (add_note kind decision; up to 50, newest first: {note_id, task, ts, text (first line)}): they belong to the project's decisions without being copied into pages. The project's guide is not in the wiki: see get_guide.",
+             "inputSchema": obj(["project_id": int, "project_code": str, "kind": pageKindEnum,
+                                 "include_notes": ["type": "boolean", "description": "list the decision notes of its tasks too (default true)"] as [String: Any]])],
+
+            ["name": "get_page",
+             "description": "A wiki page in full, by `id`, or in a project (`project_code`/`project_id`) by `title` or `source_key`: {id, project, kind, title, body (markdown), version, author (who wrote the row: user|agent), created_at, updated_at, and when set: outcome and decided_on (decisions), tasks [{code, title, status}] it refers to, session, source, source_key, source_author, source_session, source_timestamp (where an imported page came from)}.",
+             "inputSchema": obj(pageRef)],
+
+            ["name": "create_page",
+             "description": "Add a wiki page to a project (`project_id`/`project_code`, not archived). `kind` decision (something decided for the project: `outcome` says what, `body` why and the options not taken, `decided_on` yyyy-MM-dd defaults to today) or note (default; findings, how-tos, a running log; no outcome or decided_on). `title` one line. `tasks` (codes) or `task_ids`: the tasks it refers to, any project. A decision about one task belongs in add_note kind decision on that task; use a page for what the whole project should remember. Importers: `source` (where it came from), `source_key` (the source item's stable identity: a second create_page with the same source_key in the project returns the existing page unchanged with created false, so a rerun never duplicates), `source_author`, `source_session`, `source_timestamp` (the original's, when known; leave them out when not known). The page's author is always the agent. Returns the page as get_page, plus `created`.",
+             "inputSchema": obj([
+                "project_id": int, "project_code": str, "kind": pageKindEnum, "title": str,
+                "body": ["type": "string", "description": "markdown"] as [String: Any],
+                "outcome": ["type": "string", "description": "a decision's result, short"] as [String: Any],
+                "decided_on": ["type": "string", "description": "yyyy-MM-dd; a decision's date (default today)"] as [String: Any],
+                "tasks": codesArr, "task_ids": idsArr, "session": sessionStr,
+                "source": ["type": "string", "description": "provenance: where the page came from, e.g. PLAN.md#Decisions"] as [String: Any],
+                "source_key": ["type": "string", "description": "the source item's stable identity; makes the call repeat-safe"] as [String: Any],
+                "source_author": ["type": "string", "description": "who wrote the original (only when known)"] as [String: Any],
+                "source_session": ["type": "string", "description": "the session that wrote the original (only when known)"] as [String: Any],
+                "source_timestamp": ["type": "string", "description": "when the original was written, ISO-8601 or yyyy-MM-dd (only when known)"] as [String: Any]
+             ], required: ["title"])],
+
+            ["name": "update_page",
+             "description": "Change a wiki page, by `id` or in a project by `title`/`source_key` (only given fields change): `new_title`, `body` (replaces the text), `append` (adds a paragraph at the end instead: use it for a running log, so two sessions appending never lose each other's text; not with body), `kind`, `outcome` (null clears it), `decided_on`, `tasks`/`task_ids` (replace the page's tasks) or `add_tasks`/`add_task_ids`. Turning a decision into a note drops its outcome and date. `expected_version`: the version you read (get_page); if the page changed since, nothing is written and the error says so: read it again and redo the edit. Every change is kept (get_page_history). Returns the page as get_page.",
+             "inputSchema": obj(pageRef.merging([
+                "new_title": str, "body": ["type": "string", "description": "markdown; replaces the whole text"] as [String: Any],
+                "append": ["type": "string", "description": "markdown paragraph to add at the end"] as [String: Any],
+                "kind": pageKindEnum, "outcome": ["type": ["string", "null"], "description": "a decision's result; null clears it"] as [String: Any],
+                "decided_on": ["type": "string", "description": "yyyy-MM-dd"] as [String: Any],
+                "tasks": codesArr, "task_ids": idsArr, "add_tasks": codesArr, "add_task_ids": idsArr,
+                "expected_version": ["type": "integer", "description": "the page's version your edit is based on"] as [String: Any],
+                "session": sessionStr
+             ]) { a, _ in a })],
+
+            ["name": "delete_page",
+             "description": "Delete a wiki page (by `id`, or in a project by `title`/`source_key`) and its history. Only when the user asked for it. Returns {deleted (title), id, project}.",
+             "inputSchema": obj(pageRef)],
+
+            ["name": "search_pages",
+             "description": "Search the wiki before asking the user something the project may already have decided: pages whose title, outcome or body hold every word of `query` (any part of a word matches, Thai included; ASCII case-insensitive), across every project (archived too) or one (`project_id`/`project_code`), optionally one `kind`. Returns {engine (fts5: best matches first; like: newest first, used when a word is under 3 characters or full-text search is unavailable), pages [{id, project, kind, title, updated_at, decided_on?, outcome?, snippet}], decision_notes [{note_id, task, project, ts, snippet}] (decision notes of tasks holding every word; not with kind note)}. `limit` (default 20, max 100) caps each list. Read a hit with get_page or get_task.",
+             "inputSchema": obj([
+                "query": str, "project_id": int, "project_code": str, "kind": pageKindEnum,
+                "limit": ["type": "integer", "minimum": 1, "maximum": 100] as [String: Any]
+             ], required: ["query"])],
+
+            ["name": "get_page_history",
+             "description": "A wiki page's changes (by `id`, or in a project by `title`/`source_key`), newest first: {page, title, version, events [{ts, field (created, title, kind, outcome, decided_on, body, tasks), old, new, author, session}]}; body events carry the whole old and new text. `limit` default 10, max 50.",
+             "inputSchema": obj(pageRef.merging([
+                "limit": ["type": "integer", "minimum": 1, "maximum": 50] as [String: Any]
+             ]) { a, _ in a })],
 
             ["name": "list_templates",
              "description": "List all reusable task templates. Each has an `id`, `name`, and the preset fields (title, detail, priority, tags, estimate_minutes) applied to tasks spawned from it.",

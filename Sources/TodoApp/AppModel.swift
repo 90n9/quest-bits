@@ -81,6 +81,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var openQuestions: [Question] = []
     /// The tab shown for the selected project; back to Tasks when another project is picked.
     @Published var projectTab: ProjectTab = .tasks
+    /// The selected project's wiki (its Wiki tab): pages in full, the decision notes of its
+    /// tasks, the selection, and the search typed above the list. Loaded only while the
+    /// tab shows.
+    @Published private(set) var wikiPages: [ProjectPage] = []
+    @Published private(set) var wikiDecisionNotes: [NoteSearchHit] = []
+    @Published var wikiSelection: WikiItem?
+    @Published var wikiQuery = "" { didSet { if wikiQuery != oldValue { reloadWiki() } } }
     @Published var daySeries: [DayStat] = []
     @Published var projectEfforts: [ProjectEffort] = []
 
@@ -199,6 +206,7 @@ final class AppModel: ObservableObject {
         reloadTasks()
         reloadStats()
         if showDashboard { reloadDashboard() }
+        reloadWiki()
     }
 
     func reloadDashboard() {
@@ -271,7 +279,7 @@ final class AppModel: ObservableObject {
     }
 
     func selectProject(_ id: Int64?) {
-        if id != selectedProjectId { projectTab = .tasks }
+        if id != selectedProjectId { projectTab = .tasks; wikiSelection = nil; wikiQuery = "" }
         showDashboard = false
         showQuestions = false
         showArchived = false
@@ -334,6 +342,7 @@ final class AppModel: ObservableObject {
     func selectProjectTab(_ tab: ProjectTab) {
         projectTab = tab
         if tab == .questions { selectedQuestionId = nil; reloadQuestions() }
+        if tab == .wiki { reloadWiki() }
     }
 
     func selectArchived() {
@@ -909,6 +918,92 @@ final class AppModel: ObservableObject {
         let byCode = hits.filter { $0.code.localizedCaseInsensitiveContains(q) }
         let byTitle = hits.filter { !$0.code.localizedCaseInsensitiveContains(q) }
         return Array((byCode + byTitle).prefix(limit))
+    }
+
+    // MARK: - Wiki
+
+    /// Reread the selected project's wiki while its Wiki tab shows (every DB change from
+    /// an agent lands here too, through reloadAll). With a search typed, only the pages and
+    /// decision notes that match. A selection that is gone falls back to the first item.
+    func reloadWiki() {
+        guard shownProjectTab == .wiki, let pid = selectedProjectId else { return }
+        let q = wikiQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        var pages: [ProjectPage]
+        var notes: [NoteSearchHit]
+        if q.isEmpty {
+            pages = (try? store.pages(projectId: pid)) ?? wikiPages
+            notes = (try? store.decisionNotes(projectId: pid)) ?? wikiDecisionNotes
+        } else if let found = try? store.searchPages(query: q, projectId: pid, limit: 200) {
+            pages = found.pages.map(\.page)
+            notes = found.decisionNotes
+        } else {
+            pages = []; notes = []
+        }
+        if pages != wikiPages { wikiPages = pages }
+        if notes != wikiDecisionNotes { wikiDecisionNotes = notes }
+        let items = wikiItems
+        if wikiSelection.map({ !items.contains($0) }) ?? true { wikiSelection = items.first }
+    }
+
+    /// The wiki list in order: decision pages, decision notes, then notes.
+    var wikiItems: [WikiItem] {
+        wikiPages.filter { $0.kind == .decision }.map { .page($0.id) }
+            + wikiDecisionNotes.map { .note($0.note.id) }
+            + wikiPages.filter { $0.kind == .note }.map { .page($0.id) }
+    }
+
+    /// Add a page to the selected project and select it; nil (with a toast) when refused.
+    @discardableResult
+    func createWikiPage(kind: PageKind, title: String) -> ProjectPage? {
+        guard let pid = selectedProjectId else { return nil }
+        do {
+            let page = try store.createPage(projectId: pid, kind: kind, title: title, author: .user).page
+            wikiQuery = ""
+            reloadWiki()
+            wikiSelection = .page(page.id)
+            return page
+        } catch {
+            flashToast("Couldn't add the page: \(error)")
+            return nil
+        }
+    }
+
+    /// Save the user's edit of a page made from `version`. Throws PageConflict when an
+    /// agent changed it first (nothing is written), or the store's refusal.
+    func saveWikiPage(_ id: Int64, title: String, body: String, outcome: String?, decidedOn: String?,
+                      taskIds: [Int64], version: Int) throws {
+        let page = try store.page(id: id)
+        try store.updatePage(id: id, title: title, body: body,
+                             outcome: page.kind == .decision ? .some(outcome) : nil,
+                             decidedOn: page.kind == .decision ? decidedOn.map { .some($0) } : nil,
+                             taskIds: taskIds, author: .user, expectedVersion: version)
+        reloadWiki()
+    }
+
+    func setWikiPageKind(_ id: Int64, _ kind: PageKind) {
+        do { try store.updatePage(id: id, kind: kind, author: .user) } catch { flashToast("\(error)") }
+        reloadWiki()
+    }
+
+    func deleteWikiPage(_ id: Int64) {
+        do { try store.deletePage(id: id) } catch { flashToast("Couldn't delete the page: \(error)") }
+        reloadWiki()
+    }
+
+    /// How many pages of each kind a project's wiki has.
+    func wikiCounts(projectId: Int64) -> [PageKind: Int] {
+        (try? store.pageCounts(projectId: projectId)) ?? [:]
+    }
+
+    func wikiPageHistory(_ id: Int64) -> [PageEvent] {
+        (try? store.pageHistory(pageId: id, limit: 200)) ?? []
+    }
+
+    /// A task code written in a wiki page, clicked: show the task on the Tasks tab.
+    func openTask(code: String) {
+        guard let id = store.taskId(forCode: code) else { return flashToast("No task \(code)") }
+        projectTab = .tasks
+        openTask(id)
     }
 
     // MARK: - Milestones
