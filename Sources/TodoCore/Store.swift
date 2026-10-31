@@ -507,6 +507,19 @@ public final class Store: @unchecked Sendable {
         if !columnExists("questions", "agent_session_id") {
             exec("ALTER TABLE questions ADD COLUMN agent_session_id TEXT;")
         }
+
+        // --- Additive migration: task claims (1.5.0) ---
+        // The session working on a task (next_task / claim_task): claimed_by is the Claude
+        // Code session id, or the agent's session label when its session is unknown;
+        // claim_label the label it passed. The claim holds until claim_expires_at, which
+        // each heartbeat moves to claim_heartbeat_at + claimTTL (a session's end moves it to
+        // then). All NULL = unclaimed; done/dropped and release clear them.
+        if !columnExists("tasks", "claimed_by") { exec("ALTER TABLE tasks ADD COLUMN claimed_by TEXT;") }
+        if !columnExists("tasks", "claim_label") { exec("ALTER TABLE tasks ADD COLUMN claim_label TEXT;") }
+        if !columnExists("tasks", "claimed_at") { exec("ALTER TABLE tasks ADD COLUMN claimed_at REAL;") }
+        if !columnExists("tasks", "claim_heartbeat_at") { exec("ALTER TABLE tasks ADD COLUMN claim_heartbeat_at REAL;") }
+        if !columnExists("tasks", "claim_expires_at") { exec("ALTER TABLE tasks ADD COLUMN claim_expires_at REAL;") }
+        exec("CREATE INDEX IF NOT EXISTS idx_tasks_claimed_by ON tasks(claimed_by) WHERE claimed_by IS NOT NULL;")
         pageSearchUsesFTS = migratePageSearchIndex()
 
         // --- Data repair: status-derived fields (every open; touches only rows that need it) ---
@@ -1170,7 +1183,7 @@ public final class Store: @unchecked Sendable {
     // MARK: - Tasks
 
     /// Canonical task column list (order must match `taskFromRow`).
-    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since, branch, milestone_id"
+    private static let taskCols = "id, code, project_id, title, detail, link, status, priority, due_date, tags, started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds, waiting_on, waiting_reason, waiting_since, branch, milestone_id, claimed_by, claim_label, claimed_at, claim_heartbeat_at, claim_expires_at"
     /// `taskCols` qualified with `tasks.`, for queries that join another table.
     private static let qualifiedTaskCols = taskCols.components(separatedBy: ", ").map { "tasks.\($0)" }.joined(separator: ", ")
     /// How many columns `taskCols` selects: the index of a column a query adds after them.
@@ -1592,7 +1605,7 @@ public final class Store: @unchecked Sendable {
                            waitingOn: WaitingOn? = nil, waitingReason: String?? = nil,
                            parentId: Int64?? = nil,
                            branch: String?? = nil, milestoneId: Int64?? = nil, author: NoteAuthor? = nil,
-                           note: NoteDraft? = nil) throws {
+                           note: NoteDraft? = nil, actor: ClaimActor = .user) throws {
         let noteText = try note.map { try Self.noteBody($0.text) }
         // link: .some(nil) or .some("") removes the primary link; see setLegacyLinkUnlocked.
         let link: String?? = try link.map { v in
@@ -1605,7 +1618,8 @@ public final class Store: @unchecked Sendable {
                 id: id, title: title, detail: detail, link: link, status: status, priority: priority,
                 dueDate: dueDate, tags: tags, recurrence: recurrence, estimateSeconds: estimateSeconds,
                 waitingOn: waitingOn, waitingReason: waitingReason, parentId: parentId,
-                branch: branch, milestoneId: milestoneId, author: author, spawnRecurrence: spawnRecurrence)
+                branch: branch, milestoneId: milestoneId, author: author, actor: actor,
+                spawnRecurrence: spawnRecurrence)
             if let note, let noteText {
                 _ = try insertNoteUnlocked(taskId: id, text: noteText, kind: note.kind, author: note.author,
                                            sessionId: note.sessionId, statusEventId: eventId)
@@ -1651,7 +1665,7 @@ public final class Store: @unchecked Sendable {
                                 dueDate: Date?? = nil, addTags: [String]? = nil,
                                 waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
                                 waitingReason: String?? = nil, parentId: Int64?? = nil,
-                                milestoneId: Int64?? = nil) throws {
+                                milestoneId: Int64?? = nil, actor: ClaimActor = .user) throws {
         lock.lock(); defer { lock.unlock() }
         let apply = { [self] (spawnRecurrence: Bool) in
             try beginImmediate()
@@ -1660,7 +1674,8 @@ public final class Store: @unchecked Sendable {
                     try applyTaskUpdateUnlocked(id: id, status: status, priority: priority, dueDate: dueDate,
                                                 addTags: addTags, waitingOn: waitingOn, waitingOnDefault: waitingOnDefault,
                                                 waitingReason: waitingReason, parentId: parentId,
-                                                milestoneId: milestoneId, spawnRecurrence: spawnRecurrence)
+                                                milestoneId: milestoneId, actor: actor,
+                                                spawnRecurrence: spawnRecurrence)
                 } catch StoreError.invalid(let msg) {
                     // Name the task that failed the batch.
                     let code = queryString("SELECT code FROM tasks WHERE id=?;", [.int(id)]) ?? "task \(id)"
@@ -1700,8 +1715,15 @@ public final class Store: @unchecked Sendable {
                                          waitingOn: WaitingOn? = nil, waitingOnDefault: WaitingOn? = nil,
                                          waitingReason: String?? = nil, parentId: Int64?? = nil,
                                          branch: String?? = nil, milestoneId: Int64?? = nil, author: NoteAuthor? = nil,
-                                         spawnRecurrence: Bool) throws -> Int64? {
+                                         actor: ClaimActor = .user, spawnRecurrence: Bool) throws -> Int64? {
         guard let old = getTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+        // The claim rule: an agent changes the status of a task another session holds a live
+        // claim on only once that claim expires (checked here, against the row read inside
+        // the caller's transaction). The user in the app may change any task.
+        if let status, status != old.status, case .agent(let holder) = actor,
+           let claim = old.claim, claim.isLive(), claim.holder != holder?.id {
+            throw StoreError.invalid(Self.claimConflict(old, claim))
+        }
         // milestoneId .some(id): put it in that milestone; .some(nil): in none.
         var newMilestone: Int64?? = nil
         if let milestoneId, milestoneId != old.milestoneId {
@@ -1743,6 +1765,8 @@ public final class Store: @unchecked Sendable {
             binds += ts.binds
             // Leaving waiting (or any non-waiting status write) clears what it waited on.
             if status != .waiting { sets += ["waiting_on=NULL", "waiting_reason=NULL"] }
+            // Closing (done / dropped) ends the claim: nobody works on the task any more.
+            if status.isClosed, old.claim != nil { sets += Self.clearClaimSets }
         }
         if let waitingOn { sets.append("waiting_on=?"); binds.append(.text(waitingOn.rawValue)) }
         if let waitingReason {
@@ -1810,6 +1834,7 @@ public final class Store: @unchecked Sendable {
         // History: log discrete-field changes (skip free-text title/detail — autosave makes them noisy).
         var statusEventId: Int64?
         if let status, status != old.status { statusEventId = logEvent(id, "status", old.status.display, status.display) }
+        if let status, status.isClosed, let claim = old.claim { logEvent(id, "claim", claim.holderName, "") }
         // waiting_on is logged by raw value (user / external); waiting_reason is free text
         // (like title/detail) and is not logged.
         // Leaving waiting clears it, but the status row already says so: log only a new who.
@@ -3781,7 +3806,15 @@ public final class Store: @unchecked Sendable {
             }
             binds.append(.text(id))
             try runWrite("UPDATE agent_sessions SET \(sets.joined(separator: ", ")) WHERE id=?;", binds)
+            // A session that ended works on nothing: its claims expire now (kept, so a takeover
+            // still shows whose work it was, and a resumed session can renew them).
+            if state == .ended { try expireClaimsUnlocked(holderId: id, at: e.at) }
             if e.kind == .start, let p = e.process {
+                let superseded = try readSessionsUnlocked(
+                    "WHERE id<>? AND pid=? AND ABS(pid_started_at - ?) < 1 AND state<>?",
+                    [.text(id), .int(Int64(p.pid)), .double(p.startedAt.timeIntervalSince1970),
+                     .text(SessionState.ended.rawValue)])
+                for old in superseded { try expireClaimsUnlocked(holderId: old.id, at: e.at) }
                 try runWrite(
                     "UPDATE agent_sessions SET state=?, ended_at=?, end_reason='superseded' "
                     + "WHERE id<>? AND pid=? AND ABS(pid_started_at - ?) < 1 AND state<>?;",
@@ -3817,7 +3850,9 @@ public final class Store: @unchecked Sendable {
                              [.text(SessionState.ended.rawValue), .double(now.timeIntervalSince1970), .text(s.id),
                               .text(SessionState.ended.rawValue), .int(Int64(s.pid ?? 0)),
                               .double(s.lastSeen.timeIntervalSince1970)])
-                n += Int(sqlite3_changes(db))
+                let ended = Int(sqlite3_changes(db))
+                if ended > 0 { try expireClaimsUnlocked(holderId: s.id, at: now) }
+                n += ended
             }
             if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
             return n
@@ -3879,6 +3914,225 @@ public final class Store: @unchecked Sendable {
         }
         guard rc == SQLITE_DONE else { throw StoreError.step(errmsg()) }
         return out
+    }
+
+    // MARK: - Claims (next_task / claim_task, 1.5.0)
+
+    /// How long a claim holds after its last heartbeat. Its holder renews it with the
+    /// heartbeat tool, by claiming it again, or by writing to the task (update_task,
+    /// add_note, add_link, ask_user, resume_question); after that long without any, the
+    /// claim expires and another session may take the task over.
+    public static let claimTTL: TimeInterval = 30 * 60
+
+    /// The SET clauses that end a claim.
+    static let clearClaimSets = ["claimed_by=NULL", "claim_label=NULL", "claimed_at=NULL",
+                                 "claim_heartbeat_at=NULL", "claim_expires_at=NULL"]
+
+    /// Why an agent may not change (or claim) a task another session holds a live claim on.
+    static func claimConflict(_ t: TodoTask, _ c: TaskClaim, now: Date = Date()) -> String {
+        let left = max(1, Int((c.expiresAt.timeIntervalSince(now) / 60).rounded(.up)))
+        return "\(t.code) is claimed by \(c.holderName) (last heartbeat \(TaskClaim.ago(c.heartbeatAt, now: now)), "
+            + "expires in \(left) min without another): only that session may change its status or claim, "
+            + "until the claim expires or the user releases it in the app. Work on another task (next_task)."
+    }
+
+    /// Run `body` in one BEGIN IMMEDIATE (caller holds the lock): committed when it
+    /// returns, rolled back when it throws.
+    private func inWriteTransaction<T>(_ body: () throws -> T) throws -> T {
+        do {
+            try beginImmediate()
+            let out = try body()
+            if exec("COMMIT;") != SQLITE_OK { throw StoreError.step("commit failed: \(errmsg())") }
+            return out
+        } catch {
+            exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Claim a task for `holder`, in one BEGIN IMMEDIATE with the row re-read inside it:
+    /// - no claim: claimed. The caller's own claim (live or expired): renewed.
+    /// - another session's expired claim: taken over (`previous` is the old claim).
+    /// - another session's live claim: refused (`claimConflict`).
+    /// A todo task moves to in progress; other statuses stay. Done or dropped: refused.
+    public func claimTask(id: Int64, holder: ClaimHolder, now: Date = Date()) throws -> ClaimResult {
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            guard let t = try readTaskUnlocked(id) else { throw StoreError.notFound("task \(id)") }
+            guard !t.status.isClosed else {
+                throw StoreError.invalid("\(t.code) is \(t.status.rawValue): a closed task cannot be claimed")
+            }
+            return try claimUnlocked(t, holder: holder, now: now)
+        }
+    }
+
+    /// The next task to work on in board order (`TaskSort.board`), and optionally claim it
+    /// for `holder`, in one BEGIN IMMEDIATE so two sessions never get the same task: the
+    /// pick runs inside the transaction, with the eligibility rule re-evaluated there.
+    /// Eligible (priority never reorders):
+    /// - a todo task that is not blocked, has no open subtasks (its first eligible subtask
+    ///   comes next in board order instead), is not under a waiting or blocked parent, and
+    ///   has no live claim of another session;
+    /// - or an in-progress task whose claim expired (a takeover).
+    /// Archived projects are left out; `projectId` nil looks across every active project.
+    /// Nil result: nothing eligible; `skips` says what was passed over.
+    public func nextTask(projectId: Int64?, holder: ClaimHolder?, claim: Bool,
+                         now: Date = Date()) throws -> (result: ClaimResult?, skips: NextTaskSkips) {
+        if claim && holder == nil { throw StoreError.invalid("claiming needs to know your session") }
+        lock.lock(); defer { lock.unlock() }
+        let pick = { [self] () throws -> (ClaimResult?, NextTaskSkips) in
+            guard let t = try nextCandidateUnlocked(projectId: projectId, holderId: holder?.id, now: now) else {
+                return (nil, try nextSkipsUnlocked(projectId: projectId, holderId: holder?.id, now: now))
+            }
+            if claim, let holder { return (try claimUnlocked(t, holder: holder, now: now), NextTaskSkips()) }
+            let expiredOther = t.claim.map { !$0.isLive(at: now) && $0.holder != holder?.id } ?? false
+            return (ClaimResult(task: t, outcome: .unclaimed, previous: expiredOther ? t.claim : nil), NextTaskSkips())
+        }
+        return claim ? try inWriteTransaction(pick) : try pick()
+    }
+
+    /// Give a claim back. The user (`.user`) may release any claim; an agent only its own
+    /// (live or expired), so a session whose claim was taken over cannot release the new
+    /// holder's. `reopen`: an in-progress task goes back to todo, where next_task offers it
+    /// again. Returns the task and the claim released (nil when it had none).
+    public func releaseClaim(taskId: Int64, actor: ClaimActor, reopen: Bool = true,
+                             now: Date = Date()) throws -> (task: TodoTask, released: TaskClaim?) {
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            guard let t = try readTaskUnlocked(taskId) else { throw StoreError.notFound("task \(taskId)") }
+            guard let c = t.claim else { return (t, nil) }
+            if case .agent(let holder) = actor, c.holder != holder?.id {
+                throw StoreError.invalid(c.isLive(at: now)
+                    ? Self.claimConflict(t, c, now: now)
+                    : "\(t.code) is not your claim: \(c.holderName) holds it (expired)")
+            }
+            try runWrite("UPDATE tasks SET \(Self.clearClaimSets.joined(separator: ", ")) WHERE id=?;", [.int(t.id)])
+            logEvent(t.id, "claim", c.holderName, "")
+            if reopen && t.status == .inProgress {
+                try applyTaskUpdateUnlocked(id: t.id, status: .todo, spawnRecurrence: false)
+            }
+            guard let after = try readTaskUnlocked(t.id) else { throw StoreError.notFound("task \(t.id)") }
+            return (after, c)
+        }
+    }
+
+    /// Heartbeat: renew the claims `holder` still holds (live or expired, on open tasks),
+    /// all of them or only `taskId`'s, to now + claimTTL. A claim another session took over
+    /// is not the holder's any more and is not renewed. Returns the renewed tasks.
+    @discardableResult
+    public func renewClaims(holder: ClaimHolder, taskId: Int64? = nil, now: Date = Date()) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        return try inWriteTransaction {
+            var whereSQL = "claimed_by=? AND status NOT IN ('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)')"
+            var binds: [SQLValue] = [.text(holder.id)]
+            if let taskId { whereSQL += " AND id=?"; binds.append(.int(taskId)) }
+            try runWrite("UPDATE tasks SET claim_heartbeat_at=?, claim_expires_at=? WHERE \(whereSQL);",
+                         [.double(now.timeIntervalSince1970), .double(now.addingTimeInterval(Self.claimTTL).timeIntervalSince1970)]
+                         + binds)
+            guard sqlite3_changes(db) > 0 else { return [] }
+            return try readTasks("SELECT \(Self.taskCols) FROM tasks WHERE \(whereSQL) ORDER BY id;", binds)
+        }
+    }
+
+    /// The open tasks `holderId` (a Claude Code session id, or a session label) holds a
+    /// claim on, live or expired, last renewed first.
+    public func claimedTasks(holderId: String) throws -> [TodoTask] {
+        lock.lock(); defer { lock.unlock() }
+        return try readTasks(
+            "SELECT \(Self.taskCols) FROM tasks WHERE claimed_by=? "
+            + "AND status NOT IN ('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)') "
+            + "ORDER BY claim_heartbeat_at DESC, id;", [.text(holderId)])
+    }
+
+    /// The task a Claude Code session works on: the one it claimed and renewed last
+    /// (live or expired, as long as nobody took it over), or nil.
+    public func claimedTask(agentSessionId: String) throws -> TodoTask? {
+        try claimedTasks(holderId: agentSessionId.lowercased()).first
+    }
+
+    /// `claimTask` for a row already read inside the caller's transaction.
+    private func claimUnlocked(_ t: TodoTask, holder: ClaimHolder, now: Date) throws -> ClaimResult {
+        let outcome: ClaimResult.Outcome
+        switch t.claim {
+        case nil: outcome = .claimed
+        case let c? where c.holder == holder.id: outcome = .renewed
+        case let c? where c.isLive(at: now): throw StoreError.invalid(Self.claimConflict(t, c, now: now))
+        case _?: outcome = .tookOver
+        }
+        let at = now.timeIntervalSince1970
+        var sets = ["claimed_by=?", "claim_label=?", "claim_heartbeat_at=?", "claim_expires_at=?"]
+        var binds: [SQLValue] = [.text(holder.id), holder.label.map(SQLValue.text) ?? .null, .double(at),
+                                 .double(now.addingTimeInterval(Self.claimTTL).timeIntervalSince1970)]
+        if outcome != .renewed { sets.append("claimed_at=?"); binds.append(.double(at)) }
+        try runWrite("UPDATE tasks SET \(sets.joined(separator: ", ")) WHERE id=?;", binds + [.int(t.id)])
+        let name = TaskClaim.holderName(holder.id)
+        switch outcome {
+        case .claimed: logEvent(t.id, "claim", "", name)
+        case .tookOver: logEvent(t.id, "claim", (t.claim?.holderName ?? "") + " (expired)", name)
+        case .renewed, .unclaimed: break
+        }
+        if t.status == .todo { try applyTaskUpdateUnlocked(id: t.id, status: .inProgress, spawnRecurrence: false) }
+        guard let after = try readTaskUnlocked(t.id) else { throw StoreError.notFound("task \(t.id)") }
+        return ClaimResult(task: after, outcome: outcome, previous: outcome == .tookOver ? t.claim : nil)
+    }
+
+    /// The scope of next_task: active projects, or one of them.
+    private static func nextScopeSQL(_ projectId: Int64?) -> (sql: String, binds: [SQLValue]) {
+        guard let projectId else { return ("p.archived_at IS NULL", []) }
+        return ("p.archived_at IS NULL AND tasks.project_id=?", [.int(projectId)])
+    }
+
+    /// `nextTask`'s pick (see there for the rule); caller holds the lock.
+    private func nextCandidateUnlocked(projectId: Int64?, holderId: String?, now: Date) throws -> TodoTask? {
+        let scope = Self.nextScopeSQL(projectId)
+        let open = "('\(TaskStatus.done.rawValue)', '\(TaskStatus.dropped.rawValue)')"
+        let sql = """
+            SELECT \(Self.qualifiedTaskCols) FROM tasks \(Self.projectJoinSQL)
+            WHERE \(scope.sql)
+              AND ((tasks.status='\(TaskStatus.todo.rawValue)'
+                    AND (tasks.claimed_by IS NULL OR tasks.claim_expires_at <= ? OR tasks.claimed_by = ?))
+                   OR (tasks.status='\(TaskStatus.inProgress.rawValue)'
+                       AND tasks.claimed_by IS NOT NULL AND tasks.claim_expires_at <= ?))
+              AND NOT \(Self.hasOpenDependencySQL("tasks"))
+              AND NOT EXISTS (SELECT 1 FROM tasks s WHERE s.parent_id = tasks.id AND s.status NOT IN \(open))
+              AND NOT EXISTS (SELECT 1 FROM tasks pt WHERE pt.id = tasks.parent_id
+                              AND (pt.status = '\(TaskStatus.waiting.rawValue)' OR \(Self.hasOpenDependencySQL("pt"))))
+            ORDER BY \(Self.treeOrderSQL) LIMIT 1;
+            """
+        let at = now.timeIntervalSince1970
+        return try readTasks(sql, scope.binds + [.double(at), .text(holderId ?? ""), .double(at)]).first
+    }
+
+    /// What next_task passed over in its scope, by reason (`NextTaskSkips`).
+    private func nextSkipsUnlocked(projectId: Int64?, holderId: String?, now: Date) throws -> NextTaskSkips {
+        let scope = Self.nextScopeSQL(projectId)
+        let todo = "tasks.status='\(TaskStatus.todo.rawValue)'"
+        let live = "(tasks.claimed_by IS NOT NULL AND tasks.claim_expires_at > ?)"
+        let stmt = try prepare(
+            """
+            SELECT COALESCE(SUM(\(todo) AND \(live) AND tasks.claimed_by <> ?), 0),
+                   COALESCE(SUM(\(todo) AND \(Self.hasOpenDependencySQL("tasks"))), 0),
+                   COALESCE(SUM(tasks.status='\(TaskStatus.waiting.rawValue)'), 0),
+                   COALESCE(SUM(tasks.status='\(TaskStatus.inProgress.rawValue)'
+                                AND (tasks.claimed_by IS NULL OR tasks.claim_expires_at > ?)), 0)
+            FROM tasks \(Self.projectJoinSQL) WHERE \(scope.sql);
+            """,
+            [.double(now.timeIntervalSince1970), .text(holderId ?? ""), .double(now.timeIntervalSince1970)] + scope.binds)
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.step(errmsg()) }
+        var s = NextTaskSkips()
+        s.claimed = Int(sqlite3_column_int64(stmt, 0))
+        s.blocked = Int(sqlite3_column_int64(stmt, 1))
+        s.waiting = Int(sqlite3_column_int64(stmt, 2))
+        s.inProgress = Int(sqlite3_column_int64(stmt, 3))
+        return s
+    }
+
+    /// End the claims of a session that ended: they expire at `at` (if later), and stay
+    /// recorded so a takeover can name the session, and a resumed session can renew them.
+    private func expireClaimsUnlocked(holderId: String, at: Date) throws {
+        try runWrite("UPDATE tasks SET claim_expires_at=? WHERE claimed_by=? AND claim_expires_at>?;",
+                     [.double(at.timeIntervalSince1970), .text(holderId), .double(at.timeIntervalSince1970)])
     }
 
     // MARK: - Dependencies (blocked-by)
@@ -4214,7 +4468,8 @@ public final class Store: @unchecked Sendable {
     private func taskFromRow(_ stmt: OpaquePointer?) -> TodoTask {
         // Columns: id, code, project_id, title, detail, link, status, priority, due_date, tags,
         //          started_at, completed_at, effort_seconds, created_at, updated_at, sort_order, recurrence, parent_id, estimate_seconds,
-        //          waiting_on, waiting_reason, waiting_since, branch, milestone_id
+        //          waiting_on, waiting_reason, waiting_since, branch, milestone_id,
+        //          claimed_by, claim_label, claimed_at, claim_heartbeat_at, claim_expires_at
         func date(_ i: Int32) -> Date? {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, i))
         }
@@ -4222,6 +4477,12 @@ public final class Store: @unchecked Sendable {
             sqlite3_column_type(stmt, i) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, i)
         }
         let status = TaskStatus(rawValue: colText(stmt, 6)) ?? .todo
+        // A claim needs its holder and times; a row missing any of them reads as unclaimed.
+        var claim: TaskClaim?
+        if let holder = colTextOpt(stmt, 24), let at = date(26), let beat = date(27), let expires = date(28) {
+            claim = TaskClaim(holder: holder, label: colTextOpt(stmt, 25), claimedAt: at, heartbeatAt: beat,
+                              expiresAt: expires)
+        }
         return TodoTask(
             id: sqlite3_column_int64(stmt, 0),
             code: colText(stmt, 1),
@@ -4247,7 +4508,8 @@ public final class Store: @unchecked Sendable {
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 14)),
             sortOrder: Int(sqlite3_column_int64(stmt, 15)),
             branch: colTextOpt(stmt, 22),
-            milestoneId: int64Opt(23)
+            milestoneId: int64Opt(23),
+            claim: claim
         )
     }
 

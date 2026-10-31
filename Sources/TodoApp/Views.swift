@@ -1218,6 +1218,7 @@ struct TaskRow: View {
                         }
                         if let n = model.blockingCounts[task.id] { BlocksOthersMark(count: n) }
                         WaitingChip(task: task)
+                        if let claim = task.claim, !task.status.isClosed { ClaimChip(claim: claim) }
                     }
                     Text(task.title)
                         .font(Theme.Fonts.bodySm)
@@ -1577,6 +1578,7 @@ struct BoardCard: View {
                 CodeBadge(code: task.code)
                 if let n = model.blockingCounts[task.id] { BlocksOthersMark(count: n) }
                 Spacer()
+                if let claim = task.claim, !task.status.isClosed { ClaimChip(claim: claim) }
             }
             Text(task.title)
                 .font(Theme.Fonts.bodySm)
@@ -1809,6 +1811,7 @@ struct TaskDetailView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            if let claim = task.claim { ClaimLine(task: task, claim: claim) }
             if status == .waiting {
                 labeledRow("Waiting on") {
                     Picker("", selection: $waitingOn) {

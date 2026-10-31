@@ -298,6 +298,59 @@ final class MCPServer: @unchecked Sendable {
         _ = try? store.recordSession(SessionEvent(kind, sessionId: sid, at: now))
     }
 
+    // MARK: - Claims
+
+    /// Who this call claims as (`ClaimHolder`): its Claude Code session when known
+    /// (`agentSessionId`), else its `session` label; nil when neither is known.
+    private func claimHolder(_ args: [String: Any]) throws -> ClaimHolder? {
+        let label = try sessionArg(args)
+        if let sid = agentSessionId(args) { return ClaimHolder(id: sid, label: label) }
+        return label.map { ClaimHolder(id: $0) }
+    }
+
+    private func requireClaimHolder(_ args: [String: Any]) throws -> ClaimHolder {
+        guard let holder = try claimHolder(args) else {
+            throw MCPError.invalidArg("QuestBits cannot tell which session you are: pass `session` (a label for your "
+                + "session, the same on every call; your session id when your start context gives one), "
+                + "or install the Claude Code hooks from QuestBits Settings")
+        }
+        return holder
+    }
+
+    /// The implicit heartbeat: a write to a task this call's session holds a claim on renews
+    /// that claim (the store checks the holder, so another session's claim is never touched).
+    /// Never fails the call.
+    private func renewOwnClaim(_ args: [String: Any], taskId: Int64) {
+        guard let holder = try? claimHolder(args) else { return }
+        _ = try? store.renewClaims(holder: holder, taskId: taskId)
+    }
+
+    /// next_task / claim_task output: the task (get_task's shape), whether it is now claimed
+    /// and how (outcome), its claim, and on a takeover the claim it replaced and the latest
+    /// notes, so the new session reads where the work stands before carrying on.
+    private func claimResultDict(_ r: ClaimResult, claimed: Bool) throws -> [String: Any] {
+        var d: [String: Any] = ["task": try readTaskDicts([r.task])[0], "claimed": claimed]
+        if claimed { d["outcome"] = r.outcome.rawValue }
+        if let prev = r.previous {
+            d[claimed ? "took_over_from" : "would_take_over_from"] = claimDict(prev)
+            let notes = try store.notes(taskId: r.task.id, limit: 5)
+            if !notes.isEmpty { d["latest_notes"] = notes.map(noteDict) }
+            d["hint"] = "This task was claimed by \(prev.holderName), whose claim expired. Read latest_notes "
+                + "(and get_task) before carrying on."
+        }
+        return d
+    }
+
+    /// A task's claim: who (`by` for display, `holder` the session id or label), since
+    /// when, the last heartbeat, when it expires, and `expired` once it has.
+    private func claimDict(_ c: TaskClaim) -> [String: Any] {
+        var d: [String: Any] = ["by": c.holderName, "holder": c.holder, "claimed_at": iso(c.claimedAt),
+                                "heartbeat_at": iso(c.heartbeatAt), "expires_at": iso(c.expiresAt)]
+        if let label = c.label { d["label"] = label }
+        if !c.isLive() { d["expired"] = true }
+        return d
+    }
+
     /// `project_id`/`project_code` and `session` for the question tools; all optional.
     private func questionFilterArgs(_ args: [String: Any]) throws -> (projectId: Int64?, sessionId: String?) {
         let pid = given(args, "project_id", "project_code")
@@ -470,6 +523,7 @@ final class MCPServer: @unchecked Sendable {
             // Always the agent: only the user, in the app, writes (and edits) as the user.
             let added = try store.addNote(taskId: try resolveTaskId(args), text: text, kind: try parseNoteKind(args["kind"]),
                                           author: .agent, sessionId: try sessionArg(args))
+            renewOwnClaim(args, taskId: added.note.taskId)
             var d: [String: Any] = ["note_id": added.note.id, "task": taskHandle(code: added.taskCode, id: added.note.taskId),
                                     "ts": iso(added.note.timestamp)]
             if added.note.kind != .note { d["kind"] = added.note.kind.rawValue }
@@ -571,8 +625,10 @@ final class MCPServer: @unchecked Sendable {
                 branch: try optionalStringArg(args, "branch"),
                 milestoneId: milestone,
                 author: .agent,
-                note: note
+                note: note,
+                actor: .agent(try claimHolder(args))
             )
+            renewOwnClaim(args, taskId: id)
             return try jsonString(taskDict(store.getTask(id: id)))
 
         case "delete_task":
@@ -625,7 +681,7 @@ final class MCPServer: @unchecked Sendable {
                 ids: ids, status: try statusArg(args), priority: parsePriority(args["priority"]),
                 dueDate: dueArg, addTags: parseTags(args["add_tags"]),
                 waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args),
-                parentId: try parentArg(args), milestoneId: milestone)
+                parentId: try parentArg(args), milestoneId: milestone, actor: .agent(try claimHolder(args)))
             return "updated \(ids.count) tasks"
 
         case "bulk_move_tasks":
@@ -680,7 +736,8 @@ final class MCPServer: @unchecked Sendable {
                     let original = try store.getTask(id: originalId)
                     try store.updateTask(id: dupId, status: .dropped, author: .agent,
                                          note: NoteDraft(text: "Dropped as a duplicate of \(original.code).",
-                                                         kind: .summary, author: .agent, sessionId: try sessionArg(args)))
+                                                         kind: .summary, author: .agent, sessionId: try sessionArg(args)),
+                                         actor: .agent(try claimHolder(args)))
                     dropped = taskHandle(code: dup.code, id: dup.id)
                 }
             }
@@ -698,6 +755,74 @@ final class MCPServer: @unchecked Sendable {
             out["removed"] = removed
             return try jsonString(out)
 
+        case "next_task":
+            // Scope: one project (id, code, or the folder find_project maps), else every
+            // active project. With claim, the pick and the claim are one transaction.
+            var pid: Int64?
+            if given(args, "path") {
+                guard !given(args, "project_id", "project_code") else {
+                    throw MCPError.invalidArg("give path or project_id/project_code, not both")
+                }
+                let path = try requireString(args, "path")
+                guard let p = try store.findProject(path: path) else {
+                    throw StoreError.notFound("no project for the folder \(Store.resolvedPath(path))")
+                }
+                pid = p.id
+            } else if given(args, "project_id", "project_code") {
+                pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            }
+            let claim = try boolArg(args, "claim") ?? false
+            let holder = claim ? try requireClaimHolder(args) : try claimHolder(args)
+            let next = try store.nextTask(projectId: pid, holder: holder, claim: claim)
+            var out: [String: Any] = [:]
+            if let pid { out["project"] = store.projectCode(id: pid) ?? "" }
+            if let r = next.result {
+                out.merge(try claimResultDict(r, claimed: claim), uniquingKeysWith: { $1 })
+            } else {
+                out["task"] = NSNull()
+                let s = next.skips
+                out["skipped"] = ["claimed_by_others": s.claimed, "blocked": s.blocked, "waiting": s.waiting,
+                                  "in_progress": s.inProgress]
+            }
+            if let holder {
+                let mine = try store.claimedTasks(holderId: holder.id)
+                    .filter { $0.id != next.result?.task.id }.map { taskHandle(code: $0.code, id: $0.id) }
+                if !mine.isEmpty { out["your_other_claims"] = mine }
+            }
+            return try jsonString(out)
+
+        case "claim_task":
+            let result = try store.claimTask(id: try resolveTaskId(args), holder: try requireClaimHolder(args))
+            return try jsonString(claimResultDict(result, claimed: true))
+
+        case "release_task":
+            let holder = try requireClaimHolder(args)
+            let keep = try boolArg(args, "keep_status") ?? false
+            let released = try store.releaseClaim(taskId: try resolveTaskId(args), actor: .agent(holder), reopen: !keep)
+            var d: [String: Any] = ["task": taskHandle(code: released.task.code, id: released.task.id),
+                                    "released": released.released != nil, "status": released.task.status.rawValue]
+            if released.released == nil { d["note"] = "the task had no claim" }
+            return try jsonString(d)
+
+        case "heartbeat":
+            let holder = try requireClaimHolder(args)
+            let tid: Int64? = given(args, "id", "code") ? try resolveTaskId(args) : nil
+            let renewed = try store.renewClaims(holder: holder, taskId: tid)
+            if let tid, renewed.isEmpty {
+                // Say why: the task is not (or no longer) this session's.
+                let t = try store.getTask(id: tid)
+                if let c = t.claim {
+                    throw StoreError.invalid("\(t.code) is not your claim: \(c.holderName) holds it"
+                        + (c.isLive() ? ". Work on another task (next_task)."
+                                      : " (expired). claim_task takes it over; read its latest notes first."))
+                }
+                throw StoreError.invalid("\(t.code) has no claim\(t.status.isClosed ? " (it is \(t.status.rawValue))" : ""); claim it with claim_task")
+            }
+            var d: [String: Any] = ["renewed": renewed.map { taskHandle(code: $0.code, id: $0.id) },
+                                    "ttl_minutes": Int(Store.claimTTL / 60)]
+            if let c = renewed.first?.claim { d["expires_at"] = iso(c.expiresAt) }
+            return try jsonString(d)
+
         case "add_link":
             // Always the agent, as for notes; the app adds links as the user.
             guard let url = args["url"] as? String else { throw MCPError.missingArg("url") }
@@ -712,6 +837,7 @@ final class MCPServer: @unchecked Sendable {
             let added = try store.addLink(taskId: tid, url: url, kind: kind,
                                           title: try optionalStringArg(args, "title") ?? nil, author: .agent,
                                           source: try optionalStringArg(args, "source") ?? nil)
+            renewOwnClaim(args, taskId: tid)
             return try jsonString(["task": try store.getTask(id: tid).code, "link": linkDict(added.link),
                                    "created": added.created] as [String: Any])
 
@@ -914,6 +1040,7 @@ final class MCPServer: @unchecked Sendable {
                 context: args["context"] as? String ?? "", options: options,
                 blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args),
                 agentSessionId: agentSessionId(args))
+            renewOwnClaim(args, taskId: q.taskId)
             var d = questionDict(q)
             if q.blocksTask { d["task_status"] = TaskStatus.waiting.rawValue }
             return try jsonString(d)
@@ -924,6 +1051,7 @@ final class MCPServer: @unchecked Sendable {
 
         case "resume_question":
             let resumed = try store.resumeQuestion(id: try requireInt(args, "id"), sessionId: try sessionArg(args))
+            renewOwnClaim(args, taskId: resumed.task.id)
             var d = questionDict(resumed.question)
             d["task_status"] = resumed.task.status.rawValue
             return try jsonString(d)
@@ -1045,6 +1173,7 @@ final class MCPServer: @unchecked Sendable {
             d["milestone_id"] = mid
             if let name = rel.milestoneNames[mid] { d["milestone"] = name }
         }
+        if let c = t.claim { d["claim"] = claimDict(c) }
         return d
     }
 
@@ -1068,6 +1197,10 @@ final class MCPServer: @unchecked Sendable {
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
         if let branch = t.branch { d["branch"] = branch }
         if let mid = t.milestoneId { d["milestone"] = rel.milestoneNames[mid] ?? mid }
+        if let c = t.claim {
+            d["claimed_by"] = c.holderName
+            if !c.isLive() { d["claim_expired"] = true }
+        }
         return d
     }
 

@@ -136,6 +136,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
     public var sortOrder: Int
     public var branch: String?
     public var milestoneId: Int64?
+    public var claim: TaskClaim?     // the session working on it (next_task / claim_task), live or expired
 
     public init(
         id: Int64,
@@ -161,7 +162,8 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         updatedAt: Date,
         sortOrder: Int,
         branch: String? = nil,
-        milestoneId: Int64? = nil
+        milestoneId: Int64? = nil,
+        claim: TaskClaim? = nil
     ) {
         self.id = id
         self.code = code
@@ -187,6 +189,7 @@ public struct TodoTask: Identifiable, Codable, Hashable, Sendable {
         self.sortOrder = sortOrder
         self.branch = branch
         self.milestoneId = milestoneId
+        self.claim = claim
     }
 }
 

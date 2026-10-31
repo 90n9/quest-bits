@@ -1109,6 +1109,17 @@ final class AppModel: ObservableObject {
         reloadTasks()
     }
 
+    /// Release an agent's claim on a task (the user may release any claim). The status is
+    /// left as is: the user decides what happens to the task next.
+    func releaseClaim(_ task: TodoTask) {
+        do {
+            _ = try store.releaseClaim(taskId: task.id, actor: .user, reopen: false)
+        } catch {
+            flashToast("Couldn't release the claim: \(error)")
+        }
+        reloadTasks()
+    }
+
     func removeLink(_ link: TaskLink) {
         do {
             try store.removeLink(id: link.id)

@@ -142,3 +142,55 @@ struct SessionRow: View {
         session.cwd.isEmpty ? "" : (session.cwd as NSString).lastPathComponent
     }
 }
+
+// MARK: - Task claims
+
+/// The small "agent" chip on a claimed task (task rows and board cards): which session
+/// works on it, in the tooltip. An expired claim shows greyed until someone takes the task
+/// over or it closes. Re-read every minute, so a claim that lapses without any write shows.
+struct ClaimChip: View {
+    let claim: TaskClaim
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            chip(live: claim.isLive(at: context.date), now: context.date)
+        }
+    }
+
+    private func chip(live: Bool, now: Date) -> some View {
+        Label(live ? "agent" : "agent (expired)", systemImage: live ? "bolt.fill" : "bolt.slash")
+            .font(Theme.Fonts.micro)
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(live ? Theme.Colors.tealLight : Theme.Colors.surface, in: Capsule())
+            .foregroundStyle(live ? Theme.Colors.mossDark : Theme.Colors.steel)
+            .help(claim.summary(now: now))
+    }
+}
+
+/// The task detail's claim line: who holds the task and their last heartbeat, with a
+/// button to release the claim (e.g. when the session is gone and should not keep it).
+struct ClaimLine: View {
+    @EnvironmentObject var model: AppModel
+    let task: TodoTask
+    let claim: TaskClaim
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            row(now: context.date)
+        }
+    }
+
+    private func row(now: Date) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: claim.isLive(at: now) ? "bolt.circle" : "bolt.slash")
+                .foregroundStyle(claim.isLive(at: now) ? Theme.Colors.mossDark : Theme.Colors.steel)
+            Text(claim.summary(now: now))
+                .font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
+                .help(claim.label.map { "\(claim.holder) · label: \($0)" } ?? claim.holder)
+            Spacer()
+            Button("Release") { model.releaseClaim(task) }
+                .buttonStyle(QBGhostButtonStyle())
+                .help("Release the claim so another session (or you) can take this task")
+        }
+    }
+}

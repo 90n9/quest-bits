@@ -108,6 +108,7 @@ enum ExportMarkdown {
         if t.estimateSeconds > 0 { out.append("- Estimate: \(minutes(t.estimateSeconds))") }
         if t.effortSeconds > 0 { out.append("- Effort: \(minutes(t.effortSeconds))") }
         if let b = t.branch { out.append("- Branch: \(b)") }
+        if let c = t.claim { out.append("- Claim: \(c.summary()) (expires \(Fmt.iso(c.expiresAt)))") }
         if let l = t.link, !l.isEmpty { out.append("- Link: \(l)") }
         var times = ["created \(Fmt.iso(t.createdAt))", "updated \(Fmt.iso(t.updatedAt))"]
         if let s = t.startedAt { times.append("started \(Fmt.iso(s))") }
@@ -274,6 +275,12 @@ enum ExportJSON {
         if t.estimateSeconds > 0 { d["estimate_seconds"] = t.estimateSeconds }
         if t.effortSeconds > 0 { d["effort_seconds"] = t.effortSeconds }
         if let b = t.branch { d["branch"] = b }
+        if let c = t.claim {
+            var cd: [String: Any] = ["holder": c.holder, "claimed_at": Fmt.iso(c.claimedAt),
+                                     "heartbeat_at": Fmt.iso(c.heartbeatAt), "expires_at": Fmt.iso(c.expiresAt)]
+            if let label = c.label { cd["label"] = label }
+            d["claim"] = cd
+        }
         if let l = t.link, !l.isEmpty { d["link"] = l }
         if let s = t.startedAt { d["started_at"] = Fmt.iso(s) }
         if let c = t.completedAt { d["completed_at"] = Fmt.iso(c) }

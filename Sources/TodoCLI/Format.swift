@@ -26,7 +26,8 @@ enum Fmt {
         return "[\(s)]"
     }
 
-    /// One task as a line: "QUE-20 [in_progress/high] Title — blocked by QUE-35; branch feat/x".
+    /// One task as a line: "QUE-20 [in_progress/high] Title — blocked by QUE-35; branch feat/x;
+    /// Claimed by session 1a2b3c4d · 3 min ago".
     static func taskLine(_ t: TodoTask, _ rel: TaskRelations, titleWidth: Int = 120) -> String {
         var extras: [String] = []
         if let blockers = rel.blockedBy[t.id], !blockers.isEmpty {
@@ -34,6 +35,7 @@ enum Fmt {
         }
         if let reason = t.waitingReason, !reason.isEmpty { extras.append(oneLine(reason, max: 120)) }
         if let branch = t.branch { extras.append("branch " + branch) }
+        if let claim = t.claim, !t.status.isClosed { extras.append(claim.summary()) }
         if let due = t.dueDate { extras.append("due " + day(due)) }
         let head = "\(t.code) \(statusTag(t)) \(oneLine(t.title, max: titleWidth))"
         return extras.isEmpty ? head : head + " — " + extras.joined(separator: "; ")
