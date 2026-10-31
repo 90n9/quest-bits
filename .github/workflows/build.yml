@@ -1,4 +1,5 @@
-# Build check for pull requests and main: compiles both binaries on the same
+# Build check for pull requests and main: compiles all three binaries (app,
+# todo-mcp, questbits CLI — see Scripts/build-app.sh) on the same
 # runner image the release uses, so compiler problems (e.g. the type-checker
 # timeout that broke the v1.3.0 release build) show up before a merge, which
 # releases (see release.yml).

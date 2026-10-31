@@ -87,6 +87,9 @@ struct QuestionDetailView: View {
 struct QuestionCard: View {
     @EnvironmentObject var model: AppModel
     let question: Question
+    /// Where Skip goes instead of the next question (the Waiting on you page: its next
+    /// item); nil there disables Skip.
+    var skipTo: (() -> Void)?? = nil
     @State private var choice: Int?
     @State private var typed = ""
     @State private var editingDraft = false
@@ -100,6 +103,9 @@ struct QuestionCard: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                 header
+                if let session = model.agentSession(for: question) {
+                    SessionStatusLine(session: session)
+                }
                 Text(question.prompt)
                     .font(Theme.Fonts.heading5)
                     .foregroundStyle(Theme.Colors.ink)
@@ -113,7 +119,7 @@ struct QuestionCard: View {
                 }
                 switch question.kind {
                 case .approve: approveBody
-                case .choice, .text: answerBody
+                case .choice, .text, .disagree: answerBody
                 }
                 footer
             }
@@ -231,7 +237,7 @@ struct QuestionCard: View {
                 .qbField()
                 .focused($typing)
         } else if !question.context.isEmpty {
-            markdown(question.context)
+            approveContext
                 .padding(Theme.Spacing.sm)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Theme.Colors.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.md))
@@ -243,7 +249,7 @@ struct QuestionCard: View {
             Button("Skip for now") { skip() }
                 .buttonStyle(QBSecondaryButtonStyle(compact: true))
                 .fixedSize()
-                .disabled(model.questionAfter(question.id) == nil)
+                .disabled(skipTo.map { $0 == nil } ?? (model.questionAfter(question.id) == nil))
                 .help("Leave it open and go to the next question")
             Spacer()
             if question.kind == .approve {
@@ -257,7 +263,7 @@ struct QuestionCard: View {
                 } else {
                     Button("Edit…") { draft = question.context; editingDraft = true; typing = true }
                         .buttonStyle(QBSecondaryButtonStyle(compact: true))
-                    Button("Approve") { send(answer: "Approved", choice: nil) }
+                    Button("Approve") { send(answer: Store.approvedAnswer, choice: nil) }
                         .buttonStyle(QBPrimaryButtonStyle(compact: true))
                         .keyboardShortcut(.return, modifiers: .command)
                 }
@@ -268,6 +274,20 @@ struct QuestionCard: View {
                     .disabled(choice == nil && typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .help("Send (⌘↵) and go to the next question")
             }
+        }
+    }
+
+    /// A gate question's context is a tool call: shown as typed (markdown would eat `*`, `_`
+    /// and backslashes), so the user approves exactly what they read.
+    @ViewBuilder private var approveContext: some View {
+        if model.isGateQuestion(question.id) {
+            Text(verbatim: question.context)
+                .font(Theme.Fonts.bodySm.monospaced())
+                .foregroundStyle(Theme.Colors.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            markdown(question.context)
         }
     }
 
@@ -285,6 +305,7 @@ struct QuestionCard: View {
     }
 
     private func skip() {
+        if let skipTo { skipTo?(); return }
         if let next = model.questionAfter(question.id) { model.selectedQuestionId = next }
     }
 

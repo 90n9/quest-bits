@@ -17,6 +17,142 @@ hand-pushed `v*` tag). Source history and tags live in the public
 
 _Nothing yet._
 
+## [1.5.0] - 2026-10-31
+
+### Added
+
+- **Projects know their repo folder.** Give a project a Repo folder in its
+  sheet (shown on the Detail tab). MCP `find_project` tells an agent which
+  project its working folder belongs to: a subfolder matches, and when
+  folders nest the deepest one wins. `create_project` and `update_project`
+  take `repo_path`.
+- **Agents can set the task order.** MCP `reorder_tasks` saves the order the
+  list and board show, the same order your drag sets, and `list_tasks` with
+  `sort` `board` reads it back. Priority never moves a task.
+- **Links and a working branch.** A task keeps any number of typed links
+  (pull request, design, doc, file, branch or other) in a Links section of
+  its detail: open, show in Finder, copy, change the kind or remove. One PR
+  can be linked from several tasks. A task also has a working branch, shown
+  as a chip on its row. MCP `add_link`, `remove_link`, and `branch` on
+  `create_task` and `update_task`. The single `link` field still works.
+- **Relations.** Blocked by, blocks, relates to, duplicates and duplicated
+  by, across projects, in a Relations section of the task detail. Marking a
+  duplicate offers to drop it. A hand mark on rows and cards shows tasks
+  that block unfinished work. MCP `add_relation` and `remove_relation`;
+  `get_task` lists `relations`.
+- **Milestones.** Named stages of a project, such as a release, with
+  progress, a target date and acceptance criteria, beside parent and
+  subtask. Manage them in the Milestones section of the Detail tab, pick one
+  in the task detail, and group the task list with **Group by milestone**. A
+  milestone never closes by itself. MCP `list_milestones`,
+  `create_milestone`, `update_milestone` and `delete_milestone`; tasks take
+  `milestone`.
+- **Project wiki.** A Wiki tab keeps a project's decisions and notes: search,
+  new page, edit in place (an edit made elsewhere in the meantime is caught,
+  not overwritten), history and delete. Task codes in a page open the task.
+  Agents search it before asking you again: MCP `list_pages`, `get_page`,
+  `create_page`, `update_page`, `delete_page`, `search_pages` (Thai and parts
+  of words match) and `get_page_history`.
+- **The `questbits` command-line tool**, inside the app. `brief` prints a
+  short start-of-session summary of a folder's project, `list` and `show`
+  read tasks, `export` writes every project to markdown or JSON (tasks,
+  notes, history, links, milestones, wiki pages and guides), and `import` is
+  below. Settings → Command Line links it into `~/.local/bin` as
+  `questbits` (`questbits-dev` for a dev build).
+- **Claude Code hooks, opt-in from Settings.** Settings → Claude Code Hooks
+  installs, updates or uninstalls QuestBits' hooks in
+  `~/.claude/settings.json`. Nothing is installed until you click Install.
+  Your other hooks and settings are kept, and the old file is backed up
+  beside it first. With the hooks installed, in a folder that belongs to a
+  project:
+  - A new session starts with a brief: the project's guide, what is in
+    progress, what waits on you, the next tasks, open milestones and the
+    latest decisions.
+  - After Claude Code compacts a conversation, the session gets its own work
+    back: the tasks it claimed, their latest notes and decisions, and its
+    questions.
+  - **Gate approvals.** A risky call (git push, gh release, merging or
+    opening a PR, a recursive delete outside the repo folder, sqlite and
+    commands on the QuestBits database, QuestBits calls that change which
+    project a folder belongs to, git or gh told to run other commands,
+    sending Slack or Gmail messages, and the project's own rules) is not
+    run: it becomes an approval question in QuestBits that shows the whole
+    call and every rule it matched, and the agent keeps working. Once you
+    approve, the agent may retry that exact call once, within 24 hours. It
+    covers Bash, Monitor and PowerShell commands and MCP calls. When the
+    gate can't check a call, it asks in the terminal; it never allows on an
+    error. Edit a project's rules in the Gate section of its Detail tab. In
+    folders that belong to no project, the gate does nothing. The gate stops
+    mistakes, not an agent set on getting around it: what `make` or
+    `npm run` run, git hooks, and a script edited after you approve it are
+    not checked.
+  - A session waiting at its terminal (for a permission, an answer or after
+    going idle) shows in QuestBits, with the folder to go back to.
+  - Question cards and the Detail tab show each Claude Code session's
+    status (working, waiting, idle or ended) and a command to copy that
+    resumes it.
+- **Agents claim tasks.** MCP `next_task` gives the next ready task in board
+  order (blocked, waiting and claimed ones are skipped) and can claim it in
+  the same step, so two sessions never pick the same task. `claim_task`,
+  `release_task` and `heartbeat` manage claims. A claim runs out 30 minutes
+  after the session's last sign of life; another session can then take the
+  task over. Rows, cards and the task detail show which agent holds a task,
+  with a Release button.
+- **Waiting on you** page in the sidebar, with a count: sessions waiting at
+  a terminal, open questions (approvals included) and tasks waiting on you,
+  across projects, each with its quick action.
+- **Activity** page in the sidebar: every task change, note and wiki edit,
+  newest first, with who made it (you, an agent, a hook, the command line
+  or an import). Filter by project, day and who. MCP `get_task_history`
+  gives each change's `source`.
+- **Decisions** page in the sidebar: the decisions agents made on their own,
+  with a count of new ones. Mark them as seen, or **Disagree** and say why:
+  the agent gets your reason as an answered question, reconsiders, and
+  records what it does. MCP `decisions` lists them.
+- **Menu bar counts.** The menu-bar item shows ✋ how many things wait on you
+  and ⚡ how many tasks are being worked on. Its menu lists the first few of
+  each; click one to open it.
+- **Notifications when an agent needs you:** a new question, a task an agent
+  set waiting on you, or a session waiting at its terminal. Clicking one
+  opens Waiting on you. Turn them off in Settings → Notifications.
+- Subtask rows show their status icon, waiting and blocked marks, and the
+  agent working on them.
+- **`questbits import`** moves work tracked elsewhere (plan files, agent
+  work logs) into QuestBits from a mapping you review. A dry run writes
+  nothing and lists every item with what would change; `--apply` writes only
+  the plan you reviewed, backs up the database first, and a second run adds
+  nothing twice. If a source changed after the dry run, `--apply` stops
+  without writing.
+
+### Changed
+
+- The rules QuestBits gives agents (MCP `instructions` and `get_guide`)
+  cover the new workflow: find the project, take tasks with `next_task`,
+  keep links, relations and the wiki up to date, and what to do when the
+  gate stops a call or you disagree with a decision.
+
+### Removed
+
+- **The Pomodoro timer:** the bottom bar, the Timer menu and its shortcuts
+  (⌘↩, ⌘K and ⌘.), the phase notifications and the timer settings. The
+  menu-bar item stays, with the counts above. The Stats dashboard keeps
+  tasks completed, in progress and open questions; the focus and pomodoro
+  charts are gone. Past focus sessions and effort stay in the database, and
+  a task still shows its effort when it has some.
+
+### Upgrade notes
+
+- **MCP `daily_stats` changed:** it now returns
+  `{date, tasks_completed, subtasks_completed}`. `completed_pomodoros` and
+  `total_focus_minutes` are gone.
+- On first open, 1.5.0 adds new tables and columns to the database; nothing
+  is removed or rewritten. Existing task links move into the new Links list.
+- If you move QuestBits.app after installing the hooks, open Settings and
+  click **Update Hooks**: the hooks run the app's command-line tool by its
+  full path. Until then they do nothing (the gate is off), and Settings says
+  so.
+- A project's repo folder can't be `/` or your home folder.
+
 ## [1.4.3] - 2026-10-31
 
 ### Added

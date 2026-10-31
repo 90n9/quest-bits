@@ -1,7 +1,7 @@
 ---
 version: 1
 name: QuestBit-cozy-rpg
-description: QuestBit is a macOS quest-log todo app themed as a cozy RPG — a warm tavern quest board rendered in parchment and wood. Aged-paper surfaces ({colors.parchment}) carry bark-brown ink ({colors.ink}), trimmed with harvest gold ({colors.gold}) and herb green ({colors.herb}); ember rust ({colors.ember}) marks links and selection. Alegreya (a storybook serif) carries headings while Quicksand (soft rounded sans) keeps body text friendly and highly readable. Tasks read as quests, projects as quest logs, the pomodoro timer as a hearth-side focus ritual.
+description: QuestBit is a macOS quest-log todo app themed as a cozy RPG — a warm tavern quest board rendered in parchment and wood. Aged-paper surfaces ({colors.parchment}) carry bark-brown ink ({colors.ink}), trimmed with harvest gold ({colors.gold}) and herb green ({colors.herb}); ember rust ({colors.ember}) marks links and selection. Alegreya (a storybook serif) carries headings while Quicksand (soft rounded sans) keeps body text friendly and highly readable. Tasks read as quests, projects as quest logs.
 colors:
   bark: "#4a3423"
   on-bark: "#f9f0dd"
@@ -112,11 +112,6 @@ typography:
     fontSize: 14px
     fontWeight: 700
     lineHeight: 1.30
-  timer-display:
-    fontFamily: Alegreya
-    fontSize: 22px
-    fontWeight: 700
-    lineHeight: 1.10
   code-badge:
     fontFamily: SF Mono
     fontSize: 11px
@@ -233,12 +228,6 @@ components:
     typography: "{typography.code-badge}"
     rounded: "{rounded.sm}"
     padding: "2px 6px"
-  pomodoro-bar:
-    backgroundColor: "{colors.bark}"
-    textColor: "{colors.on-dark}"
-    typography: "{typography.timer-display}"
-    rounded: "{rounded.lg}"
-    padding: "{spacing.md} {spacing.lg}"
   text-input:
     backgroundColor: "{colors.vellum}"
     textColor: "{colors.ink}"
@@ -277,7 +266,7 @@ language, never from noise.
 - Ember rust ({colors.ember}) replaces "action blue": links, selection strokes, focus rings
 - Herb green ({colors.success-accent}) for done/success
 - Alegreya bold serif headings; Quicksand rounded-sans body — readability first
-- Dark bark ({colors.bark}) reserved for the pomodoro bar, toasts, banners, and primary buttons
+- Dark bark ({colors.bark}) reserved for toasts, banners, and primary buttons
 - Pills everywhere buttons appear ({rounded.full}); cards and rows use {rounded.lg}–{rounded.xl}
 
 ## Colors
@@ -311,11 +300,11 @@ language, never from noise.
 ## Typography
 
 ### Font Families
-- **Alegreya** (headings, timer): storybook serif, bold (700). Variable TTF bundled at `Resources/Fonts/Alegreya.ttf` (OFL).
+- **Alegreya** (headings): storybook serif, bold (700). Variable TTF bundled at `Resources/Fonts/Alegreya.ttf` (OFL).
 - **Quicksand** (body, buttons, badges): soft geometric rounded sans. Variable TTF bundled at `Resources/Fonts/Quicksand.ttf` (OFL).
 - **SF Mono** (system monospaced): task/project code badges only (`GEN-3`).
 
-Both fonts are registered at launch via `ATSApplicationFontsPath` (Info.plist, written by `Scripts/build-app.sh`). Readability rule: **display serif is confined to headings and the timer — task titles, lists, and controls always use Quicksand.**
+Both fonts are registered at launch via `ATSApplicationFontsPath` (Info.plist, written by `Scripts/build-app.sh`). Readability rule: **display serif is confined to headings — task titles, lists, and controls always use Quicksand.**
 
 ### Hierarchy
 
@@ -335,7 +324,6 @@ Both fonts are registered at launch via `ATSApplicationFontsPath` (Info.plist, w
 | `{typography.micro}` | Quicksand | 12px | 500 | Microcopy |
 | `{typography.micro-uppercase}` | Quicksand | 11px | 700 | Section labels (0.5px tracking) |
 | `{typography.button-md}` | Quicksand | 14px | 700 | Button labels |
-| `{typography.timer-display}` | Alegreya | 22px | 700 | Pomodoro countdown |
 | `{typography.code-badge}` | SF Mono | 11px | 600 | `GEN-3` code chips |
 
 ### Swift token mapping
@@ -369,7 +357,7 @@ Both fonts are registered at launch via `ATSApplicationFontsPath` (Info.plist, w
 
 ### App Structure
 - Sidebar (quest logs / projects) on {colors.parchment-aged}, main content on {colors.parchment}.
-- Pomodoro bar is the one dark element in the main window ({colors.bark}) — anchors the bottom like a hearth.
+- Dark bark ({colors.bark}) in the main window is kept to the update banner and toasts; the window has no bottom bar.
 
 ## Shapes
 
@@ -378,7 +366,7 @@ Both fonts are registered at launch via `ATSApplicationFontsPath` (Info.plist, w
 | `{rounded.xs}` | 4px | Micro chips |
 | `{rounded.sm}` | 6px | Code badges |
 | `{rounded.md}` | 8px | Inputs, ghost buttons, nav rows |
-| `{rounded.lg}` | 12px | Quest rows, pomodoro bar |
+| `{rounded.lg}` | 12px | Quest rows |
 | `{rounded.xl}` | 16px | Cards, sheets |
 | `{rounded.xxl}` | 20px | Large panels |
 | `{rounded.full}` | 9999px | All pill buttons and badges |
@@ -386,10 +374,10 @@ Both fonts are registered at launch via `ATSApplicationFontsPath` (Info.plist, w
 Elevation stays flat-with-hairlines. Depth cue is a warm 2px drop edge (`0 2px 0 rgba(138,106,72,.18)`) on cards/rows instead of blurred shadows — reads as stacked paper.
 
 ### Decorative art (bundled, `Contents/Resources/`)
-- **Icons/** — Lucide (ISC) + Tabler (MIT) SVGs, template-tinted via `QBIcon`. Sidebar views (map, swords, castle, backpack, door-open) and pomodoro phases (campfire, beer, bed, flame-kindling).
+- **Icons/** — Lucide (ISC) + Tabler (MIT) SVGs, template-tinted via `QBIcon`. Sidebar views (map, swords, castle, backpack, door-open).
 - **Frames/panel-border.png** — Kenney Fantasy UI Borders (CC0), white line-art 9-slice, template-tinted. Applied around the task-detail pane via `.qbQuestFrame()` (default {colors.hairline-strong}). Decorative only, never intercepts clicks.
 - **Textures/paper.jpg** — ambientCG Paper001 (CC0), tiled at 12% opacity over {colors.parchment} via `.qbParchment()` — every former flat-canvas pane.
-- **Textures/planks.jpg** — ambientCG Planks037A (CC0), tiled under a `{colors.bark}` 85% scrim via `.qbHearth()` — pomodoro bar + update banner.
+- **Textures/planks.jpg** — ambientCG Planks037A (CC0), tiled under a `{colors.bark}` 85% scrim via `.qbHearth()` — update banner.
 - License texts ship in the same bundle folders (`LICENSE-lucide.txt`, `LICENSE-tabler.txt`, `LICENSE-kenney.txt`, `LICENSE-ambientcg.txt`).
 
 ## Components
@@ -398,7 +386,7 @@ Elevation stays flat-with-hairlines. Depth cue is a warm 2px drop edge (`0 2px 0
 
 **`button-secondary`** — outlined pill, {colors.hairline-strong} border, ink text.
 
-**`button-on-dark`** — cream pill on bark surfaces (update banner, pomodoro bar).
+**`button-on-dark`** — cream pill on bark surfaces (update banner).
 
 **`button-ghost`** — quiet rectangular, pressed fill {colors.parchment-aged}.
 
@@ -412,8 +400,6 @@ Elevation stays flat-with-hairlines. Depth cue is a warm 2px drop edge (`0 2px 0
 
 **`code-badge`** — `GEN-3` chips: SF Mono on {colors.parchment-aged}, {rounded.sm}.
 
-**`pomodoro-bar`** — dark bark panel, Alegreya gold-cream countdown, cream pill buttons.
-
 **`toast` / `update-banner`** — bark background, cream text, `button-on-dark` actions.
 
 ## Do's and Don'ts
@@ -421,8 +407,8 @@ Elevation stays flat-with-hairlines. Depth cue is a warm 2px drop edge (`0 2px 0
 ### Do
 - Keep every background warm — parchment family only; no white, no grey
 - Use {colors.ember} wherever "action blue" would appear (links, focus, selection strokes)
-- Reserve Alegreya for headings and the timer; Quicksand for everything interactive
-- Reserve {colors.bark} fills for primary buttons, pomodoro bar, toasts, banners
+- Reserve Alegreya for headings; Quicksand for everything interactive
+- Reserve {colors.bark} fills for primary buttons, toasts, banners
 - Keep pills ({rounded.full}) for all buttons and badges
 - Use quest-log language in UI copy where natural (quests, quest logs, streaks)
 
@@ -436,6 +422,5 @@ Elevation stays flat-with-hairlines. Depth cue is a warm 2px drop edge (`0 2px 0
 ## Known Gaps
 
 - No dark-mode tokens — app remains locked to light appearance (TodoApp.swift)
-- Pomodoro countdown still renders in system monospaced font in code; `{typography.timer-display}` (Alegreya) is the target — Alegreya lacks tabular figures, so verify no digit-jitter before switching
-- Menu-bar countdown (MenuBarExtra) uses the system font by OS constraint — out of scope
+- Menu-bar item (MenuBarExtra) uses a system template icon and font by OS constraint — out of scope
 - Decorative assets integrated (Lucide/Tabler icons, Kenney frame, ambientCG textures — see "Decorative art"); remaining candidates for later: Kenney dividers as section separators, frame variants on sheets/dashboard tiles

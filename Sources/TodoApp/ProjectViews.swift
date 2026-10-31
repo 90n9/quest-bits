@@ -5,7 +5,7 @@ import SwiftUI
 /// The tabs of a project's page. Tasks is the list (or board) and task detail as before;
 /// the others show the rest of the project in place of popups and the sidebar menu.
 enum ProjectTab: String, CaseIterable, Identifiable {
-    case tasks, detail, guide, questions
+    case tasks, detail, wiki, guide, questions
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum ProjectTab: String, CaseIterable, Identifiable {
         switch self {
         case .tasks: return "Tasks"
         case .detail: return "Detail"
+        case .wiki: return "Wiki"
         case .guide: return "Guide"
         case .questions: return "Questions"
         }
@@ -61,6 +62,7 @@ struct ProjectTabColumn: View {
         switch tab {
         case .tasks: EmptyView()
         case .detail: ProjectOverview(project: project)
+        case .wiki: WikiListView(project: project)
         case .guide: GuideContextView(project: project)
         case .questions: QuestionListView()
         }
@@ -81,6 +83,7 @@ struct ProjectTabDetail: View {
             GuideEditor(project: project, showsBuiltIn: false).id(project.id)
                 .padding(Theme.Spacing.lg)
                 .qbParchment()
+        case .wiki: WikiDetailView()
         case .questions: QuestionDetailView()
         }
     }
@@ -109,10 +112,30 @@ struct ProjectOverview: View {
                     stat("Waiting on you", c.waitingOnUser)
                     stat("Done", c.done)
                 }
+                section("Milestones") {
+                    MilestonesSection(project: project)
+                }
+                section("Wiki") {
+                    let pages = model.wikiCounts(projectId: project.id)
+                    stat("Decisions", pages[.decision] ?? 0)
+                    stat("Notes", pages[.note] ?? 0)
+                    link("Open Wiki", .wiki)
+                }
                 section("Questions") {
                     let n = model.openQuestions.filter { $0.projectCode == project.code }.count
                     stat("Waiting for your answer", n)
                     if n > 0 { link("Answer…", .questions) }
+                }
+                section("Agent sessions") {
+                    ProjectSessionsList(project: project)
+                }
+                section("Repo folder") {
+                    Text(project.repoPath ?? "None").font(Theme.Fonts.caption)
+                        .foregroundStyle(project.repoPath == nil ? Theme.Colors.steel : Theme.Colors.slate)
+                        .textSelection(.enabled)
+                }
+                section("Gate") {
+                    GateRulesSection(project: project)
                 }
                 section("Agent guide") {
                     Text(guideLabel).font(Theme.Fonts.caption).foregroundStyle(Theme.Colors.slate)
@@ -121,7 +144,7 @@ struct ProjectOverview: View {
                 Text("Created \(fmtDateTime(project.createdAt))")
                     .font(Theme.Fonts.micro).foregroundStyle(Theme.Colors.steel)
                 HStack(spacing: 8) {
-                    Button("Edit name & code…") { editing = true }
+                    Button("Edit project…") { editing = true }
                         .buttonStyle(QBSecondaryButtonStyle(compact: true))
                     if project.isArchived {
                         Button("Unarchive") { model.setArchived(project.id, false) }
@@ -139,8 +162,8 @@ struct ProjectOverview: View {
         .qbParchment()
         .sheet(isPresented: $editing) {
             ProjectSheet(title: "Edit Project", projectId: project.id, name: project.name, code: project.code,
-                         showsDescription: false) { v in
-                model.editProject(project.id, name: v.name, detail: nil, code: v.code)
+                         repoPath: project.repoPath ?? "", showsDescription: false) { v in
+                model.editProject(project.id, name: v.name, detail: nil, code: v.code, repoPath: v.repoPath)
             }
         }
         .sheet(isPresented: $archiving) {

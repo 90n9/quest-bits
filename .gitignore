@@ -33,3 +33,6 @@ asset-candidates.html
 
 # Detail editor dependencies (npm ci in Scripts/build-app.sh)
 Editor/node_modules/
+
+# Local planning docs (QUE-41; kept out of the public repo)
+Docs/plans/

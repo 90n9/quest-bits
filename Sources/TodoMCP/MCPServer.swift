@@ -17,6 +17,13 @@ final class MCPServer: @unchecked Sendable {
     private let waitLock = NSLock()
     private var activeWaits: [String: UUID] = [:]
     private var cancelledWaits = Set<UUID>()
+    // The Claude Code process that spawned this server (its parent), found once at start:
+    // how a call learns its Claude Code session (`agentSessionId`). And when each session
+    // was last refreshed from here, so a burst of calls writes the heartbeat once.
+    private let host = ClaudeProcess.host()
+    private let touchLock = NSLock()
+    private var lastTouch: [String: (at: Date, kind: SessionEvent.Kind)] = [:]
+    static let touchEverySeconds: TimeInterval = 30
 
     init() {
         do {
@@ -30,6 +37,7 @@ final class MCPServer: @unchecked Sendable {
             FileHandle.standardError.write("todo-mcp: failed to open store: \(error)\n".data(using: .utf8)!)
             exit(1)
         }
+        store.origin = ChangeOrigin(.mcp)
     }
 
     func run() {
@@ -108,6 +116,10 @@ final class MCPServer: @unchecked Sendable {
     private func handleToolCall(id: Any?, params: [String: Any]) {
         let name = params["name"] as? String ?? ""
         let args = params["arguments"] as? [String: Any] ?? [:]
+        // What this call writes is recorded as the agent's, with its session (the activity
+        // feed). Calls run one at a time here; the wait thread writes no history.
+        let sid = touchSession(args, .mcp)
+        store.origin = ChangeOrigin(.mcp, agentSessionId: sid, sessionLabel: (try? sessionArg(args)) ?? nil)
         do {
             let text = try invoke(tool: name, args: args)
             respondText(id: id, text)
@@ -174,11 +186,12 @@ final class MCPServer: @unchecked Sendable {
             return
         }
         let token = (params["_meta"] as? [String: Any])?["progressToken"]
+        let agentSession = touchSession(args, .wait)
         let key = Self.requestKey(id), waitId = UUID()
         waitLock.lock(); activeWaits[key] = waitId; waitLock.unlock()
         Thread.detachNewThread { [self] in
             waitForAnswers(id: id, key: key, waitId: waitId, token: token, projectId: filter.projectId,
-                           sessionId: filter.sessionId, minutes: minutes)
+                           sessionId: filter.sessionId, agentSession: agentSession, minutes: minutes)
         }
     }
 
@@ -188,14 +201,17 @@ final class MCPServer: @unchecked Sendable {
     /// call after 30 silent minutes). A power assertion keeps the Mac from idle sleep
     /// meanwhile: asleep, nothing is answered, and on wake the client counts the sleep
     /// as silence. A closed lid still sleeps. A cancelled wait sends no response.
+    /// Meanwhile the Claude Code session (`agentSession`, when known) is marked waiting and
+    /// its heartbeat refreshed each minute, so the app can say it still waits.
     private func waitForAnswers(id: Any?, key: String, waitId: UUID, token: Any?, projectId: Int64?,
-                                sessionId: String?, minutes: Int) {
+                                sessionId: String?, agentSession: String?, minutes: Int) {
         var assertion: IOPMAssertionID = 0
         let asserted = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
             "QuestBits is waiting for your answers" as CFString, &assertion) == kIOReturnSuccess
         defer {
             if asserted { IOPMAssertionRelease(assertion) }
+            if let agentSession { recordSessionEvent(agentSession, .waitDone, force: true) }
             waitLock.lock()
             if activeWaits[key] == waitId { activeWaits[key] = nil }
             cancelledWaits.remove(waitId)
@@ -204,6 +220,7 @@ final class MCPServer: @unchecked Sendable {
         let start = Date()
         let deadline = start.addingTimeInterval(TimeInterval(minutes * 60))
         var lastProgress = start
+        var lastBeat = start
         var progress = 0
         while true {
             waitLock.lock(); let cancelled = cancelledWaits.contains(waitId); waitLock.unlock()
@@ -215,6 +232,10 @@ final class MCPServer: @unchecked Sendable {
                     respondText(id: id, try answersJSON(projectId: projectId, sessionId: sessionId,
                                                         waitedSeconds: Int(Date().timeIntervalSince(start))))
                     return
+                }
+                if let agentSession, Date().timeIntervalSince(lastBeat) >= Self.waitProgressSeconds {
+                    lastBeat = Date()
+                    recordSessionEvent(agentSession, .wait, force: true)
                 }
                 if let token, Date().timeIntervalSince(lastProgress) >= Self.waitProgressSeconds {
                     progress += 1
@@ -242,6 +263,100 @@ final class MCPServer: @unchecked Sendable {
         var d: [String: Any] = ["answered": answered.map(questionDict), "open": open]
         if let waitedSeconds { d["waited_minutes"] = waitedSeconds / 60 }
         return try jsonString(d)
+    }
+
+    // MARK: - Claude Code session
+
+    /// The Claude Code session this call comes from (AgentSession.id), or nil: the session
+    /// id inside the `session` label when a hook recorded that session, else the session
+    /// the hooks last saw open in the Claude Code process that spawned this server. Claude
+    /// Code gives MCP servers no session id, so without the hooks this is nil.
+    private func agentSessionId(_ args: [String: Any]) -> String? {
+        if let label = try? sessionArg(args), let sid = AgentSession.sessionId(in: label),
+           (try? store.agentSession(id: sid)) != nil {
+            return sid
+        }
+        guard let host else { return nil }
+        return (try? store.currentAgentSession(process: host))?.id
+    }
+
+    /// Refresh the heartbeat of the call's session (`kind` mcp or wait); returns its id.
+    /// Never fails the call: a session that cannot be written is simply not refreshed.
+    @discardableResult
+    private func touchSession(_ args: [String: Any], _ kind: SessionEvent.Kind) -> String? {
+        guard let sid = agentSessionId(args) else { return nil }
+        recordSessionEvent(sid, kind, force: kind != .mcp)
+        return sid
+    }
+
+    /// Write `kind` on session `sid`, at most every `touchEverySeconds` for the same kind
+    /// unless `force`. An MCP call is always written while the session needs the user at
+    /// its terminal (SessionAttention): the call shows it went on, which clears that.
+    private func recordSessionEvent(_ sid: String, _ kind: SessionEvent.Kind, force: Bool) {
+        let now = Date()
+        touchLock.lock()
+        let last = lastTouch[sid]
+        var due = force || last == nil || last!.kind != kind || now.timeIntervalSince(last!.at) >= Self.touchEverySeconds
+        touchLock.unlock()
+        if !due, kind.clearsAttention, (try? store.agentSession(id: sid))?.attention != nil { due = true }
+        guard due else { return }
+        touchLock.lock()
+        lastTouch[sid] = (now, kind)
+        touchLock.unlock()
+        _ = try? store.recordSession(SessionEvent(kind, sessionId: sid, at: now))
+    }
+
+    // MARK: - Claims
+
+    /// Who this call claims as (`ClaimHolder`): its Claude Code session when known
+    /// (`agentSessionId`), else its `session` label; nil when neither is known.
+    private func claimHolder(_ args: [String: Any]) throws -> ClaimHolder? {
+        let label = try sessionArg(args)
+        if let sid = agentSessionId(args) { return ClaimHolder(id: sid, label: label) }
+        return label.map { ClaimHolder(id: $0) }
+    }
+
+    private func requireClaimHolder(_ args: [String: Any]) throws -> ClaimHolder {
+        guard let holder = try claimHolder(args) else {
+            throw MCPError.invalidArg("QuestBits cannot tell which session you are: pass `session` (a label for your "
+                + "session, the same on every call; your session id when your start context gives one), "
+                + "or install the Claude Code hooks from QuestBits Settings")
+        }
+        return holder
+    }
+
+    /// The implicit heartbeat: a write to a task this call's session holds a claim on renews
+    /// that claim (the store checks the holder, so another session's claim is never touched).
+    /// Never fails the call.
+    private func renewOwnClaim(_ args: [String: Any], taskId: Int64) {
+        guard let holder = try? claimHolder(args) else { return }
+        _ = try? store.renewClaims(holder: holder, taskId: taskId)
+    }
+
+    /// next_task / claim_task output: the task (get_task's shape), whether it is now claimed
+    /// and how (outcome), its claim, and on a takeover the claim it replaced and the latest
+    /// notes, so the new session reads where the work stands before carrying on.
+    private func claimResultDict(_ r: ClaimResult, claimed: Bool) throws -> [String: Any] {
+        var d: [String: Any] = ["task": try readTaskDicts([r.task])[0], "claimed": claimed]
+        if claimed { d["outcome"] = r.outcome.rawValue }
+        if let prev = r.previous {
+            d[claimed ? "took_over_from" : "would_take_over_from"] = claimDict(prev)
+            let notes = try store.notes(taskId: r.task.id, limit: 5)
+            if !notes.isEmpty { d["latest_notes"] = notes.map(noteDict) }
+            d["hint"] = "This task was claimed by \(prev.holderName), whose claim expired. Read latest_notes "
+                + "(and get_task) before carrying on."
+        }
+        return d
+    }
+
+    /// A task's claim: who (`by` for display, `holder` the session id or label), since
+    /// when, the last heartbeat, when it expires, and `expired` once it has.
+    private func claimDict(_ c: TaskClaim) -> [String: Any] {
+        var d: [String: Any] = ["by": c.holderName, "holder": c.holder, "claimed_at": iso(c.claimedAt),
+                                "heartbeat_at": iso(c.heartbeatAt), "expires_at": iso(c.expiresAt)]
+        if let label = c.label { d["label"] = label }
+        if !c.isLive() { d["expired"] = true }
+        return d
     }
 
     /// `project_id`/`project_code` and `session` for the question tools; all optional.
@@ -276,7 +391,7 @@ final class MCPServer: @unchecked Sendable {
                 code = s
             }
             let p = try store.createProject(name: name, detail: desc, code: code,
-                                            guideTemplate: template,
+                                            repoPath: try repoPathArg(args) ?? nil, guideTemplate: template,
                                             author: .agent, sessionId: try sessionArg(args))
             var d = projectDict(p)
             if let template { d["guide_template"] = template.rawValue }
@@ -288,14 +403,44 @@ final class MCPServer: @unchecked Sendable {
 
         case "update_project":
             let pid = try resolveProjectId(args, idKey: "id", codeKey: "code")
-            // The code first: a refused code leaves the name and description unchanged too.
-            var newCode: String?
+            // Every field is checked before any is written, in one transaction: a refusal
+            // (a code or folder already taken) leaves the whole project unchanged.
+            let repoPath = try repoPathArg(args)
+            var code: String?
             if let raw = args["new_code"], !(raw is NSNull) {
                 guard let s = raw as? String else { throw MCPError.invalidArg("new_code must be a string") }
-                newCode = try store.setProjectCode(id: pid, code: s)
+                code = s
             }
-            try store.updateProject(id: pid, name: args["name"] as? String, detail: args["description"] as? String)
-            return newCode.map { "updated; the project's code is now \($0) (its tasks keep their codes)" } ?? "updated"
+            let name = try optionalStringArg(args, "name") ?? nil
+            let detail = try optionalStringArg(args, "description") ?? nil
+            let edited = try store.editProject(id: pid, name: name, detail: detail, code: code, repoPath: repoPath)
+            let newCode = edited.code
+            let stored = edited.repoPath
+            var parts: [String] = []
+            if let newCode { parts.append("the project's code is now \(newCode) (its tasks keep their codes)") }
+            if let stored { parts.append(stored.map { "its repo folder is \($0)" } ?? "it has no repo folder") }
+            return parts.isEmpty ? "updated" : "updated; " + parts.joined(separator: "; ")
+
+        case "find_project":
+            let path = try requireString(args, "path")
+            let resolved = Store.resolvedPath(path)
+            guard let p = try store.findProject(path: path) else {
+                return try jsonString(["path": resolved, "project": NSNull()] as [String: Any])
+            }
+            let c = try store.openTaskCounts(projectId: p.id)
+            var d = projectDict(p)
+            d["open"] = c.open
+            d["in_progress"] = c.inProgress
+            d["waiting_on_user"] = c.waitingOnUser
+            // What an agent starting here should read: the project's guide (not a wiki
+            // page), and how many wiki pages it can search.
+            if let g = try store.guide(projectId: p.id), !g.markdown.isEmpty {
+                d["guide"] = g.markdown
+                d["guide_version"] = g.id
+            }
+            let pages = try store.pageCounts(projectId: p.id)
+            d["wiki"] = PageKind.allCases.reduce(into: [String: Any]()) { $0[$1.plural.lowercased()] = pages[$1] ?? 0 }
+            return try jsonString(["path": resolved, "project": d] as [String: Any])
 
         case "archive_project", "unarchive_project":
             let archive = tool == "archive_project"
@@ -333,6 +478,13 @@ final class MCPServer: @unchecked Sendable {
                 }
                 filter.tag = tag
             }
+            if given(args, "sort") {
+                guard let s = args["sort"] as? String, let sort = TaskSort(rawValue: s) else {
+                    throw MCPError.invalidArg("sort must be \"status\" or \"board\"")
+                }
+                filter.sort = sort
+            }
+            filter.milestone = try milestoneFilterArg(args, projectId: filter.projectId)
             return try jsonString(readTaskDicts(store.listTasks(matching: filter), compact: compact))
 
         case "get_task":
@@ -352,6 +504,8 @@ final class MCPServer: @unchecked Sendable {
             // Questions still in play: open (waiting on the user) or answered (to resume).
             let questions = try store.questions(statuses: [.open, .answered], taskId: task.id)
             if !questions.isEmpty { d["questions"] = questions.map(questionDict) }
+            let relations = try store.relatedTasks(taskId: task.id)
+            if !relations.isEmpty { d["relations"] = relationsDict(relations) }
             return try jsonString(d)
 
         case "inbox":
@@ -377,6 +531,7 @@ final class MCPServer: @unchecked Sendable {
             // Always the agent: only the user, in the app, writes (and edits) as the user.
             let added = try store.addNote(taskId: try resolveTaskId(args), text: text, kind: try parseNoteKind(args["kind"]),
                                           author: .agent, sessionId: try sessionArg(args))
+            renewOwnClaim(args, taskId: added.note.taskId)
             var d: [String: Any] = ["note_id": added.note.id, "task": taskHandle(code: added.taskCode, id: added.note.taskId),
                                     "ts": iso(added.note.timestamp)]
             if added.note.kind != .note { d["kind"] = added.note.kind.rawValue }
@@ -385,7 +540,8 @@ final class MCPServer: @unchecked Sendable {
         case "create_task":
             // Optional parent (subtask). If given and no project is specified,
             // the subtask inherits the parent's project.
-            let parentId: Int64? = (args["parent_id"] != nil || args["parent_code"] != nil)
+            // An explicit null parent or project is "not given", as in the other tools.
+            let parentId: Int64? = given(args, "parent_id", "parent_code")
                 ? try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code")
                 : nil
             // Enforce the one-level nesting invariant: a subtask cannot itself be a
@@ -400,7 +556,7 @@ final class MCPServer: @unchecked Sendable {
                 throw MCPError.invalidArg("a subtask cannot recur; recurrence is only valid on top-level tasks")
             }
             let projectId: Int64
-            if args["project_id"] != nil || args["project_code"] != nil {
+            if given(args, "project_id", "project_code") {
                 projectId = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
             } else if let parentId {
                 projectId = try store.getTask(id: parentId).projectId
@@ -420,34 +576,21 @@ final class MCPServer: @unchecked Sendable {
                 tags: parseTags(args["tags"]) ?? [],
                 recurrence: args["recurrence"] as? String,
                 parentId: parentId,
-                estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60
+                estimateSeconds: (parseMinutes(args["estimate_minutes"]) ?? 0) * 60,
+                branch: try optionalStringArg(args, "branch") ?? nil,
+                milestoneId: try milestoneArg(args, projectId: { projectId }) ?? nil,
+                author: .agent
             )
             return try jsonString(taskDict(task))
 
         case "update_task":
             let id = try resolveTaskId(args)
-            // link uses double-optional: key absent (.none) = leave alone;
-            // key present (.some) = set to the string, or clear if JSON null.
-            let linkArg: String??
-            if args.keys.contains("link") {
-                linkArg = .some(args["link"] as? String)
-            } else {
-                linkArg = .none
-            }
-            // due_date same double-optional semantics: present+null clears it.
-            let dueArg: Date??
-            if args.keys.contains("due_date") {
-                dueArg = .some(parseDate(args["due_date"]))
-            } else {
-                dueArg = .none
-            }
-            // recurrence double-optional: present+null clears it, absent leaves alone.
-            let recurArg: String??
-            if args.keys.contains("recurrence") {
-                recurArg = .some(args["recurrence"] as? String)
-            } else {
-                recurArg = .none
-            }
+            // link, due_date and recurrence are double-optional: key absent (.none) = leave
+            // alone; null (or "") = clear; a value of the wrong type, or a date that does
+            // not parse, is an error (never read as a clear: that would drop the value).
+            let linkArg = try optionalStringArg(args, "link")
+            let dueArg = try dueDateArg(args)
+            let recurArg = try optionalStringArg(args, "recurrence")
             // A subtask must not recur — reject a non-nil recurrence on a task that is a
             // subtask after this update (a parent_code null in it makes it top-level).
             let parent = try parentArg(args)
@@ -457,6 +600,7 @@ final class MCPServer: @unchecked Sendable {
             }
             let status = try statusArg(args)
             let note = try updateNoteArg(args, status: status)
+            let milestone = try milestoneArg(args, projectId: { try self.store.getTask(id: id).projectId })
             try store.updateTask(
                 id: id,
                 title: args["title"] as? String,
@@ -471,8 +615,13 @@ final class MCPServer: @unchecked Sendable {
                 waitingOn: try parseWaitingOn(args["waiting_on"]),
                 waitingReason: try waitingReasonArg(args),
                 parentId: parent,
-                note: note
+                branch: try optionalStringArg(args, "branch"),
+                milestoneId: milestone,
+                author: .agent,
+                note: note,
+                actor: .agent(try claimHolder(args))
             )
+            renewOwnClaim(args, taskId: id)
             return try jsonString(taskDict(store.getTask(id: id)))
 
         case "delete_task":
@@ -494,16 +643,38 @@ final class MCPServer: @unchecked Sendable {
             try store.moveTask(id: tid, toProjectId: toPid)
             return try jsonString(taskDict(store.getTask(id: tid)))
 
+        case "reorder_tasks":
+            // Validated before the write: an unknown code here, and inside the store's one
+            // transaction a missing id, a repeat, or tasks that are not siblings; any of
+            // them leaves the order as it was.
+            let ids = try orderedTaskIds(args)
+            var place = TaskPlacement.top
+            if given(args, "place") {
+                guard let s = args["place"] as? String, let p = TaskPlacement(rawValue: s) else {
+                    throw MCPError.invalidArg("place must be \"top\" or \"bottom\"")
+                }
+                place = p
+            }
+            let siblings = try store.reorderTasks(ids: ids, place: place)
+            guard let first = siblings.first else { throw StoreError.invalid("nothing to reorder") }
+            var out: [String: Any] = ["project": store.projectCode(id: first.projectId) ?? "",
+                                      "tasks": try readTaskDicts(siblings, compact: true)]
+            if let pid = first.parentId, let parent = try? store.getTask(id: pid) { out["parent"] = parent.code }
+            return try jsonString(out)
+
         case "bulk_update_tasks":
             let ids = try resolveTaskIds(args)
             let dueArg: Date??
             if args.keys.contains("due_date") { dueArg = .some(parseDate(args["due_date"])) } else { dueArg = .none }
+            // A milestone name is looked up in the first task's project; the store then
+            // refuses any task of another project.
+            let milestone = try milestoneArg(args, projectId: { try self.store.getTask(id: ids[0]).projectId })
             // One transaction for the whole batch: any bad task leaves every task unchanged.
             try store.bulkUpdateTasks(
                 ids: ids, status: try statusArg(args), priority: parsePriority(args["priority"]),
                 dueDate: dueArg, addTags: parseTags(args["add_tags"]),
                 waitingOn: try parseWaitingOn(args["waiting_on"]), waitingReason: try waitingReasonArg(args),
-                parentId: try parentArg(args))
+                parentId: try parentArg(args), milestoneId: milestone, actor: .agent(try claimHolder(args)))
             return "updated \(ids.count) tasks"
 
         case "bulk_move_tasks":
@@ -524,7 +695,11 @@ final class MCPServer: @unchecked Sendable {
         case "get_task_history":
             let id = try resolveTaskId(args)
             let events = try store.taskHistory(taskId: id).map { e -> [String: Any] in
-                ["timestamp": iso(e.timestamp), "field": e.field, "old": e.oldValue, "new": e.newValue]
+                var d: [String: Any] = ["timestamp": iso(e.timestamp), "field": e.field, "old": e.oldValue, "new": e.newValue]
+                if let source = e.source { d["source"] = source.rawValue }
+                if let sid = e.agentSessionId { d["claude_session"] = sid }
+                if let label = e.sessionLabel { d["session"] = label }
+                return d
             }
             return try jsonString(events)
 
@@ -539,6 +714,289 @@ final class MCPServer: @unchecked Sendable {
             let dep = try resolveTaskId(args, idKey: "depends_on_id", codeKey: "depends_on_code")
             try store.removeDependency(taskId: tid, dependsOnId: dep)
             return try jsonString(taskDict(store.getTask(id: tid)))
+
+        case "add_relation":
+            let kind = try relationKindArg(args)
+            let tid = try resolveTaskId(args)
+            let other = try resolveTaskId(args, idKey: "other_id", codeKey: "other_code")
+            let drop = try boolArg(args, "drop") ?? false
+            if drop && kind != .duplicates && kind != .duplicatedBy {
+                throw MCPError.invalidArg("drop is only for kind duplicates or duplicated_by")
+            }
+            let created = try store.addRelation(taskId: tid, otherId: other, kind: kind)
+            var dropped: Any?
+            if drop {
+                // The duplicate is dropped (closed, kept with its history) unless already closed.
+                let (dupId, originalId) = kind == .duplicates ? (tid, other) : (other, tid)
+                let dup = try store.getTask(id: dupId)
+                if !dup.status.isClosed {
+                    let original = try store.getTask(id: originalId)
+                    try store.updateTask(id: dupId, status: .dropped, author: .agent,
+                                         note: NoteDraft(text: "Dropped as a duplicate of \(original.code).",
+                                                         kind: .summary, author: .agent, sessionId: try sessionArg(args)),
+                                         actor: .agent(try claimHolder(args)))
+                    dropped = taskHandle(code: dup.code, id: dup.id)
+                }
+            }
+            var out = try relationResult(tid, other, kind)
+            out["created"] = created
+            if let dropped { out["dropped"] = dropped }
+            return try jsonString(out)
+
+        case "remove_relation":
+            let kind = try relationKindArg(args)
+            let tid = try resolveTaskId(args)
+            let other = try resolveTaskId(args, idKey: "other_id", codeKey: "other_code")
+            let removed = try store.removeRelation(taskId: tid, otherId: other, kind: kind)
+            var out = try relationResult(tid, other, kind)
+            out["removed"] = removed
+            return try jsonString(out)
+
+        case "next_task":
+            // Scope: one project (id, code, or the folder find_project maps), else every
+            // active project. With claim, the pick and the claim are one transaction.
+            var pid: Int64?
+            if given(args, "path") {
+                guard !given(args, "project_id", "project_code") else {
+                    throw MCPError.invalidArg("give path or project_id/project_code, not both")
+                }
+                let path = try requireString(args, "path")
+                guard let p = try store.findProject(path: path) else {
+                    throw StoreError.notFound("no project for the folder \(Store.resolvedPath(path))")
+                }
+                pid = p.id
+            } else if given(args, "project_id", "project_code") {
+                pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            }
+            let claim = try boolArg(args, "claim") ?? false
+            let holder = claim ? try requireClaimHolder(args) : try claimHolder(args)
+            let next = try store.nextTask(projectId: pid, holder: holder, claim: claim)
+            var out: [String: Any] = [:]
+            if let pid { out["project"] = store.projectCode(id: pid) ?? "" }
+            if let r = next.result {
+                out.merge(try claimResultDict(r, claimed: claim), uniquingKeysWith: { $1 })
+            } else {
+                out["task"] = NSNull()
+                let s = next.skips
+                out["skipped"] = ["claimed_by_others": s.claimed, "blocked": s.blocked, "waiting": s.waiting,
+                                  "in_progress": s.inProgress]
+            }
+            if let holder {
+                let mine = try store.claimedTasks(holder: holder)
+                    .filter { $0.id != next.result?.task.id }.map { taskHandle(code: $0.code, id: $0.id) }
+                if !mine.isEmpty { out["your_other_claims"] = mine }
+            }
+            return try jsonString(out)
+
+        case "claim_task":
+            let result = try store.claimTask(id: try resolveTaskId(args), holder: try requireClaimHolder(args))
+            return try jsonString(claimResultDict(result, claimed: true))
+
+        case "release_task":
+            let holder = try requireClaimHolder(args)
+            let keep = try boolArg(args, "keep_status") ?? false
+            let released = try store.releaseClaim(taskId: try resolveTaskId(args), actor: .agent(holder), reopen: !keep)
+            var d: [String: Any] = ["task": taskHandle(code: released.task.code, id: released.task.id),
+                                    "released": released.released != nil, "status": released.task.status.rawValue]
+            if released.released == nil { d["note"] = "the task had no claim" }
+            return try jsonString(d)
+
+        case "heartbeat":
+            let holder = try requireClaimHolder(args)
+            let tid: Int64? = given(args, "id", "code") ? try resolveTaskId(args) : nil
+            let renewed = try store.renewClaims(holder: holder, taskId: tid)
+            if let tid, renewed.isEmpty {
+                // Say why: the task is not (or no longer) this session's.
+                let t = try store.getTask(id: tid)
+                if let c = t.claim {
+                    throw StoreError.invalid("\(t.code) is not your claim: \(c.holderName) holds it"
+                        + (c.isLive() ? ". Work on another task (next_task)."
+                                      : " (expired). claim_task takes it over; read its latest notes first."))
+                }
+                throw StoreError.invalid("\(t.code) has no claim\(t.status.isClosed ? " (it is \(t.status.rawValue))" : ""); claim it with claim_task")
+            }
+            var d: [String: Any] = ["renewed": renewed.map { taskHandle(code: $0.code, id: $0.id) },
+                                    "ttl_minutes": Int(Store.claimTTL / 60)]
+            if let c = renewed.first?.claim { d["expires_at"] = iso(c.expiresAt) }
+            return try jsonString(d)
+
+        case "add_link":
+            // Always the agent, as for notes; the app adds links as the user.
+            guard let url = args["url"] as? String else { throw MCPError.missingArg("url") }
+            let tid = try resolveTaskId(args)
+            var kind: LinkKind?
+            if given(args, "kind") {
+                guard let s = args["kind"] as? String, let k = LinkKind(rawValue: s) else {
+                    throw MCPError.invalidArg("kind must be one of \(LinkKind.allCases.map(\.rawValue).joined(separator: ", "))")
+                }
+                kind = k
+            }
+            let added = try store.addLink(taskId: tid, url: url, kind: kind,
+                                          title: try optionalStringArg(args, "title") ?? nil, author: .agent,
+                                          source: try optionalStringArg(args, "source") ?? nil)
+            renewOwnClaim(args, taskId: tid)
+            return try jsonString(["task": try store.getTask(id: tid).code, "link": linkDict(added.link),
+                                   "created": added.created] as [String: Any])
+
+        case "remove_link":
+            let removed: TaskLink
+            if given(args, "link_id") {
+                guard !given(args, "url") else { throw MCPError.invalidArg("give url (with the task) or link_id, not both") }
+                // A task given as well must be the link's own (checked before anything is removed).
+                removed = try store.removeLink(id: try requireInt(args, "link_id"),
+                                               taskId: given(args, "id", "code") ? try resolveTaskId(args) : nil)
+            } else {
+                guard let url = args["url"] as? String else { throw MCPError.missingArg("url or link_id") }
+                removed = try store.removeLink(taskId: try resolveTaskId(args), url: url)
+            }
+            return try jsonString(["task": try store.getTask(id: removed.taskId).code, "removed": linkDict(removed)] as [String: Any])
+
+        case "list_gate_rules":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            return try jsonString(gateRulesDict(pid, rules: try store.gateRules(projectId: pid)))
+
+        case "add_gate_rule":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let (rules, added) = try store.addGateRule(projectId: pid, rule: try requireString(args, "rule"))
+            var d = gateRulesDict(pid, rules: rules)
+            d["added"] = added
+            return try jsonString(d)
+
+        case "list_milestones":
+            let includeClosed = try boolArg(args, "include_closed") ?? false
+            let pid: Int64? = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            let list = try store.milestones(projectId: pid, includeClosed: includeClosed, includeArchived: pid != nil)
+            return try jsonString(list.map(milestoneDict))
+
+        case "create_milestone":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let m = try store.createMilestone(
+                projectId: pid, name: try requireString(args, "name"),
+                detail: (try optionalStringArg(args, "description") ?? nil) ?? "",
+                acceptance: (try optionalStringArg(args, "acceptance") ?? nil) ?? "",
+                targetDate: try targetDateArg(args) ?? nil)
+            return try jsonString(milestoneDict(m))
+
+        case "update_milestone":
+            let mid = try resolveMilestoneId(args)
+            var newName: String?
+            if given(args, "new_name") {
+                guard let s = args["new_name"] as? String else { throw MCPError.invalidArg("new_name must be a string") }
+                newName = s
+            }
+            let m = try store.updateMilestone(
+                id: mid, name: newName,
+                detail: try optionalStringArg(args, "description").map { $0 ?? "" },
+                acceptance: try optionalStringArg(args, "acceptance").map { $0 ?? "" },
+                targetDate: try targetDateArg(args), closed: try boolArg(args, "closed"),
+                force: try boolArg(args, "force") ?? false)
+            return try jsonString(milestoneDict(m))
+
+        case "delete_milestone":
+            let m = try store.milestone(id: try resolveMilestoneId(args))
+            let unassigned = try store.deleteMilestone(id: m.id)
+            return try jsonString(["deleted": m.name, "project": store.projectCode(id: m.projectId) ?? "",
+                                   "unassigned": unassigned] as [String: Any])
+
+        case "list_pages":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let kind = try pageKindArg(args)
+            var d: [String: Any] = ["project": try scopeName(pid),
+                                    "pages": try store.pages(projectId: pid, kind: kind).map { pageDict($0, full: false) }]
+            if kind != .note, try boolArg(args, "include_notes") ?? true {
+                d["decision_notes"] = try store.decisionNotes(projectId: pid, limit: 50).map { hit in
+                    ["note_id": hit.note.id, "task": taskHandle(code: hit.taskCode, id: hit.note.taskId),
+                     "ts": iso(hit.note.timestamp), "text": Self.firstLine(hit.note.text)] as [String: Any]
+                }
+            }
+            return try jsonString(d)
+
+        case "get_page":
+            return try jsonString(pageDict(store.page(id: try resolvePageId(args)), full: true))
+
+        case "create_page":
+            let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+            let prov = PageProvenance(
+                source: try optionalStringArg(args, "source") ?? nil, key: try optionalStringArg(args, "source_key") ?? nil,
+                author: try optionalStringArg(args, "source_author") ?? nil,
+                session: try optionalStringArg(args, "source_session") ?? nil,
+                timestamp: try sourceTimestampArg(args))
+            let made = try store.createPage(
+                projectId: pid, kind: try pageKindArg(args) ?? .note, title: try requireString(args, "title"),
+                body: (try optionalStringArg(args, "body") ?? nil) ?? "",
+                outcome: try optionalStringArg(args, "outcome") ?? nil,
+                decidedOn: try optionalStringArg(args, "decided_on") ?? nil,
+                taskIds: try pageTaskIdsArg(args, codesKey: "tasks", idsKey: "task_ids") ?? [],
+                author: .agent, sessionId: try sessionArg(args), provenance: prov)
+            var d = pageDict(made.page, full: true)
+            d["created"] = made.created
+            return try jsonString(d)
+
+        case "update_page":
+            let id = try resolvePageId(args)
+            var newTitle: String?
+            if given(args, "new_title") {
+                guard let s = args["new_title"] as? String else { throw MCPError.invalidArg("new_title must be a string") }
+                newTitle = s
+            }
+            var expected: Int?
+            if given(args, "expected_version") {
+                guard let n = try? requireInt(args, "expected_version") else {
+                    throw MCPError.invalidArg("expected_version must be an integer")
+                }
+                expected = Int(n)
+            }
+            let page = try store.updatePage(
+                id: id, title: newTitle,
+                body: try optionalStringArg(args, "body").map { $0 ?? "" },
+                append: try optionalStringArg(args, "append") ?? nil,
+                kind: try pageKindArg(args),
+                outcome: try optionalStringArg(args, "outcome"),
+                decidedOn: try optionalStringArg(args, "decided_on"),
+                taskIds: try pageTaskIdsArg(args, codesKey: "tasks", idsKey: "task_ids"),
+                addTaskIds: try pageTaskIdsArg(args, codesKey: "add_tasks", idsKey: "add_task_ids") ?? [],
+                author: .agent, sessionId: try sessionArg(args), expectedVersion: expected)
+            return try jsonString(pageDict(page, full: true))
+
+        case "delete_page":
+            let page = try store.deletePage(id: try resolvePageId(args))
+            return try jsonString(["deleted": page.title, "id": page.id,
+                                   "project": store.projectCode(id: page.projectId) ?? ""] as [String: Any])
+
+        case "search_pages":
+            guard let query = args["query"] as? String else { throw MCPError.missingArg("query") }
+            let pid = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            let result = try store.searchPages(query: query, projectId: pid, kind: try pageKindArg(args),
+                                               limit: try limitArg(args, "limit", default: 20, max: 100))
+            let pages: [[String: Any]] = result.pages.map { hit in
+                var d = pageDict(hit.page, full: false)
+                d["project"] = hit.projectCode
+                if let o = hit.page.outcome { d["outcome"] = o }
+                d["snippet"] = hit.snippet
+                return d
+            }
+            let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+            let notes: [[String: Any]] = result.decisionNotes.map { hit in
+                ["note_id": hit.note.id, "task": taskHandle(code: hit.taskCode, id: hit.note.taskId),
+                 "project": hit.projectCode, "ts": iso(hit.note.timestamp),
+                 "snippet": Store.snippet(hit.note.text, terms: terms)] as [String: Any]
+            }
+            return try jsonString(["engine": result.usedFTS ? "fts5" : "like", "pages": pages,
+                                   "decision_notes": notes] as [String: Any])
+
+        case "get_page_history":
+            let page = try store.page(id: try resolvePageId(args))
+            let limit = try limitArg(args, "limit", default: 10, max: 50)
+            let events: [[String: Any]] = try store.pageHistory(pageId: page.id, limit: limit).map { e in
+                var d: [String: Any] = ["ts": iso(e.timestamp), "field": e.field, "old": e.oldValue, "new": e.newValue]
+                if let a = e.author { d["author"] = a.rawValue }
+                if let s = e.sessionId { d["session"] = s }
+                return d
+            }
+            return try jsonString(["page": page.id, "title": page.title, "version": page.version,
+                                   "events": events] as [String: Any])
 
         case "list_templates":
             return try jsonString(store.listTemplates().map(templateDict))
@@ -574,6 +1032,28 @@ final class MCPServer: @unchecked Sendable {
                 return d
             })
 
+        case "decisions":
+            let pid = given(args, "project_id", "project_code")
+                ? try resolveProjectId(args, idKey: "project_id", codeKey: "project_code") : nil
+            var since: Date?
+            if given(args, "since") {
+                guard let d = parseDate(args["since"]) else {
+                    throw MCPError.invalidArg("since must be an ISO-8601 time or yyyy-MM-dd")
+                }
+                since = d
+            }
+            var author = DecisionAuthor.agent
+            if given(args, "author") {
+                guard let s = args["author"] as? String, let a = DecisionAuthor(rawValue: s) else {
+                    throw MCPError.invalidArg("author must be one of: agent, user, any")
+                }
+                author = a
+            }
+            let filter = DecisionFilter(projectId: pid, from: since, author: author,
+                                        disagreedOnly: try boolArg(args, "disagreed") ?? false,
+                                        includeArchived: true, limit: try limitArg(args, "limit", default: 50, max: 200))
+            return try jsonString(store.decisions(filter).map(decisionDict))
+
         case "get_note_history":
             let noteId = try requireInt(args, "note_id")
             let note = try store.note(id: noteId)
@@ -588,9 +1068,11 @@ final class MCPServer: @unchecked Sendable {
             let q = try store.askQuestion(
                 taskId: try resolveTaskId(args), kind: kind, prompt: prompt,
                 context: args["context"] as? String ?? "", options: options,
-                blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args))
+                blocksTask: try boolArg(args, "blocks_task") ?? true, sessionId: try sessionArg(args),
+                agentSessionId: agentSessionId(args), actor: .agent(try claimHolder(args)))
+            renewOwnClaim(args, taskId: q.taskId)
             var d = questionDict(q)
-            if q.blocksTask { d["task_status"] = TaskStatus.waiting.rawValue }
+            if q.blocksTask { d["task_status"] = (try? store.getTask(id: q.taskId).status.rawValue) ?? TaskStatus.waiting.rawValue }
             return try jsonString(d)
 
         case "get_answers":
@@ -598,14 +1080,16 @@ final class MCPServer: @unchecked Sendable {
             return try answersJSON(projectId: filter.projectId, sessionId: filter.sessionId)
 
         case "resume_question":
-            let resumed = try store.resumeQuestion(id: try requireInt(args, "id"), sessionId: try sessionArg(args))
+            let resumed = try store.resumeQuestion(id: try requireInt(args, "id"), sessionId: try sessionArg(args),
+                                                   actor: .agent(try claimHolder(args)))
+            renewOwnClaim(args, taskId: resumed.task.id)
             var d = questionDict(resumed.question)
             d["task_status"] = resumed.task.status.rawValue
             return try jsonString(d)
 
         case "cancel_question":
             let q = try store.cancelQuestion(id: try requireInt(args, "id"), reason: args["reason"] as? String ?? "",
-                                             sessionId: try sessionArg(args))
+                                             sessionId: try sessionArg(args), actor: .agent(try claimHolder(args)))
             return try jsonString(questionDict(q))
 
         case "get_guide":
@@ -628,8 +1112,8 @@ final class MCPServer: @unchecked Sendable {
             let stats = try store.dailyStats()
             return try jsonString([
                 "date": stats.date,
-                "completed_pomodoros": stats.completedPomodoros,
-                "total_focus_minutes": stats.totalFocusSeconds / 60
+                "tasks_completed": stats.tasksCompleted,
+                "subtasks_completed": stats.subtasksCompleted
             ] as [String: Any])
 
         default:
@@ -639,10 +1123,18 @@ final class MCPServer: @unchecked Sendable {
 
     // MARK: - Serialization helpers
 
+    /// list_gate_rules / add_gate_rule: the defaults (always on) and the project's own rules.
+    private func gateRulesDict(_ pid: Int64, rules: [String]) -> [String: Any] {
+        ["project": store.projectCode(id: pid) ?? "\(pid)",
+         "defaults": GateRule.defaults.map(\.text),
+         "rules": rules]
+    }
+
     private func projectDict(_ p: Project) -> [String: Any] {
         var d: [String: Any] = ["id": p.id, "code": p.code, "name": p.name, "description": p.detail,
                                 "created_at": iso(p.createdAt)]
         if let a = p.archivedAt { d["archived_at"] = iso(a) }
+        if let r = p.repoPath { d["repo_path"] = r }
         // Images in the description, as for a task's detail.
         let files = attachmentFiles(in: p.detail)
         if !files.isEmpty { d["attachments"] = files }
@@ -657,7 +1149,8 @@ final class MCPServer: @unchecked Sendable {
     /// read degrades the output (numeric `parent_id`, no deps) instead of failing the call.
     private func taskDicts(_ tasks: [TodoTask]) -> [[String: Any]] {
         let rel = (try? store.taskRelations(for: tasks)) ?? TaskRelations()
-        return tasks.map { taskDict($0, rel) }
+        let links = (try? store.links(taskIds: tasks.map(\.id))) ?? [:]
+        return tasks.map { taskDict($0, rel, links: links[$0.id]) }
     }
 
     /// The serializer for read-only tools (list_tasks, get_task): nothing was written, so
@@ -666,7 +1159,9 @@ final class MCPServer: @unchecked Sendable {
     /// view — only what an agent needs to pick a task; get_task has the rest.
     private func readTaskDicts(_ tasks: [TodoTask], compact: Bool = false) throws -> [[String: Any]] {
         let rel = try store.taskRelations(for: tasks)
-        return tasks.map { compact ? compactTaskDict($0, rel) : taskDict($0, rel) }
+        if compact { return tasks.map { compactTaskDict($0, rel) } }
+        let links = try store.links(taskIds: tasks.map(\.id))
+        return tasks.map { taskDict($0, rel, links: links[$0.id]) }
     }
 
     /// How output refers to another task: its code, or its numeric id if it has no code.
@@ -679,7 +1174,7 @@ final class MCPServer: @unchecked Sendable {
         taskDicts([t])[0]
     }
 
-    private func taskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
+    private func taskDict(_ t: TodoTask, _ rel: TaskRelations, links: [TaskLink]? = nil) -> [String: Any] {
         var d: [String: Any] = [
             "id": t.id,
             "code": t.code,
@@ -694,6 +1189,8 @@ final class MCPServer: @unchecked Sendable {
         if let since = t.waitingSince { d["waiting_since"] = iso(since) }
         if !t.detail.isEmpty { d["detail"] = t.detail }
         if let link = t.link, !link.isEmpty { d["link"] = link }
+        if let links, !links.isEmpty { d["links"] = links.map(linkDict) }
+        if let branch = t.branch { d["branch"] = branch }
         if t.priority != Priority.none { d["priority"] = t.priority.rawValue }
         if let due = t.dueDate { d["due_date"] = iso(due) }
         if !t.tags.isEmpty { d["tags"] = t.tags }
@@ -710,11 +1207,17 @@ final class MCPServer: @unchecked Sendable {
         // Whole minutes as before, but a non-zero sub-minute value shows as 1, not omitted.
         if t.effortSeconds > 0 { d["effort_minutes"] = max(1, t.effortSeconds / 60) }
         if t.estimateSeconds > 0 { d["estimate_minutes"] = max(1, t.estimateSeconds / 60) }
+        if let mid = t.milestoneId {
+            d["milestone_id"] = mid
+            if let name = rel.milestoneNames[mid] { d["milestone"] = name }
+        }
+        if let c = t.claim { d["claim"] = claimDict(c) }
         return d
     }
 
     /// The compact list shape: code, title, status, plus priority, parent, blocked_by
-    /// (the open dependencies blocking it), tags, due_date and waiting_on only when set.
+    /// (the open dependencies blocking it), tags, due_date, waiting_on, branch and milestone
+    /// (its name) only when set. No links (get_task has them).
     /// No detail or timestamps; ids only where a task has no code (`taskHandle`).
     private func compactTaskDict(_ t: TodoTask, _ rel: TaskRelations) -> [String: Any] {
         var d: [String: Any] = ["code": t.code, "title": t.title, "status": t.status.rawValue]
@@ -730,6 +1233,67 @@ final class MCPServer: @unchecked Sendable {
         if !t.tags.isEmpty { d["tags"] = t.tags }
         if let due = t.dueDate { d["due_date"] = iso(due) }
         if let on = t.waitingOn { d["waiting_on"] = on.rawValue }
+        if let branch = t.branch { d["branch"] = branch }
+        if let mid = t.milestoneId { d["milestone"] = rel.milestoneNames[mid] ?? mid }
+        if let c = t.claim {
+            d["claimed_by"] = c.holderName
+            if !c.isLive() { d["claim_expired"] = true }
+        }
+        return d
+    }
+
+    /// A milestone as the milestone tools return it: its project by code, counts of its
+    /// tasks (done and total leave dropped ones out; open = not done or dropped), and
+    /// description, acceptance, target_date and closed_at only when set.
+    private func milestoneDict(_ m: Milestone) -> [String: Any] {
+        var d: [String: Any] = ["id": m.id, "project": store.projectCode(id: m.projectId) ?? "", "name": m.name,
+                                "done": m.done, "total": m.total, "open": m.open]
+        if !m.detail.isEmpty { d["description"] = m.detail }
+        if !m.acceptance.isEmpty { d["acceptance"] = m.acceptance }
+        if let t = m.targetDate { d["target_date"] = iso(t) }
+        if let c = m.closedAt { d["closed_at"] = iso(c) }
+        return d
+    }
+
+    /// A task's relations as get_task returns them: one key per kind that has any
+    /// (blocked_by, blocks, relates, duplicates, duplicated_by), each a list of
+    /// {code, title, status} (id instead of code for a task without one).
+    private func relationsDict(_ r: RelatedTasks) -> [String: Any] {
+        var d: [String: Any] = [:]
+        for kind in RelationKind.allCases where !r[kind].isEmpty {
+            d[kind.rawValue] = r[kind].map { t -> [String: Any] in
+                var e: [String: Any] = ["title": t.title, "status": t.status.rawValue]
+                if t.code.isEmpty { e["id"] = t.id } else { e["code"] = t.code }
+                return e
+            }
+        }
+        return d
+    }
+
+    /// add_relation / remove_relation output: both tasks by code, the kind, and the
+    /// task's relations after the write (empty object when it has none).
+    private func relationResult(_ taskId: Int64, _ otherId: Int64, _ kind: RelationKind) throws -> [String: Any] {
+        let task = try store.getTask(id: taskId), other = try store.getTask(id: otherId)
+        return ["task": taskHandle(code: task.code, id: task.id), "other": taskHandle(code: other.code, id: other.id),
+                "kind": kind.rawValue, "relations": relationsDict(try store.relatedTasks(taskId: taskId))]
+    }
+
+    /// add_relation / remove_relation `kind` (required).
+    private func relationKindArg(_ args: [String: Any]) throws -> RelationKind {
+        guard given(args, "kind") else { throw MCPError.missingArg("kind") }
+        guard let s = args["kind"] as? String, let k = RelationKind(rawValue: s) else {
+            throw MCPError.invalidArg("kind must be one of: \(RelationKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return k
+    }
+
+    /// A task link as get_task, add_link and remove_link return it: title, author and
+    /// source only when known.
+    private func linkDict(_ l: TaskLink) -> [String: Any] {
+        var d: [String: Any] = ["id": l.id, "kind": l.kind.rawValue, "url": l.url, "created_at": iso(l.createdAt)]
+        if let title = l.title { d["title"] = title }
+        if let author = l.author { d["author"] = author.rawValue }
+        if let source = l.source { d["source"] = source }
         return d
     }
 
@@ -759,6 +1323,28 @@ final class MCPServer: @unchecked Sendable {
         return d
     }
 
+    /// A decision in `decisions`: the note (as in get_task) plus task, title, task_status,
+    /// project, seen_at (when the user marked it seen) and the user's disagreements.
+    private func decisionDict(_ d: AgentDecision) -> [String: Any] {
+        var out = noteDict(d.note)
+        out["task"] = taskHandle(code: d.taskCode, id: d.note.taskId)
+        out["title"] = d.taskTitle
+        out["task_status"] = d.taskStatus.rawValue
+        out["project"] = d.projectCode
+        if let s = d.agentSessionId { out["claude_session"] = s }
+        if let t = d.reviewedAt { out["seen_at"] = iso(t) }
+        if !d.disagreements.isEmpty {
+            out["disagreements"] = d.disagreements.map { q -> [String: Any] in
+                var dq: [String: Any] = ["question_id": q.id, "task": taskHandle(code: q.taskCode, id: q.taskId),
+                                         "why": q.answer ?? "", "at": iso(q.answeredAt ?? q.askedAt),
+                                         "status": q.status.rawValue]
+                if let t = q.resumedAt { dq["resumed_at"] = iso(t) }
+                return dq
+            }
+        }
+        return out
+    }
+
     /// A question as the question tools return it. Options are numbered from 1, as the
     /// user picks them; empty and default fields are omitted.
     private func questionDict(_ q: Question) -> [String: Any] {
@@ -776,6 +1362,8 @@ final class MCPServer: @unchecked Sendable {
         }
         if !q.blocksTask { d["blocks_task"] = false }
         if let s = q.sessionId { d["session"] = s }
+        if let s = q.agentSessionId { d["claude_session"] = s }
+        if let n = q.aboutNoteId { d["about_note"] = n }
         if let a = q.answer { d["answer"] = a }
         if let c = q.answerChoice { d["choice"] = c + 1 }
         if let r = q.cancelReason { d["cancel_reason"] = r }
@@ -799,7 +1387,7 @@ final class MCPServer: @unchecked Sendable {
     }
 
     private func parseDate(_ v: Any?) -> Date? {
-        if let n = v as? NSNumber { return Date(timeIntervalSince1970: n.doubleValue) }
+        if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { return Date(timeIntervalSince1970: n.doubleValue) }
         guard let s = v as? String, !s.isEmpty else { return nil }
         if let d = ISO8601DateFormatter().date(from: s) { return d }
         let f = DateFormatter()
@@ -810,12 +1398,20 @@ final class MCPServer: @unchecked Sendable {
         return f.date(from: s)
     }
 
-    /// Parse an integer minutes argument (accepts JSON number or numeric string). nil if absent/invalid.
+    /// Parse an integer minutes argument (accepts JSON number or numeric string). nil if
+    /// absent/invalid. Clamped to 0…`maxMinutes`, so the seconds it becomes cannot overflow.
     private func parseMinutes(_ v: Any?) -> Int? {
-        if let n = v as? NSNumber { return max(0, n.intValue) }
-        if let s = v as? String, let n = Int(s) { return max(0, n) }
+        if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+            let d = n.doubleValue
+            guard d.isFinite else { return nil }
+            return Int(min(max(0, d), Double(Self.maxMinutes)))
+        }
+        if let s = v as? String, let n = Int(s) { return min(max(0, n), Self.maxMinutes) }
         return nil
     }
+
+    /// The largest estimate taken, in minutes (about 19 years).
+    private static let maxMinutes = 10_000_000
 
     private func parseTags(_ v: Any?) -> [String]? {
         if let arr = v as? [String] { return arr }
@@ -826,6 +1422,105 @@ final class MCPServer: @unchecked Sendable {
     private func parsePriority(_ v: Any?) -> Priority? {
         guard let s = v as? String else { return nil }
         return Priority(rawValue: s)
+    }
+
+    // MARK: - Wiki pages
+
+    /// A wiki page as the page tools return it. `full` false is list_pages' shape: no body,
+    /// tasks or provenance.
+    private func pageDict(_ p: ProjectPage, full: Bool) -> [String: Any] {
+        var d: [String: Any] = ["id": p.id, "kind": p.kind.rawValue, "title": p.title, "updated_at": iso(p.updatedAt)]
+        if let date = p.decidedOn { d["decided_on"] = date }
+        guard full else { return d }
+        d["project"] = store.projectCode(id: p.projectId) ?? ""
+        d["body"] = p.body
+        d["version"] = p.version
+        d["author"] = p.author.rawValue
+        d["created_at"] = iso(p.createdAt)
+        if let o = p.outcome { d["outcome"] = o }
+        if let s = p.sessionId { d["session"] = s }
+        if !p.tasks.isEmpty {
+            d["tasks"] = p.tasks.map { ["code": $0.code, "title": $0.title, "status": $0.status.rawValue] }
+        }
+        let prov = p.provenance
+        if let v = prov.source { d["source"] = v }
+        if let v = prov.key { d["source_key"] = v }
+        if let v = prov.author { d["source_author"] = v }
+        if let v = prov.session { d["source_session"] = v }
+        if let v = prov.timestamp { d["source_timestamp"] = iso(v) }
+        return d
+    }
+
+    /// The page a call names: `id`, or in a project (`project_id`/`project_code`) its
+    /// `source_key` or its `title` (whole title, case-insensitive; several pages with that
+    /// title is an error listing their ids).
+    private func resolvePageId(_ args: [String: Any]) throws -> Int64 {
+        if given(args, "id") { return try requireInt(args, "id") }
+        guard given(args, "source_key") || given(args, "title") else {
+            throw MCPError.missingArg("id, or title (or source_key) with project_code")
+        }
+        let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+        let code = try scopeName(pid)
+        if let key = args["source_key"] as? String, given(args, "source_key") {
+            guard let id = store.pageId(projectId: pid, sourceKey: key) else {
+                throw StoreError.notFound("page with source_key \(key) in project \(code)")
+            }
+            return id
+        }
+        guard let title = args["title"] as? String else { throw MCPError.invalidArg("title must be a string") }
+        let ids = store.pageIds(projectId: pid, title: title)
+        guard let first = ids.first else { throw StoreError.notFound("page titled \"\(title)\" in project \(code)") }
+        guard ids.count == 1 else {
+            throw MCPError.invalidArg("project \(code) has \(ids.count) pages titled \"\(title)\" "
+                                      + "(ids \(ids.map(String.init).joined(separator: ", "))); give the id")
+        }
+        return first
+    }
+
+    /// `kind` of a page: absent or null = not given; otherwise decision or note.
+    private func pageKindArg(_ args: [String: Any]) throws -> PageKind? {
+        guard given(args, "kind") else { return nil }
+        guard let s = args["kind"] as? String, let k = PageKind(rawValue: s) else {
+            throw MCPError.invalidArg("kind must be one of: \(PageKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        return k
+    }
+
+    /// A page's tasks: task codes in `codesKey` and/or ids in `idsKey`; nil when neither is
+    /// given. An unknown code is an error naming it.
+    private func pageTaskIdsArg(_ args: [String: Any], codesKey: String, idsKey: String) throws -> [Int64]? {
+        guard given(args, codesKey) || given(args, idsKey) else { return nil }
+        var ids: [Int64] = []
+        if given(args, codesKey) {
+            guard let codes = args[codesKey] as? [String] else { throw MCPError.invalidArg("\(codesKey) must be an array of task codes") }
+            for c in codes {
+                guard let id = store.taskId(forCode: c) else { throw StoreError.notFound("task \(c)") }
+                ids.append(id)
+            }
+        }
+        if given(args, idsKey) {
+            guard let arr = args[idsKey] as? [Any] else { throw MCPError.invalidArg("\(idsKey) must be an array of task ids") }
+            for v in arr {
+                if let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { ids.append(n.int64Value) }
+                else { throw MCPError.invalidArg("\(idsKey): \(v) is not a task id") }
+            }
+        }
+        return ids
+    }
+
+    /// create_page `source_timestamp`: absent or null = unknown; else ISO-8601 or yyyy-MM-dd.
+    private func sourceTimestampArg(_ args: [String: Any]) throws -> Date? {
+        guard given(args, "source_timestamp") else { return nil }
+        guard let d = parseDate(args["source_timestamp"]) else {
+            throw MCPError.invalidArg("source_timestamp must be ISO-8601 or yyyy-MM-dd, or null")
+        }
+        return d
+    }
+
+    /// The first line of a note, at most 160 characters, for lists.
+    private static func firstLine(_ text: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        return line.count > 160 ? String(line.prefix(160)) + "…" : line
     }
 
     // MARK: - Guides
@@ -891,6 +1586,72 @@ final class MCPServer: @unchecked Sendable {
         return .some(try resolveTaskId(args, idKey: "parent_id", codeKey: "parent_code"))
     }
 
+    /// update_milestone / delete_milestone: the milestone by `id`, or by `name` in a project
+    /// (`project_id`/`project_code`).
+    private func resolveMilestoneId(_ args: [String: Any]) throws -> Int64 {
+        if given(args, "id") { return try requireInt(args, "id") }
+        guard let name = args["name"] as? String else { throw MCPError.missingArg("id, or name with project_code") }
+        let pid = try resolveProjectId(args, idKey: "project_id", codeKey: "project_code")
+        return try milestoneId(named: name, projectId: pid)
+    }
+
+    /// A project's milestone by name, or an error naming the project's open milestones.
+    private func milestoneId(named name: String, projectId: Int64) throws -> Int64 {
+        if let id = store.milestoneId(projectId: projectId, name: name) { return id }
+        let code = store.projectCode(id: projectId) ?? "\(projectId)"
+        let names = try store.milestones(projectId: projectId, includeClosed: false).map(\.name)
+        throw StoreError.notFound("milestone \(name) in project \(code)"
+            + (names.isEmpty ? " (it has no open milestones; create_milestone adds one)"
+                             : " (open milestones: \(names.joined(separator: ", ")))"))
+    }
+
+    /// create_task / update_task / bulk_update_tasks `milestone` (a name in the task's
+    /// project) or `milestone_id`: absent = leave alone, null = no milestone.
+    private func milestoneArg(_ args: [String: Any], projectId: () throws -> Int64) throws -> Int64?? {
+        let present = ["milestone", "milestone_id"].filter { args.keys.contains($0) }
+        guard !present.isEmpty else { return .none }
+        if present.allSatisfy({ args[$0] is NSNull }) { return .some(nil) }
+        if given(args, "milestone_id") { return .some(try requireInt(args, "milestone_id")) }
+        guard let name = args["milestone"] as? String else { throw MCPError.invalidArg("milestone must be a name or null") }
+        return .some(try milestoneId(named: name, projectId: try projectId()))
+    }
+
+    /// list_tasks `milestone` (a name, or "none" for tasks in no milestone) or
+    /// `milestone_id`. With a project the name must be one of its milestones; without one
+    /// it matches that name in any project, and must exist in at least one.
+    private func milestoneFilterArg(_ args: [String: Any], projectId: Int64?) throws -> MilestoneFilter? {
+        if given(args, "milestone_id") { return .id(try requireInt(args, "milestone_id")) }
+        guard given(args, "milestone") else { return nil }
+        guard let raw = args["milestone"] as? String, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw MCPError.invalidArg("milestone must be a milestone name, or \"none\"")
+        }
+        if raw.trimmingCharacters(in: .whitespaces).lowercased() == "none" { return .unassigned }
+        if let projectId { return .id(try milestoneId(named: raw, projectId: projectId)) }
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard try store.milestones().contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            throw StoreError.notFound("milestone \(name) in any project")
+        }
+        return .named(name)
+    }
+
+    /// create/update_milestone `target_date`: absent = .none, null = .some(nil) (clear), a
+    /// date (ISO-8601 or yyyy-MM-dd) = that date; anything else is an error, not a clear.
+    /// update_task `due_date`: absent = .none, null or "" = .some(nil) (clear), else a date
+    /// that parses (yyyy-MM-dd, ISO-8601, or epoch seconds); anything else is an error.
+    private func dueDateArg(_ args: [String: Any]) throws -> Date?? {
+        guard let v = args["due_date"] else { return .none }
+        if v is NSNull || (v as? String)?.isEmpty == true { return .some(nil) }
+        guard let d = parseDate(v) else { throw MCPError.invalidArg("due_date must be yyyy-MM-dd or ISO-8601, or null") }
+        return .some(d)
+    }
+
+    private func targetDateArg(_ args: [String: Any]) throws -> Date?? {
+        guard let v = args["target_date"] else { return .none }
+        if v is NSNull { return .some(nil) }
+        guard let d = parseDate(v) else { throw MCPError.invalidArg("target_date must be yyyy-MM-dd or ISO-8601, or null") }
+        return .some(d)
+    }
+
     /// Resolve a list of task ids from `ids` (array of int) and/or `codes` (array of string).
     /// Like `resolveTaskId`, an unknown code (or an id that is not a number) is an error
     /// naming it, never skipped, so the bulk tools stay all or nothing. An unknown numeric
@@ -900,7 +1661,7 @@ final class MCPServer: @unchecked Sendable {
         var ids: [Int64] = []
         if let arr = args["ids"] as? [Any] {
             for v in arr {
-                if let n = v as? NSNumber { ids.append(n.int64Value) }
+                if let n = Self.integer(v) { ids.append(n) }
                 else if let s = v as? String, let n = Int64(s) { ids.append(n) }
                 else { throw MCPError.invalidArg("ids: \(v) is not a task id") }
             }
@@ -916,6 +1677,29 @@ final class MCPServer: @unchecked Sendable {
         return ids.filter { seen.insert($0).inserted }
     }
 
+    /// reorder_tasks' tasks, in order: `codes` (array of string) or `ids` (array of int),
+    /// not both, since a mix has no single order. An unknown code is an error naming it;
+    /// unknown ids and repeats are left to the store, which checks them in its transaction.
+    private func orderedTaskIds(_ args: [String: Any]) throws -> [Int64] {
+        let hasIds = given(args, "ids"), hasCodes = given(args, "codes")
+        guard hasIds != hasCodes else {
+            throw hasIds ? MCPError.invalidArg("give codes or ids, not both") : MCPError.missingArg("codes or ids")
+        }
+        if hasCodes {
+            guard let codes = args["codes"] as? [String] else { throw MCPError.invalidArg("codes must be an array of task codes") }
+            return try codes.map { code in
+                guard let id = store.taskId(forCode: code) else { throw StoreError.notFound("task \(code)") }
+                return id
+            }
+        }
+        guard let arr = args["ids"] as? [Any] else { throw MCPError.invalidArg("ids must be an array of task ids") }
+        return try arr.map { v in
+            if let n = Self.integer(v) { return n }
+            if let s = v as? String, let n = Int64(s) { return n }
+            throw MCPError.invalidArg("ids: \(v) is not a task id")
+        }
+    }
+
     /// Resolve a task id from either `id` (int) or `code` (string handle like "GEN-3").
     private func resolveTaskId(_ args: [String: Any]) throws -> Int64 {
         try resolveTaskId(args, idKey: "id", codeKey: "code")
@@ -923,7 +1707,7 @@ final class MCPServer: @unchecked Sendable {
 
     /// Resolve a task id from arbitrary `<idKey>` (int) or `<codeKey>` (string code).
     private func resolveTaskId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
-        if let n = args[idKey] as? NSNumber { return n.int64Value }
+        if let n = Self.integer(args[idKey]) { return n }
         if let s = args[idKey] as? String, let n = Int64(s) { return n }
         if let code = args[codeKey] as? String {
             guard let id = store.taskId(forCode: code) else { throw StoreError.notFound("task \(code)") }
@@ -932,9 +1716,18 @@ final class MCPServer: @unchecked Sendable {
         throw MCPError.missingArg("\(idKey) or \(codeKey)")
     }
 
+    /// `repo_path` for create/update_project: absent = nil (leave alone), null or "" =
+    /// .some(nil) (no folder), a string = that folder (normalized by the store).
+    private func repoPathArg(_ args: [String: Any]) throws -> String?? {
+        guard let raw = args["repo_path"] else { return .none }
+        if raw is NSNull { return .some(nil) }
+        guard let s = raw as? String else { throw MCPError.invalidArg("repo_path must be a string or null") }
+        return .some(s)
+    }
+
     /// Resolve a project id from `<idKey>` (int) or `<codeKey>` (string code).
     private func resolveProjectId(_ args: [String: Any], idKey: String, codeKey: String) throws -> Int64 {
-        if let n = args[idKey] as? NSNumber { return n.int64Value }
+        if let n = Self.integer(args[idKey]) { return n }
         if let s = args[idKey] as? String, let n = Int64(s) { return n }
         if let code = args[codeKey] as? String {
             guard let id = store.projectId(forCode: code) else { throw StoreError.notFound("project \(code)") }
@@ -1036,8 +1829,8 @@ final class MCPServer: @unchecked Sendable {
     /// ask_user `kind`: choice (default), text or approve.
     private func questionKindArg(_ args: [String: Any]) throws -> QuestionKind {
         guard given(args, "kind") else { return .choice }
-        guard let s = args["kind"] as? String, let k = QuestionKind(rawValue: s) else {
-            throw MCPError.invalidArg("kind must be one of: \(QuestionKind.allCases.map(\.rawValue).joined(separator: ", "))")
+        guard let s = args["kind"] as? String, let k = QuestionKind(rawValue: s), QuestionKind.askable.contains(k) else {
+            throw MCPError.invalidArg("kind must be one of: \(QuestionKind.askable.map(\.rawValue).joined(separator: ", "))")
         }
         return k
     }
@@ -1106,13 +1899,29 @@ final class MCPServer: @unchecked Sendable {
         return .some(s)
     }
 
+    /// An optional string argument, double-optional: absent = .none (leave alone),
+    /// null = .some(nil) (clear), a string = itself. Any other value is rejected rather
+    /// than read as a clear.
+    private func optionalStringArg(_ args: [String: Any], _ key: String) throws -> String?? {
+        guard let v = args[key] else { return .none }
+        if v is NSNull { return .some(nil) }
+        guard let s = v as? String else { throw MCPError.invalidArg("\(key) must be a string or null") }
+        return .some(s)
+    }
+
     private func requireString(_ args: [String: Any], _ key: String) throws -> String {
         guard let v = args[key] as? String, !v.isEmpty else { throw MCPError.missingArg(key) }
         return v
     }
 
+    /// A JSON number as an id or count: JSON true/false is not one (NSNumber covers both).
+    private static func integer(_ v: Any?) -> Int64? {
+        guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        return n.int64Value
+    }
+
     private func requireInt(_ args: [String: Any], _ key: String) throws -> Int64 {
-        if let n = args[key] as? NSNumber { return n.int64Value }
+        if let n = Self.integer(args[key]) { return n }
         if let s = args[key] as? String, let n = Int64(s) { return n }
         throw MCPError.missingArg(key)
     }

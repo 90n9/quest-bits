@@ -161,8 +161,7 @@ struct QBParchmentBackground: ViewModifier {
     }
 }
 
-/// Hearth surface: Planks037A wood grain under a bark scrim — the pomodoro bar
-/// (DESIGN.md `pomodoro-bar`).
+/// Hearth surface: Planks037A wood grain under a bark scrim — the update banner.
 struct QBHearthBackground: ViewModifier {
     func body(content: Content) -> some View {
         content.background {
@@ -399,7 +398,7 @@ struct QBOnDarkButtonStyle: ButtonStyle {
 }
 
 /// Quieter rectangular ghost button (`button-ghost`). `onDark` renders cream text
-/// for bark surfaces (pomodoro hearth bar).
+/// for bark surfaces (the hearth).
 struct QBGhostButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
     var onDark = false

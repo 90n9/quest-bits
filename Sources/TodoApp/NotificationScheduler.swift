@@ -1,7 +1,8 @@
 import Foundation
 import UserNotifications
 
-/// Schedules local notifications for task due dates.
+/// Schedules local notifications for task due dates, and posts the ones for what newly
+/// waits on the user (`postWaiting`).
 ///
 /// Reuses the app's existing notification authorization (requested once in
 /// `AppDelegate.applicationDidFinishLaunching`) — this type never asks for
@@ -88,6 +89,53 @@ final class NotificationScheduler {
                     self.center.add(req)
                 }
             }
+        }
+    }
+
+    // MARK: - Waiting on you (QUE-26)
+
+    private nonisolated static let waitingPrefix = "waiting-"
+    private nonisolated static let itemKey = "inboxItem"
+
+    /// Post a notification now for what newly waits on the user (`WaitingWatch.notice`).
+    /// Nothing is posted unless macOS allows this app's notifications; this never asks.
+    /// The item goes in `userInfo`, so a click opens it (`waitingItem(in:)`).
+    func postWaiting(title: String, body: String, sound: Bool, item: WaitingArrival.Item) {
+        let info = [Self.itemKey: Self.encode(item)]
+        center.getNotificationSettings { settings in
+            let status = settings.authorizationStatus
+            guard status == .authorized || status == .provisional else { return }
+            Task { @MainActor in
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = body
+                content.threadIdentifier = "waiting"
+                content.userInfo = info
+                if sound { content.sound = .default }
+                try? await self.center.add(UNNotificationRequest(
+                    identifier: Self.waitingPrefix + UUID().uuidString, content: content, trigger: nil))
+            }
+        }
+    }
+
+    /// The item a waiting notification was posted for, from its `userInfo`; nil for any
+    /// other notification (a due reminder).
+    nonisolated static func waitingItem(in userInfo: [AnyHashable: Any]) -> WaitingArrival.Item? {
+        guard let raw = userInfo[itemKey] as? String, let colon = raw.firstIndex(of: ":") else { return nil }
+        let kind = raw[..<colon], id = String(raw[raw.index(after: colon)...])
+        switch kind {
+        case "session": return id.isEmpty ? nil : .session(id)
+        case "question": return Int64(id).map { .question($0) }
+        case "task": return Int64(id).map { .task($0) }
+        default: return nil
+        }
+    }
+
+    private static func encode(_ item: WaitingArrival.Item) -> String {
+        switch item {
+        case .session(let id): return "session:\(id)"
+        case .question(let id): return "question:\(id)"
+        case .task(let id): return "task:\(id)"
         }
     }
 }

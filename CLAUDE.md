@@ -15,14 +15,15 @@ VERSION=1.2.0 Scripts/build-app.sh  # override bundle version (CI passes the rel
 ```
 
 **Dev vs prod flavor.** Local builds default to a fully isolated **QuestBits Dev** app
-(compiled with `-D DEV_BUILD` into *both* binaries): bundle id `com.local.todoapp.dev`,
+(compiled with `-D DEV_BUILD` into *all three* binaries): bundle id `com.local.todoapp.dev`,
 database `~/Library/Application Support/TodoAppDev/`, MCP registration key
 `mcpServers.quest-bits-dev`, orange DEV badge in the sidebar footer. It never touches
 production data or the prod `todo` registration. CI builds (`GITHUB_ACTIONS=true`)
 and `FLAVOR=prod` produce the production QuestBits.app.
 
-`build-app.sh` compiles two separate binaries and links libsqlite3 (`-lsqlite3`) into each:
+`build-app.sh` compiles three separate binaries and links libsqlite3 (`-lsqlite3`) into each:
 - `Contents/Resources/mcp-server/todo-mcp` ← `Sources/TodoCore/*.swift` + `Sources/TodoMCP/*.swift`
+- `Contents/Resources/cli/questbits` ← `Sources/TodoCore/*.swift` + `Sources/TodoCLI/*.swift` — the CLI (`brief`, `list`, `show`, `export`, `import`, `hook <event>`; new commands go in `CLI.commands`). `brief`/`list`/`show`/`export` open the DB read-only; `hook` and `import --apply` write. Honours `TODO_DB_PATH` like todo-mcp; hooks call it by this full path, Settings can link it into `~/.local/bin` (`questbits` / `questbits-dev`).
 - `Contents/MacOS/QuestBits` ← `Sources/TodoCore/*.swift` + `Sources/TodoApp/*.swift` (+ Sparkle.framework)
 
 The task **Detail editor** is a web view running Milkdown (Notion-style blocks over markdown): `Editor/` holds its npm package (`src/main.js`, `src/theme.css`, `index.html`), and `build-app.sh` runs `npm ci` (when the lockfile changed) and esbuild into `Contents/Resources/Editor/`, so builds need Node/npm. Swift side: `TodoApp/MarkdownEditor.swift`. Detail stays markdown; images are files in `attachments/` next to the DB, linked as `attachments/<name>`.
@@ -33,7 +34,7 @@ inside-out (Sparkle helpers → framework → binaries → app); don't revert to
 `codesign --deep`. Sparkle auto-checks are compiled on only in CI builds
 (`GITHUB_ACTIONS=true`), so local dev bundles never self-replace with a release.
 
-**`TodoCore` is shared *source*, not a library** — its `.swift` files are recompiled into both binaries. A change in `TodoCore/` affects the app and the MCP server; rebuild both.
+**`TodoCore` is shared *source*, not a library** — its `.swift` files are recompiled into all three binaries. A change in `TodoCore/` affects the app, the MCP server and the CLI; rebuild all.
 
 ## Verifying changes
 
@@ -46,25 +47,26 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_proje
   | TODO_DB_PATH=/tmp/qb-test.sqlite "$MCP"
 ```
 
-- **Only `todo-mcp` reads `TODO_DB_PATH`** (`TodoMCP/MCPServer.swift`), and only when it is set on the `todo-mcp` process itself — put it after the `|`, not before `echo`. Always set it for MCP tests so you don't touch real data.
+- **Only `todo-mcp` and the `questbits` CLI read `TODO_DB_PATH`** (`TodoMCP/MCPServer.swift`, `TodoCLI/CLI.swift`), and only when it is set on that process itself — put it after the `|`, not before `echo`. Always set it for MCP tests so you don't touch real data.
 - **The app and a bare `Store()` ignore `TODO_DB_PATH`** and always open the real DB: `~/Library/Application Support/TodoApp/db.sqlite`, or `TodoAppDev/` when compiled with `-D DEV_BUILD`. Opening it runs migrations on it. A test script or harness that compiles `TodoCore` must call `Store(url:)` with a throwaway path (e.g. under `/tmp`), never `Store()`.
 - The live app registers its MCP server on launch; a Claude Code session started **before** launch won't see it — start a fresh session to pick up MCP changes.
 
 ## Architecture
 
-Two processes share **one SQLite database in WAL mode** so the SwiftUI app and the Claude-Code-spawned MCP server can read/write concurrently:
+Three binaries share **one SQLite database in WAL mode** so the SwiftUI app, the Claude-Code-spawned MCP server and the CLI (run by Claude Code hooks) can read/write concurrently:
 
 ```
 SwiftUI app (window + menu bar)  ─┐                        ┌─ todo-mcp (MCP server, spawned by Claude Code)
                                   ├─ ~/Library/Application Support/TodoApp/db.sqlite (+ -wal/-shm)
-                                  ─┘  app polls the file every 1.5s and reloads on external writes
+                                  ─┘  app polls every 1.5s  └─ questbits (CLI; `hook …` run by Claude Code hooks)
 ```
 
 - **No push/FSEvents.** `AppModel` polls the DB on a 1.5s `Timer` (`AppModel.swift`) — external MCP writes surface with up to ~1.5s lag. This is deliberate; keep the polling model unless replacing it wholesale.
-- **`Store` (`TodoCore/Store.swift`, ~1.5k lines) is the single source of truth** for all data mutation and the widest / most delicate file. Cross-process writes use `BEGIN IMMEDIATE` with re-checks *inside* the transaction (e.g. dependency-cycle and reachability guards), plus a one-level transaction-nesting guard. Preserve this pattern — naive `INSERT`/`UPDATE` outside a transaction can race the other process.
+- **`Store` (`TodoCore/Store.swift`, ~5.5k lines) is the single source of truth** for all data mutation and the widest / most delicate file. Cross-process writes use `BEGIN IMMEDIATE` with re-checks *inside* the transaction (e.g. dependency-cycle and reachability guards). Transactions do not nest: a public method takes the lock and opens one; its `*Unlocked` helpers run inside the caller's and never open their own. To combine several writes in one transaction, call the helpers from one method (as `importWrite` does), never a public method from inside another. Preserve this pattern — naive `INSERT`/`UPDATE` outside a transaction can race the other process.
 - **MCP server** speaks JSON-RPC 2.0 over stdio with **no external SDK** — hand-rolled in `TodoMCP/MCPServer.swift`; tool schemas in `TodoMCP/ToolDefinitions.swift`; entrypoint `main.swift` is just `MCPServer().run()`.
 - **Self-registration:** on first launch the app writes itself into `~/.claude.json` under `mcpServers.quest-bits` — `mcpServers.quest-bits-dev` for dev-flavor builds (`TodoApp/MCPRegistration.swift`). Each flavor auto-migrates its own legacy key name (`todo` / `todo-dev`) when it points at a QuestBits binary.
-- **App scene** is a `WindowGroup` + `MenuBarExtra` (`TodoApp/TodoApp.swift`) — the menu-bar countdown is the real `MenuBarExtra`, not a hand-rolled `NSStatusItem`. Pomodoro logic in `PomodoroEngine.swift`, local notifications in `NotificationScheduler.swift`, key commands in `Shortcuts.swift`. Nearly all UI is in `Views.swift`.
+- **App scene** is a `WindowGroup` + `MenuBarExtra` (`TodoApp/TodoApp.swift`) — the menu-bar item (icon + ✋ waiting-on-you / ⚡ working counts, `MenuBarLabel`) is the real `MenuBarExtra`, not a hand-rolled `NSStatusItem`. Local notifications in `NotificationScheduler.swift`, key commands in `Shortcuts.swift`. Most UI is in `Views.swift`; sidebar pages and sections have their own `*Views.swift`.
+- **Claude Code hooks** are opt-in: Settings → Claude Code Hooks (`TodoApp/HookInstaller.swift`) merges this flavor's rows (`HookInstaller.rows`) into `~/.claude/settings.json`, backs it up first, and marks each command `# questbits-hook:prod|dev`. Each runs `questbits hook <event>` (`TodoCLI/HookCommand.swift`): session tracking and briefs (SessionStart, also after compact), the gate (PreToolUse → `TodoCLI/GateCommand.swift`, `TodoCore/Gate*.swift`; only in folders mapped to a project), terminal attention (Notification). Hooks always exit 0 and stay silent unless `QUESTBITS_HOOK_DEBUG=1`. Test the installer with `HOME=<scratch>`, never on the real settings.json.
 
 ### Agent guide, instructions and prompts
 What agents are told ships in the binary (`TodoCore/AgentGuide.swift`), so it updates with the app: the MCP `instructions` (short and scoped: ignore QuestBits unless the session works on a QuestBits task), the built-in guide that `get_guide` returns first, and the MCP prompts (`work`, `resume`; Claude Code shows them as `/mcp__quest-bits__<name>`, which the app offers to copy). Bump `AgentGuide.version` when that text changes. The user's guide and each project's guide are append-only versions in `guide_versions` (`Store.saveGuide`); `get_guide` returns built-in, then the user's guide, then the project's.
@@ -76,7 +78,7 @@ Projects have a short code (`GEN`), tasks have one too (`GEN-3`). **Every MCP to
 
 Source lives in the **public** `90n9/quest-bits`; built DMGs are published to `90n9/quest-bits-releases`.
 
-- `.github/workflows/build.yml` compiles both binaries on `macos-latest` for every PR and push to main. It must never use secrets or `pull_request_target` (the repo is public; fork PRs need approval). Local builds can pass where CI fails (different Swift version, slower runner) — wait for this check before merging.
+- `.github/workflows/build.yml` compiles all three binaries on `macos-latest` for every PR and push to main. It must never use secrets or `pull_request_target` (the repo is public; fork PRs need approval). Local builds can pass where CI fails (different Swift version, slower runner) — wait for this check before merging.
 - **One PR = one release.** A PR that touches `Sources/`, `Scripts/`, `Resources/`, `Editor/` or `Docs/RELEASES_README.md` must add a new `## [X.Y.Z] - YYYY-MM-DD` section at the top of `CHANGELOG.md` (plain X.Y.Z, newer than every released version); the `version` check in `build.yml` fails otherwise. Docs/CI-only PRs need no version.
 - **Merging to main releases.** `.github/workflows/release.yml` reads the top `## [X.Y.Z]` of `CHANGELOG.md`; if the public `appcast.xml` doesn't list it yet, it builds the DMG, publishes the release (via the `RELEASES_REPO_TOKEN` PAT secret), updates the appcast, then pushes tag `vX.Y.Z` to this repo. Already released → the run skips, but fails if the push changed the app (that code would ship to no one). Every step is safe to re-run. Don't tag by hand after a merge. Pushing a `v*` tag by hand still works (e.g. to re-release a commit whose run failed).
 - **Auto-update (Sparkle):** CI signs the DMG with the `SPARKLE_ED_PRIVATE_KEY` secret and prepends an item to `appcast.xml` in the public releases repo (the app's `SUFeedURL` points at that file's raw main URL). The matching public key is baked into Info.plist by `build-app.sh`. Rotating the key breaks updates for already-shipped builds.
